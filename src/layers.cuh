@@ -27,15 +27,13 @@ __global__ void lstmKernel(float *x, float *h_prev, float *c_prev,
     {
         // Forget gate
         float ft = sigmoid(dot(Wf, concat(h_prev, x[idx])) + bf);
-
-        // Input gate & Cell state update
+        // Input gate
         float it = sigmoid(dot(Wi, concat(h_prev, x[idx])) + bi);
+        // Cell state
         float c_tilde = tanh(dot(Wc, concat(h_prev, x[idx])) + bc);
         c[idx] = ft * c_prev[idx] + it * c_tilde;
-
         // Output gate
         float ot = sigmoid(dot(Wo, concat(h_prev, x[idx])) + bo);
-
         // Hidden state
         h[idx] = ot * tanh(c[idx]);
     }
