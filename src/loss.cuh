@@ -1,6 +1,6 @@
 #include <cuda_runtime.h>
 
-__global__ void squaredError(float *y, float *y_pred, float *error, int n)
+__global__ void meanSquaredError(float *y, float *y_pred, float *error, int n)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
