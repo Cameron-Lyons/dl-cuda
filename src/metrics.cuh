@@ -23,3 +23,15 @@ __global__ void accuracyKernel(int *y, int *y_pred, int *correct_preds, int n)
         correct_preds[idx] = (y[idx] == y_pred[idx]) ? 1 : 0;
     }
 }
+
+__global__ void f1Kernel(int *y, int *y_pred, int *TP, int *FP, int *FN, int n)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < n)
+    {
+        TP[idx] = (y[idx] == 1 && y_pred[idx] == 1) ? 1 : 0;
+        FP[idx] = (y[idx] == 0 && y_pred[idx] == 1) ? 1 : 0;
+        FN[idx] = (y[idx] == 1 && y_pred[idx] == 0) ? 1 : 0;
+    }
+}
