@@ -1,3 +1,5 @@
+#include <cuda_runtime.h>
+
 __global__ void tanh(float *data, int n)
 {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
