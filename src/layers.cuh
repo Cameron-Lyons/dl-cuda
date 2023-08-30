@@ -15,3 +15,28 @@ __global__ void linearLayerKernel(float *X, float *W, float *b, float *Y, int n,
         Y[row * out_features + col] = sum + b[col];
     }
 }
+
+__global__ void lstmKernel(float *x, float *h_prev, float *c_prev,
+                           float *Wf, float *Wi, float *Wc, float *Wo,
+                           float *bf, float *bi, float *bc, float *bo,
+                           float *h, float *c, int sequence_length)
+{
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (idx < sequence_length)
+    {
+        // Forget gate
+        float ft = sigmoid(dot(Wf, concat(h_prev, x[idx])) + bf);
+
+        // Input gate & Cell state update
+        float it = sigmoid(dot(Wi, concat(h_prev, x[idx])) + bi);
+        float c_tilde = tanh(dot(Wc, concat(h_prev, x[idx])) + bc);
+        c[idx] = ft * c_prev[idx] + it * c_tilde;
+
+        // Output gate
+        float ot = sigmoid(dot(Wo, concat(h_prev, x[idx])) + bo);
+
+        // Hidden state
+        h[idx] = ot * tanh(c[idx]);
+    }
+}
