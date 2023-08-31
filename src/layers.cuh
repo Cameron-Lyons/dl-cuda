@@ -72,3 +72,30 @@ __global__ void conv1dKernel(float *input, float *kernel, float *output,
     output[idx] = sum;
   }
 }
+
+__global__ void conv2dKernel(float *input, int inputWidth, int inputHeight,
+                             float *kernel, int kernelWidth, int kernelHeight,
+                             float *output) {
+  int x = blockIdx.x * blockDim.x + threadIdx.x;
+  int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+  int halfKernelWidth = kernelWidth / 2;
+  int halfKernelHeight = kernelHeight / 2;
+
+  float value = 0.0f;
+
+  if (x < inputWidth && y < inputHeight) {
+    for (int ky = -halfKernelHeight; ky <= halfKernelHeight; ky++) {
+      for (int kx = -halfKernelWidth; kx <= halfKernelWidth; kx++) {
+        int inX = x + kx;
+        int inY = y + ky;
+        if (inX >= 0 && inX < inputWidth && inY >= 0 && inY < inputHeight) {
+          value += input[inY * inputWidth + inX] *
+                   kernel[(ky + halfKernelHeight) * kernelWidth +
+                          (kx + halfKernelWidth)];
+        }
+      }
+    }
+    output[y * inputWidth + x] = value;
+  }
+}
