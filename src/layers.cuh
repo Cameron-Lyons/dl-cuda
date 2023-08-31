@@ -56,3 +56,19 @@ __global__ void elmanRnnKernel(float *x, float *h_prev, float *Wxh, float *Whh,
     y[idx] = output_sum + b_y[idx];
   }
 }
+
+__global__ void conv1dKernel(float *input, float *kernel, float *output,
+                             int inputSize, int kernelSize) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int halfK = kernelSize / 2;
+
+  if (idx < inputSize) {
+    float sum = 0.0f;
+    for (int i = -halfK; i <= halfK; i++) {
+      if (idx + i >= 0 && idx + i < inputSize) {
+        sum += input[idx + i] * kernel[halfK + i];
+      }
+    }
+    output[idx] = sum;
+  }
+}
