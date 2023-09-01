@@ -1,0 +1,15 @@
+__global__ void dropoutKernel(float* input, float* output, float* mask, float dropout_prob, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    if (idx < size) {
+        // Generate a random number for each thread. Here we use a very simple random logic.
+        float rand_val = (float) (idx * 1234) / INT_MAX; // This isn't a good RNG, but used for illustrative purposes.
+        
+        // If random value is greater than dropout_prob, then keep the neuron, otherwise "drop" it.
+        mask[idx] = (rand_val > dropout_prob) ? 1.0f : 0.0f;
+        
+        // Multiply input by the mask to get the output.
+        output[idx] = input[idx] * mask[idx];
+    }
+}
+
