@@ -111,6 +111,11 @@ void transformerLayer(float *output, const float *input, const float *q_weights,
   float *dropout_mask;
   dropoutKernel<<<..., ...>>>(output, output, dropout_mask, dropout_prob, ...);
 
-  // Don't forget to free GPU memory after usage
-  // e.g., cudaFree(queries), cudaFree(keys), ...
+  cudaFree(queries);
+  cudaFree(keys);
+  cudaFree(values);
+  cudaFree(attention_output);
+  cudaFree(add_norm_output);
+  cudaFree(ff_output);
+  cudaFree(dropout_mask);
 }
