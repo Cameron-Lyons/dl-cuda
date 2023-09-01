@@ -76,3 +76,41 @@ void layer_normalization(float *output, const float *input, const float *gamma,
 
   cudaDeviceSynchronize();
 }
+
+void transformerLayer(float *output, const float *input, const float *q_weights,
+                      const float *k_weights, const float *v_weights,
+                      const float *ff_weights, const float *ff_bias,
+                      const float *gamma, const float *beta, int batch_size,
+                      int sequence_length, int d_model, int num_heads,
+                      float dropout_prob) {
+  float *queries;
+  float *keys;
+  float *values;
+
+  int d_k = d_model / num_heads;
+
+  linearKernel<<<..., ...>>>(queries, input, q_weights, ...);
+  linearKernel<<<..., ...>>>(keys, input, k_weights, ...);
+  linearKernel<<<..., ...>>>(values, input, v_weights, ...);
+
+  float *attention_output;
+  scaled_dot_product_attention_kernel<<<..., ...>>>(attention_output, queries,
+                                                    keys, values, ...);
+
+  float *add_norm_output;
+  layer_norm_kernel<<<..., ...>>>(add_norm_output, attention_output, gamma,
+                                  beta, ...);
+
+  float *ff_output;
+  linearKernel<<<..., ...>>>(ff_output, add_norm_output, ff_weights, ff_bias,
+                             ...);
+  reluKernel<<<..., ...>>>(ff_output, ff_output, ...);
+
+  layer_norm_kernel<<<..., ...>>>(output, ff_output, gamma, beta, ...);
+
+  float *dropout_mask;
+  dropoutKernel<<<..., ...>>>(output, output, dropout_mask, dropout_prob, ...);
+
+  // Don't forget to free GPU memory after usage
+  // e.g., cudaFree(queries), cudaFree(keys), ...
+}
