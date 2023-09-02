@@ -94,3 +94,12 @@ __global__ void updateAdam(float *d_g, float *d_m, float *d_v, float *d_theta,
     d_theta[idx] -= alpha * m_hat / (sqrtf(v_hat) + epsilon);
   }
 }
+
+void Adam(float *d_g, float *d_m, float *d_v, float *d_theta, float alpha,
+          float beta1, float beta2, float epsilon, int t, int n) {
+  int threadsPerBlock = 256;
+  int blocksPerGrid = (n + threadsPerBlock - 1) / threadsPerBlock;
+
+  updateAdam<<<blocksPerGrid, threadsPerBlock>>>(d_g, d_m, d_v, d_theta, alpha,
+                                                 beta1, beta2, epsilon, t, n);
+}
