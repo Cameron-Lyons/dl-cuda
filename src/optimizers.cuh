@@ -70,3 +70,12 @@ __global__ void updateRMSprop(float *d_g, float *d_s, float *d_theta,
     d_theta[idx] -= learning_rate * d_g[idx] / (sqrtf(d_s[idx]) + epsilon);
   }
 }
+
+void RMSprop(float *d_g, float *d_s, float *d_theta, float learning_rate,
+             float decay_rate, float epsilon, int n) {
+  int threadsPerBlock = 256;
+  int blocksPerGrid = (n + threadsPerBlock - 1) / threadsPerBlock;
+
+  updateRMSprop<<<blocksPerGrid, threadsPerBlock>>>(
+      d_g, d_s, d_theta, learning_rate, decay_rate, epsilon, n);
+}
