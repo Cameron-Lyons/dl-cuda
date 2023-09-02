@@ -1,5 +1,6 @@
 #include <cmath>
 #include <cuda_runtime.h>
+
 __global__ void linearLayerKernel(float *X, float *W, float *b, float *Y, int n,
                                   int in_features, int out_features) {
   int row = blockIdx.y * blockDim.y + threadIdx.y;
@@ -47,23 +48,82 @@ void linearLayer(float *h_X, float *h_W, float *h_b, float *h_Y, int n,
 __global__ void lstmKernel(float *x, float *h_prev, float *c_prev, float *Wf,
                            float *Wi, float *Wc, float *Wo, float *bf,
                            float *bi, float *bc, float *bo, float *h, float *c,
-                           int sequence_length) {
+                           int batch_size, int hidden_size) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
-  if (idx < sequence_length) {
-    // Forget gate
-    float ft = sigmoid(dot(Wf, concat(h_prev, x[idx])) + bf);
-    // Input gate
-    float it = sigmoid(dot(Wi, concat(h_prev, x[idx])) + bi);
-    // Cell state
-    float c_tilde = tanh(dot(Wc, concat(h_prev, x[idx])) + bc);
+  if (idx < batch_size) {
+    float combinedVec[2 * hidden_size];
+    float ft = sigmoid(dotProduct(Wf, combinedVec, hidden_size) + bf[idx]);
+    float it = sigmoid(dotProduct(Wi, combinedVec, hidden_size) + bi[idx]);
+    float c_tilde = tanh(dotProduct(Wc, combinedVec, hidden_size) + bc[idx]);
     c[idx] = ft * c_prev[idx] + it * c_tilde;
-    // Output gate
-    float ot = sigmoid(dot(Wo, concat(h_prev, x[idx])) + bo);
-    // Hidden state
+    float ot = sigmoid(dotProduct(Wo, combinedVec, hidden_size) + bo[idx]);
     h[idx] = ot * tanh(c[idx]);
   }
 }
+}
+
+class LSTMLayer {
+private:
+  float *Wf, *Wi, *Wc, *Wo, *bf, *bi, *bc, *bo;
+
+  float *h, *c;
+
+  int hidden_size, batch_size;
+
+public:
+  LSTMLayer(int hidden_size, int batch_size)
+      : hidden_size(hidden_size), batch_size(batch_size) {
+
+    int weightSize =
+        2 * hidden_size * hidden_size; // '2' due to concatenation of h and x
+
+    cudaMalloc(&Wf, weightSize * sizeof(float));
+    cudaMalloc(&Wi, weightSize * sizeof(float));
+    cudaMalloc(&Wc, weightSize * sizeof(float));
+    cudaMalloc(&Wo, weightSize * sizeof(float));
+
+    cudaMalloc(&bf, hidden_size * sizeof(float));
+    cudaMalloc(&bi, hidden_size * sizeof(float));
+    cudaMalloc(&bc, hidden_size * sizeof(float));
+    cudaMalloc(&bo, hidden_size * sizeof(float));
+
+    cudaMalloc(&h, batch_size * hidden_size * sizeof(float));
+    cudaMalloc(&c, batch_size * hidden_size * sizeof(float));
+  }
+
+  ~LSTMLayer() {
+    cudaFree(Wf);
+    cudaFree(Wi);
+    cudaFree(Wc);
+    cudaFree(Wo);
+
+    cudaFree(bf);
+    cudaFree(bi);
+    cudaFree(bc);
+    cudaFree(bo);
+
+    cudaFree(h);
+    cudaFree(c);
+  }
+
+  void forward(float *x, int sequence_length, float *output) {
+    int num_threads = 256; // Adjust based on GPU capabilities
+    int num_blocks = (batch_size + num_threads - 1) / num_threads;
+
+    cudaMemset(h, 0, batch_size * hidden_size * sizeof(float));
+    cudaMemset(c, 0, batch_size * hidden_size * sizeof(float));
+
+    for (int t = 0; t < sequence_length; t++) {
+      lstmKernel<<<num_blocks, num_threads>>>(
+          /*... pass the necessary arguments including x[t] ...*/);
+
+      cudaMemcpy(&output[t * batch_size * hidden_size], h,
+                 batch_size * hidden_size * sizeof(float),
+                 cudaMemcpyDeviceToDevice);
+    }
+  }
+};
 
 __global__ void elmanRnnKernel(float *x, float *h_prev, float *Wxh, float *Whh,
                                float *b_h, float *Why, float *b_y, float *h,
