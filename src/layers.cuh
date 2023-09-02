@@ -41,14 +41,12 @@ __global__ void elmanRnnKernel(float *x, float *h_prev, float *Wxh, float *Whh,
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
   if (idx < sequence_length) {
-    // Compute hidden state
     float hidden_sum = 0.0;
     for (int i = 0; i < HIDDEN_SIZE; i++) {
       hidden_sum += Wxh[idx * HIDDEN_SIZE + i] * x[idx] + Whh[i] * h_prev[idx];
     }
     h[idx] = tanhf(hidden_sum + b_h[idx]);
 
-    // Compute output
     float output_sum = 0.0;
     for (int i = 0; i < OUTPUT_SIZE; i++) {
       output_sum += Why[idx * OUTPUT_SIZE + i] * h[idx];
