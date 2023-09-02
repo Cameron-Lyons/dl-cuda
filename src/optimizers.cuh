@@ -59,3 +59,14 @@ void SGD(float *h_x, float *h_y, float *h_w, float *h_b, float learning_rate,
   cudaFree(d_dw);
   cudaFree(d_db);
 }
+
+__global__ void updateRMSprop(float *d_g, float *d_s, float *d_theta,
+                              float learning_rate, float decay_rate,
+                              float epsilon, int n) {
+  int idx = threadIdx.x + blockIdx.x * blockDim.x;
+  if (idx < n) {
+    d_s[idx] = decay_rate * d_s[idx] + (1 - decay_rate) * d_g[idx] * d_g[idx];
+
+    d_theta[idx] -= learning_rate * d_g[idx] / (sqrtf(d_s[idx]) + epsilon);
+  }
+}
