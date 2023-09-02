@@ -181,8 +181,12 @@ public:
 
     for (int t = 0; t < sequence_length; t++) {
       elmanRnnKernel<<<num_blocks, num_threads>>>(
-          /*... pass the necessary arguments including x[t] ...*/
-      );
+          &x[t * batch_size], // Input at current time step
+          h,                  // Current hidden state
+          Wxh, Whh, b_h, Why, b_y,
+          h, // Updated hidden state (output from kernel)
+          &output[t * batch_size * output_size], // Output at current time step
+          batch_size);
 
       cudaMemcpy(&output[t * batch_size * output_size], y,
                  batch_size * output_size * sizeof(float),
