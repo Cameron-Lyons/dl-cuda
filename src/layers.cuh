@@ -1,5 +1,5 @@
+#include <cmath>
 #include <cuda_runtime.h>
-
 __global__ void linearLayerKernel(float *X, float *W, float *b, float *Y, int n,
                                   int in_features, int out_features) {
   int row = blockIdx.y * blockDim.y + threadIdx.y;
