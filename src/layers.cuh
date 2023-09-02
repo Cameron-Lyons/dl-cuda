@@ -145,6 +145,52 @@ __global__ void elmanRnnKernel(float *x, float *h_prev, float *Wxh, float *Whh,
   }
 }
 
+class ElmanRNNLayer {
+private:
+  float *Wxh, *Whh, *b_h, *Why, *b_y;
+  float *h;
+
+  int hidden_size = HIDDEN_SIZE;
+  int output_size = OUTPUT_SIZE;
+  int batch_size = BATCH_SIZE;
+
+public:
+  ElmanRNNLayer() {
+    cudaMalloc(&Wxh, batch_size * hidden_size * sizeof(float));
+    cudaMalloc(&Whh, hidden_size * hidden_size * sizeof(float));
+    cudaMalloc(&b_h, batch_size * hidden_size * sizeof(float));
+    cudaMalloc(&Why, hidden_size * output_size * sizeof(float));
+    cudaMalloc(&b_y, batch_size * output_size * sizeof(float));
+    cudaMalloc(&h, batch_size * hidden_size * sizeof(float));
+
+    cudaMemset(h, 0, batch_size * hidden_size * sizeof(float));
+  }
+
+  ~ElmanRNNLayer() {
+    cudaFree(Wxh);
+    cudaFree(Whh);
+    cudaFree(b_h);
+    cudaFree(Why);
+    cudaFree(b_y);
+    cudaFree(h);
+  }
+
+  void forward(float *x, int sequence_length, float *output) {
+    int num_threads = 256; // Adjust based on GPU capabilities
+    int num_blocks = (batch_size + num_threads - 1) / num_threads;
+
+    for (int t = 0; t < sequence_length; t++) {
+      elmanRnnKernel<<<num_blocks, num_threads>>>(
+          /*... pass the necessary arguments including x[t] ...*/
+      );
+
+      cudaMemcpy(&output[t * batch_size * output_size], y,
+                 batch_size * output_size * sizeof(float),
+                 cudaMemcpyDeviceToDevice);
+    }
+  }
+};
+
 __global__ void conv1dKernel(float *input, float *kernel, float *output,
                              int inputSize, int kernelSize) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
