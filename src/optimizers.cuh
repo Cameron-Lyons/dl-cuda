@@ -79,3 +79,18 @@ void RMSprop(float *d_g, float *d_s, float *d_theta, float learning_rate,
   updateRMSprop<<<blocksPerGrid, threadsPerBlock>>>(
       d_g, d_s, d_theta, learning_rate, decay_rate, epsilon, n);
 }
+
+__global__ void updateAdam(float *d_g, float *d_m, float *d_v, float *d_theta,
+                           float alpha, float beta1, float beta2, float epsilon,
+                           int t, int n) {
+  int idx = threadIdx.x + blockIdx.x * blockDim.x;
+  if (idx < n) {
+    d_m[idx] = beta1 * d_m[idx] + (1.0f - beta1) * d_g[idx];
+    d_v[idx] = beta2 * d_v[idx] + (1.0f - beta2) * d_g[idx] * d_g[idx];
+
+    float m_hat = d_m[idx] / (1.0f - powf(beta1, t));
+    float v_hat = d_v[idx] / (1.0f - powf(beta2, t));
+
+    d_theta[idx] -= alpha * m_hat / (sqrtf(v_hat) + epsilon);
+  }
+}
