@@ -1,3 +1,4 @@
+const short N_THREADS = 256;
 
 struct Tensor {
   float *data;
@@ -51,8 +52,7 @@ struct Tensor {
     float *resultData;
     cudaMalloc(&resultData, sizeof(float) * shapeSize);
 
-    int threadsPerBlock = 256; // typical value, can be tuned
-    int blocks = (shapeSize + threadsPerBlock - 1) / threadsPerBlock;
+    int blocks = (shapeSize + N_THREADS - 1) / threadsPerBlock;
 
     addKernel<<<blocks, threadsPerBlock>>>(data, other.data, resultData,
                                            shapeSize);
