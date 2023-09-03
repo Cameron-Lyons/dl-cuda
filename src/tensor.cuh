@@ -60,6 +60,19 @@ struct Tensor {
     result.data = resultData;
     return result;
   }
+  __global__ void scalarMulKernel(float *A, float scalar, int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+      A[idx] *= scalar;
+    }
+  }
+
+  void operator*=(float scalar) {
+    int threadsPerBlock = 256;
+    int blocks = (shapeSize + threadsPerBlock - 1) / threadsPerBlock;
+
+    scalarMulKernel<<<blocks, threadsPerBlock>>>(data, scalar, shapeSize);
+  }
 };
 }
 ;
