@@ -5,24 +5,19 @@ struct Tensor {
   int *strides;  // pointer to an array on device
   int shapeSize; // size of shape array
 
-  // Constructor to allocate memory on the GPU
   Tensor(int shapeSize) : shapeSize(shapeSize) {
     cudaMalloc(&shape, sizeof(int) * shapeSize);
     cudaMalloc(&strides, sizeof(int) * shapeSize);
   }
 
-  // Destructor to free memory on the GPU
   ~Tensor() {
     cudaFree(shape);
     cudaFree(strides);
   }
 
-  // Host function to calculate strides
   void calculateStrides() {
     int *hostStrides = new int[shapeSize];
     int *hostShape = new int[shapeSize];
-
-    // Assuming shape data has been already copied to hostShape
 
     hostStrides[shapeSize - 1] = 1;
     for (int i = shapeSize - 2; i >= 0; --i) {
