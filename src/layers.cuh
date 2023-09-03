@@ -242,7 +242,7 @@ public:
     cudaMemcpy(d_kernel, h_kernel, kernelSize * sizeof(float),
                cudaMemcpyHostToDevice);
 
-    int num_threads = 256; // Adjust based on GPU
+    int num_threads = 256;
     int num_blocks = (inputSize + num_threads - 1) / num_threads;
 
     conv1dKernel<<<num_blocks, num_threads>>>(d_input, d_kernel, d_output,
@@ -279,3 +279,49 @@ conv2dKernel(float *input, int inputWidth, int inputHeight, float *kernel,
     output[y * inputWidth + x] = value;
   }
 }
+
+class Conv2DLayer {
+private:
+  float *d_input;  // Device input
+  float *d_kernel; // Device kernel/filter
+  float *d_output; // Device output
+
+  int inputWidth, inputHeight;
+  int kernelWidth, kernelHeight;
+
+public:
+  Conv2DLayer(int inputWidth, int inputHeight, int kernelWidth,
+              int kernelHeight)
+      : inputWidth(inputWidth), inputHeight(inputHeight),
+        kernelWidth(kernelWidth), kernelHeight(kernelHeight) {
+    cudaMalloc(&d_input, inputWidth * inputHeight * sizeof(float));
+    cudaMalloc(&d_kernel, kernelWidth * kernelHeight * sizeof(float));
+    cudaMalloc(&d_output, inputWidth * inputHeight *
+                              sizeof(float)); // Assuming "same" padding
+  }
+
+  ~Conv2DLayer() {
+    cudaFree(d_input);
+    cudaFree(d_kernel);
+    cudaFree(d_output);
+  }
+
+  void forward(float *h_input, float *h_kernel, float *h_output) {
+    cudaMemcpy(d_input, h_input, inputWidth * inputHeight * sizeof(float),
+               cudaMemcpyHostToDevice);
+    cudaMemcpy(d_kernel, h_kernel, kernelWidth * kernelHeight * sizeof(float),
+               cudaMemcpyHostToDevice);
+
+    dim3 block_size(16, 16); // Adjust based on GPU capabilities, a common
+                             // choice is 16x16 threads
+    dim3 grid_size((inputWidth + block_size.x - 1) / block_size.x,
+                   (inputHeight + block_size.y - 1) / block_size.y);
+
+    conv2dKernel<<<grid_size, block_size>>>(d_input, inputWidth, inputHeight,
+                                            d_kernel, kernelWidth, kernelHeight,
+                                            d_output);
+
+    cudaMemcpy(h_output, d_output, inputWidth * inputHeight * sizeof(float),
+               cudaMemcpyDeviceToHost);
+  }
+};
