@@ -37,6 +37,29 @@ struct Tensor {
     }
     return index;
   }
+  __global__ void addKernel(const float *A, const float *B, float *C,
+                            int size) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < size) {
+      C[idx] = A[idx] + B[idx];
+    }
+  }
+
+  Tensor operator+(const Tensor &other) {
+    Tensor result(shapeSize);
+
+    float *resultData;
+    cudaMalloc(&resultData, sizeof(float) * shapeSize);
+
+    int threadsPerBlock = 256; // typical value, can be tuned
+    int blocks = (shapeSize + threadsPerBlock - 1) / threadsPerBlock;
+
+    addKernel<<<blocks, threadsPerBlock>>>(data, other.data, resultData,
+                                           shapeSize);
+
+    result.data = resultData;
+    return result;
+  }
 };
 }
 ;
