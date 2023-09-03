@@ -1,7 +1,7 @@
 #include <cmath>
 #include <cuda_runtime.h>
 
-const short int NUM_THREADS = 256;
+const short NUM_THREADS = 256;
 
 __global__ void linearLayerKernel(float *X, float *W, float *b, float *Y, int n,
                                   int in_features, int out_features) {
