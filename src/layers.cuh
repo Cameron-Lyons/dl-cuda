@@ -176,7 +176,7 @@ public:
   }
 
   void forward(float *x, int sequence_length, float *output) {
-    int num_threads = 256; // Adjust based on GPU capabilities
+    int num_threads = 256; // Adjust based on GPU
     int num_blocks = (batch_size + num_threads - 1) / num_threads;
 
     for (int t = 0; t < sequence_length; t++) {
@@ -211,9 +211,49 @@ __global__ void conv1dKernel(float *input, float *kernel, float *output,
   }
 }
 
-__global__ void conv2dKernel(float *input, int inputWidth, int inputHeight,
-                             float *kernel, int kernelWidth, int kernelHeight,
-                             float *output) {
+class Conv1DLayer {
+private:
+  float *d_input;  // Device input
+  float *d_kernel; // Device kernel/filter
+  float *d_output; // Device output
+
+  int inputSize;
+  int kernelSize;
+
+public:
+  Conv1DLayer(int inputSize, int kernelSize)
+      : inputSize(inputSize), kernelSize(kernelSize) {
+    cudaMalloc(&d_input, inputSize * sizeof(float));
+    cudaMalloc(&d_kernel, kernelSize * sizeof(float));
+    cudaMalloc(&d_output, inputSize * sizeof(float));
+  }
+
+  ~Conv1DLayer() {
+    cudaFree(d_input);
+    cudaFree(d_kernel);
+    cudaFree(d_output);
+  }
+
+  void forward(float *h_input, float *h_kernel, float *h_output) {
+    cudaMemcpy(d_input, h_input, inputSize * sizeof(float),
+               cudaMemcpyHostToDevice);
+    cudaMemcpy(d_kernel, h_kernel, kernelSize * sizeof(float),
+               cudaMemcpyHostToDevice);
+
+    int num_threads = 256; // Adjust based on GPU
+    int num_blocks = (inputSize + num_threads - 1) / num_threads;
+
+    conv1dKernel<<<num_blocks, num_threads>>>(d_input, d_kernel, d_output,
+                                              inputSize, kernelSize);
+
+    cudaMemcpy(h_output, d_output, inputSize * sizeof(float),
+               cudaMemcpyDeviceToHost);
+  }
+}
+
+__global__ void
+conv2dKernel(float *input, int inputWidth, int inputHeight, float *kernel,
+             int kernelWidth, int kernelHeight, float *output) {
   int x = blockIdx.x * blockDim.x + threadIdx.x;
   int y = blockIdx.y * blockDim.y + threadIdx.y;
 
