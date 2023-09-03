@@ -73,6 +73,40 @@ struct Tensor {
 
     scalarMulKernel<<<blocks, threadsPerBlock>>>(data, scalar, shapeSize);
   }
+  __global__ void matMulKernel(const float *A, const float *B, float *C,
+                               int ARows, int ACols, int BCols) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    float sum = 0;
+    if (row < ARows && col < BCols) {
+      for (int k = 0; k < ACols; ++k) {
+        sum += A[row * ACols + k] * B[k * BCols + col];
+      }
+      C[row * BCols + col] = sum;
+    }
+  }
+
+  Tensor matMul(const Tensor &other) {
+    int ARows = shape[0];
+    int ACols = shape[1];
+    int BCols = other.shape[1];
+
+    Tensor result(2);
+
+    float *resultData;
+    cudaMalloc(&resultData, sizeof(float) * ARows * BCols);
+
+    dim3 threadsPerBlock(16, 16); // 2D block
+    dim3 blocks((BCols + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                (ARows + threadsPerBlock.y - 1) / threadsPerBlock.y);
+
+    matMulKernel<<<blocks, threadsPerBlock>>>(data, other.data, resultData,
+                                              ARows, ACols, BCols);
+
+    result.data = resultData;
+    return result;
+  }
 };
 }
 ;
