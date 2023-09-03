@@ -1,29 +1,47 @@
-#include <cuda_runtime.h>
-#include <vector>
 
-struct Tensor
-{
-    float *data;
-    std::vector<int> shape;
-    std::vector<int> strides;
+struct Tensor {
+  float *data;
+  int *shape;    // pointer to an array on device
+  int *strides;  // pointer to an array on device
+  int shapeSize; // size of shape array
 
-    void calculateStrides()
-    {
-        strides.resize(shape.size());
-        strides[shape.size() - 1] = 1;
-        for (int i = shape.size() - 2; i >= 0; --i)
-        {
-            strides[i] = strides[i + 1] * shape[i + 1];
-        }
+  // Constructor to allocate memory on the GPU
+  Tensor(int shapeSize) : shapeSize(shapeSize) {
+    cudaMalloc(&shape, sizeof(int) * shapeSize);
+    cudaMalloc(&strides, sizeof(int) * shapeSize);
+  }
+
+  // Destructor to free memory on the GPU
+  ~Tensor() {
+    cudaFree(shape);
+    cudaFree(strides);
+  }
+
+  // Host function to calculate strides
+  void calculateStrides() {
+    int *hostStrides = new int[shapeSize];
+    int *hostShape = new int[shapeSize];
+
+    // Assuming shape data has been already copied to hostShape
+
+    hostStrides[shapeSize - 1] = 1;
+    for (int i = shapeSize - 2; i >= 0; --i) {
+      hostStrides[i] = hostStrides[i + 1] * hostShape[i + 1];
     }
 
-    int getLinearIndex(const std::vector<int> &indices) const
-    {
-        int index = 0;
-        for (size_t i = 0; i < shape.size(); ++i)
-        {
-            index += indices[i] * strides[i];
-        }
-        return index;
+    cudaMemcpy(strides, hostStrides, sizeof(int) * shapeSize,
+               cudaMemcpyHostToDevice);
+    delete[] hostStrides;
+    delete[] hostShape;
+  }
+
+  __host__ __device__ int getLinearIndex(const int *indices) const {
+    int index = 0;
+    for (int i = 0; i < shapeSize; ++i) {
+      index += indices[i] * strides[i];
     }
+    return index;
+  }
 };
+}
+;
