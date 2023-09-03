@@ -1,6 +1,8 @@
 #include <cmath>
 #include <cuda_runtime.h>
 
+const short int NUM_THREADS = 256;
+
 __global__ void linearLayerKernel(float *X, float *W, float *b, float *Y, int n,
                                   int in_features, int out_features) {
   int row = blockIdx.y * blockDim.y + threadIdx.y;
@@ -108,7 +110,7 @@ public:
   }
 
   void forward(float *x, int sequence_length, float *output) {
-    int num_threads = 256; // Adjust based on GPU capabilities
+    int num_threads = NUM_THREADS;
     int num_blocks = (batch_size + num_threads - 1) / num_threads;
 
     cudaMemset(h, 0, batch_size * hidden_size * sizeof(float));
@@ -176,7 +178,7 @@ public:
   }
 
   void forward(float *x, int sequence_length, float *output) {
-    int num_threads = 256; // Adjust based on GPU
+    int num_threads = NUM_THREADS;
     int num_blocks = (batch_size + num_threads - 1) / num_threads;
 
     for (int t = 0; t < sequence_length; t++) {
