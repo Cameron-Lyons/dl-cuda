@@ -312,8 +312,7 @@ public:
     cudaMemcpy(d_kernel, h_kernel, kernelWidth * kernelHeight * sizeof(float),
                cudaMemcpyHostToDevice);
 
-    dim3 block_size(16, 16); // Adjust based on GPU capabilities, a common
-                             // choice is 16x16 threads
+    dim3 block_size(16, 16);
     dim3 grid_size((inputWidth + block_size.x - 1) / block_size.x,
                    (inputHeight + block_size.y - 1) / block_size.y);
 
