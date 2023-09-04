@@ -21,3 +21,26 @@ void loadCSV(const std::string &filename, std::vector<float *> &data) {
     data.push_back(rowData);
   }
 }
+
+int main() {
+  std::vector<float *> data;
+  loadCSV("your_data.csv", data);
+
+  LinearLayer layer(data[0].size(), 10, 5);
+  Sequential model;
+  model.add(&layer);
+
+  for (auto input : data) {
+    float output[5];
+    model.forward(input, output);
+
+    for (int i = 0; i < 5; i++) {
+      std::cout << output[i] << " ";
+    }
+    std::cout << std::endl;
+
+    delete[] input;
+  }
+
+  return 0;
+}
