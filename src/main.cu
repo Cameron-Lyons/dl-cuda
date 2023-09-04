@@ -1,3 +1,5 @@
+#include "layers.cuh"
+#include "sequential.cuh"
 #include <fstream>
 #include <iostream>
 #include <sstream>
