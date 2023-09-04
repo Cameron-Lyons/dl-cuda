@@ -79,7 +79,6 @@ __global__ void lstmKernel(float *x, float *h_prev, float *c_prev, float *Wf,
     h[idx] = ot * tanh(c[idx]);
   }
 }
-}
 
 class LSTMLayer {
 private:
