@@ -17,35 +17,45 @@ __global__ void linearLayerKernel(float *X, float *W, float *b, float *Y, int n,
   }
 }
 
-void linearLayer(float *h_X, float *h_W, float *h_b, float *h_Y, int n,
-                 int in_features, int out_features) {
+class LinearLayer {
+private:
   float *d_X, *d_W, *d_b, *d_Y;
+  int n, in_features, out_features;
 
-  cudaMalloc((void **)&d_X, n * in_features * sizeof(float));
-  cudaMalloc((void **)&d_W, in_features * out_features * sizeof(float));
-  cudaMalloc((void **)&d_b, out_features * sizeof(float));
-  cudaMalloc((void **)&d_Y, n * out_features * sizeof(float));
+public:
+  LinearLayer(int n, int in_features, int out_features)
+      : n(n), in_features(in_features), out_features(out_features) {
+    cudaMalloc((void **)&d_X, n * in_features * sizeof(float));
+    cudaMalloc((void **)&d_W, in_features * out_features * sizeof(float));
+    cudaMalloc((void **)&d_b, out_features * sizeof(float));
+    cudaMalloc((void **)&d_Y, n * out_features * sizeof(float));
+  }
 
-  cudaMemcpy(d_X, h_X, n * in_features * sizeof(float), cudaMemcpyHostToDevice);
-  cudaMemcpy(d_W, h_W, in_features * out_features * sizeof(float),
-             cudaMemcpyHostToDevice);
-  cudaMemcpy(d_b, h_b, out_features * sizeof(float), cudaMemcpyHostToDevice);
+  ~LinearLayer() {
+    cudaFree(d_X);
+    cudaFree(d_W);
+    cudaFree(d_b);
+    cudaFree(d_Y);
+  }
 
-  dim3 threadsPerBlock(32, 32); // Change this based on GPU
-  dim3 blocks((out_features + threadsPerBlock.x - 1) / threadsPerBlock.x,
-              (n + threadsPerBlock.y - 1) / threadsPerBlock.y);
+  void forward(float *h_X, float *h_W, float *h_b, float *h_Y) {
+    cudaMemcpy(d_X, h_X, n * in_features * sizeof(float),
+               cudaMemcpyHostToDevice);
+    cudaMemcpy(d_W, h_W, in_features * out_features * sizeof(float),
+               cudaMemcpyHostToDevice);
+    cudaMemcpy(d_b, h_b, out_features * sizeof(float), cudaMemcpyHostToDevice);
 
-  linearLayerKernel<<<blocks, threadsPerBlock>>>(d_X, d_W, d_b, d_Y, n,
-                                                 in_features, out_features);
+    dim3 threadsPerBlock(32, 32); // Change this based on GPU
+    dim3 blocks((out_features + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                (n + threadsPerBlock.y - 1) / threadsPerBlock.y);
 
-  cudaMemcpy(h_Y, d_Y, n * out_features * sizeof(float),
-             cudaMemcpyDeviceToHost);
+    linearLayerKernel<<<blocks, threadsPerBlock>>>(d_X, d_W, d_b, d_Y, n,
+                                                   in_features, out_features);
 
-  cudaFree(d_X);
-  cudaFree(d_W);
-  cudaFree(d_b);
-  cudaFree(d_Y);
-}
+    cudaMemcpy(h_Y, d_Y, n * out_features * sizeof(float),
+               cudaMemcpyDeviceToHost);
+  }
+};
 
 __global__ void lstmKernel(float *x, float *h_prev, float *c_prev, float *Wf,
                            float *Wi, float *Wc, float *Wo, float *bf,
