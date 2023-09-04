@@ -22,21 +22,27 @@ private:
   float *d_X, *d_W, *d_b, *d_Y;
   int n, in_features, out_features;
 
-public:
-  LinearLayer(int n, int in_features, int out_features)
-      : n(n), in_features(in_features), out_features(out_features) {
+  void allocateDeviceMemory() {
     cudaMalloc((void **)&d_X, n * in_features * sizeof(float));
     cudaMalloc((void **)&d_W, in_features * out_features * sizeof(float));
     cudaMalloc((void **)&d_b, out_features * sizeof(float));
     cudaMalloc((void **)&d_Y, n * out_features * sizeof(float));
   }
 
-  ~LinearLayer() {
+  void freeDeviceMemory() {
     cudaFree(d_X);
     cudaFree(d_W);
     cudaFree(d_b);
     cudaFree(d_Y);
   }
+
+public:
+  LinearLayer(int n, int in_features, int out_features)
+      : n(n), in_features(in_features), out_features(out_features) {
+    allocateDeviceMemory();
+  }
+
+  ~LinearLayer() { freeDeviceMemory(); }
 
   void forward(float *h_X, float *h_W, float *h_b, float *h_Y) {
     cudaMemcpy(d_X, h_X, n * in_features * sizeof(float),
@@ -45,7 +51,7 @@ public:
                cudaMemcpyHostToDevice);
     cudaMemcpy(d_b, h_b, out_features * sizeof(float), cudaMemcpyHostToDevice);
 
-    dim3 threadsPerBlock(32, 32); // Change this based on GPU
+    dim3 threadsPerBlock(32, 32);
     dim3 blocks((out_features + threadsPerBlock.x - 1) / threadsPerBlock.x,
                 (n + threadsPerBlock.y - 1) / threadsPerBlock.y);
 
