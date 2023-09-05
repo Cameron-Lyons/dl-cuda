@@ -266,11 +266,11 @@ public:
     cudaMemcpy(h_output, d_output, inputSize * sizeof(float),
                cudaMemcpyDeviceToHost);
   }
-}
+};
 
-__global__ void
-conv2dKernel(float *input, int inputWidth, int inputHeight, float *kernel,
-             int kernelWidth, int kernelHeight, float *output) {
+__global__ void conv2dKernel(float *input, int inputWidth, int inputHeight,
+                             float *kernel, int kernelWidth, int kernelHeight,
+                             float *output) {
   int x = blockIdx.x * blockDim.x + threadIdx.x;
   int y = blockIdx.y * blockDim.y + threadIdx.y;
 
