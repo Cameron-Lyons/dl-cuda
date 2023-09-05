@@ -28,13 +28,19 @@ int main() {
   std::vector<float *> data;
   loadCSV("your_data.csv", data);
 
+  if (data.empty()) {
+    std::cerr << "No data loaded from CSV." << std::endl;
+    return 1; // Error code
+  }
+
   LinearLayer layer(data[0].size(), 10, 5);
   Sequential model;
   model.add(&layer);
 
   for (auto input : data) {
     float output[5];
-    model.forward(input, output);
+    model.forward(input, output, data[0].size() * sizeof(float),
+                  5 * sizeof(float));
 
     for (int i = 0; i < 5; i++) {
       std::cout << output[i] << " ";
