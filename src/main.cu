@@ -1,5 +1,6 @@
 #include "layers.cuh"
 #include "sequential.cuh"
+#include "transformer.cuh"
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -30,7 +31,7 @@ int main() {
 
   if (data.empty()) {
     std::cerr << "No data loaded from CSV." << std::endl;
-    return 1; // Error code
+    return 1;
   }
 
   LinearLayer layer(data[0].size(), 10, 5);
