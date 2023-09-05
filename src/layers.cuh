@@ -167,9 +167,9 @@ private:
   float *Wxh, *Whh, *b_h, *Why, *b_y;
   float *h;
 
-  int hidden_size = HIDDEN_SIZE;
-  int output_size = OUTPUT_SIZE;
-  int batch_size = BATCH_SIZE;
+  const int hidden_size = 16;
+  const int output_size = 16;
+  const int batch_size = 256;
 
 public:
   ElmanRNNLayer() {
