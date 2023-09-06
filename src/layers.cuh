@@ -3,18 +3,18 @@
 
 const short NUM_THREADS = 256;
 
-__global__ void linearLayerKernel(float *X, float *W, float *b, float *Y, int n,
-                                  int in_features, int out_features) {
-  int row = blockIdx.y * blockDim.y + threadIdx.y;
-  int col = blockIdx.x * blockDim.x + threadIdx.x;
+__global__ void linearLayerKernel(float *d_X, float *d_W, float *d_b, float *d_Y,
+                                  int n, int in_features, int out_features) {
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
 
-  if (row < n && col < out_features) {
-    float sum = 0.0f;
-    for (int i = 0; i < in_features; i++) {
-      sum += X[row * in_features + i] * W[i * out_features + col];
+    if (col < out_features && row < n) {
+        float sum = 0.0f;
+        for (int i = 0; i < in_features; ++i) {
+            sum += d_X[row * in_features + i] * d_W[i * out_features + col];
+        }
+        d_Y[row * out_features + col] = sum + d_b[col];
     }
-    Y[row * out_features + col] = sum + b[col];
-  }
 }
 
 class LinearLayer {
