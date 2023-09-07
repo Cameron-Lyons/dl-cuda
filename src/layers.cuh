@@ -64,7 +64,7 @@ public:
     }
 };
 
-class LSTMLayer {
+class LSTMLayer : public Operation {
 private:
   float *Wf, *Wi, *Wc, *Wo, *bf, *bi, *bc, *bo;
 
