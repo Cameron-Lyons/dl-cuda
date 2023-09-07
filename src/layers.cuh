@@ -146,7 +146,7 @@ __global__ void elmanRnnKernel(float *x, float *h_prev, float *Wxh, float *Whh,
   }
 }
 
-class ElmanRNNLayer {
+class ElmanRNNLayer : public Operation {
 private:
   float *Wxh, *Whh, *b_h, *Why, *b_y;
   float *h;
