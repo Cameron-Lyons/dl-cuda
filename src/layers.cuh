@@ -17,7 +17,8 @@ __global__ void linearLayerKernel(float *d_X, float *d_W, float *d_b, float *d_Y
     }
 }
 
-class LinearLayer {
+
+class LinearLayer : public Operation {
 private:
     float *d_X, *d_W, *d_b, *d_Y;
     int n, in_features, out_features;
@@ -49,8 +50,7 @@ public:
                    cudaMemcpyHostToDevice);
         cudaMemcpy(d_W, h_W, in_features * out_features * sizeof(float),
                    cudaMemcpyHostToDevice);
-        cudaMemcpy(d_b, h_b, out_features * sizeof(float),
-                   cudaMemcpyHostToDevice);
+        cudaMemcpy(d_b, h_b, out_features * sizeof(float), cudaMemcpyHostToDevice);
 
         dim3 threadsPerBlock(32, 32);
         dim3 blocks((out_features + threadsPerBlock.x - 1) / threadsPerBlock.x,
@@ -62,22 +62,7 @@ public:
         cudaMemcpy(h_Y, d_Y, n * out_features * sizeof(float),
                    cudaMemcpyDeviceToHost);
     }
-};__global__ void lstmKernel(float *x, float *h_prev, float *c_prev, float *Wf,
-                           float *Wi, float *Wc, float *Wo, float *bf,
-                           float *bi, float *bc, float *bo, float *h, float *c,
-                           int batch_size, int hidden_size) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-  if (idx < batch_size) {
-    float combinedVec[2 * hidden_size];
-    float ft = sigmoid(dotProduct(Wf, combinedVec, hidden_size) + bf[idx]);
-    float it = sigmoid(dotProduct(Wi, combinedVec, hidden_size) + bi[idx]);
-    float c_tilde = tanh(dotProduct(Wc, combinedVec, hidden_size) + bc[idx]);
-    c[idx] = ft * c_prev[idx] + it * c_tilde;
-    float ot = sigmoid(dotProduct(Wo, combinedVec, hidden_size) + bo[idx]);
-    h[idx] = ot * tanh(c[idx]);
-  }
-}
+};
 
 class LSTMLayer {
 private:
