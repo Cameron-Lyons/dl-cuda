@@ -279,7 +279,7 @@ __global__ void conv2dKernel(float *input, int inputWidth, int inputHeight,
   }
 }
 
-class Conv2DLayer {
+class Conv2DLayer : public Operation {
 private:
   float *d_input;  // Device input
   float *d_kernel; // Device kernel/filter
