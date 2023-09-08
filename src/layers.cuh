@@ -3,65 +3,65 @@
 
 const short NUM_THREADS = 256;
 
-__global__ void linearLayerKernel(float *d_X, float *d_W, float *d_b, float *d_Y,
-                                  int n, int in_features, int out_features) {
-    int col = blockIdx.x * blockDim.x + threadIdx.x;
-    int row = blockIdx.y * blockDim.y + threadIdx.y;
+__global__ void linearLayerKernel(float *d_X, float *d_W, float *d_b,
+                                  float *d_Y, int n, int in_features,
+                                  int out_features) {
+  int col = blockIdx.x * blockDim.x + threadIdx.x;
+  int row = blockIdx.y * blockDim.y + threadIdx.y;
 
-    if (col < out_features && row < n) {
-        float sum = 0.0f;
-        for (int i = 0; i < in_features; ++i) {
-            sum += d_X[row * in_features + i] * d_W[i * out_features + col];
-        }
-        d_Y[row * out_features + col] = sum + d_b[col];
+  if (col < out_features && row < n) {
+    float sum = 0.0f;
+    for (int i = 0; i < in_features; ++i) {
+      sum += d_X[row * in_features + i] * d_W[i * out_features + col];
     }
+    d_Y[row * out_features + col] = sum + d_b[col];
+  }
 }
-
 
 class LinearLayer : public Operation {
 private:
-    float *d_X, *d_W, *d_b, *d_Y;
-    int n, in_features, out_features;
+  float *d_X, *d_W, *d_b, *d_Y;
+  int n, in_features, out_features;
 
-    void allocateDeviceMemory() {
-        cudaMalloc((void **)&d_X, n * in_features * sizeof(float));
-        cudaMalloc((void **)&d_W, in_features * out_features * sizeof(float));
-        cudaMalloc((void **)&d_b, out_features * sizeof(float));
-        cudaMalloc((void **)&d_Y, n * out_features * sizeof(float));
-    }
+  void allocateDeviceMemory() {
+    cudaMalloc((void **)&d_X, n * in_features * sizeof(float));
+    cudaMalloc((void **)&d_W, in_features * out_features * sizeof(float));
+    cudaMalloc((void **)&d_b, out_features * sizeof(float));
+    cudaMalloc((void **)&d_Y, n * out_features * sizeof(float));
+  }
 
-    void freeDeviceMemory() {
-        cudaFree(d_X);
-        cudaFree(d_W);
-        cudaFree(d_b);
-        cudaFree(d_Y);
-    }
+  void freeDeviceMemory() {
+    cudaFree(d_X);
+    cudaFree(d_W);
+    cudaFree(d_b);
+    cudaFree(d_Y);
+  }
 
 public:
-    LinearLayer(int n, int in_features, int out_features)
-        : n(n), in_features(in_features), out_features(out_features) {
-        allocateDeviceMemory();
-    }
+  LinearLayer(int n, int in_features, int out_features)
+      : n(n), in_features(in_features), out_features(out_features) {
+    allocateDeviceMemory();
+  }
 
-    ~LinearLayer() { freeDeviceMemory(); }
+  ~LinearLayer() { freeDeviceMemory(); }
 
-    void forward(float *h_X, float *h_W, float *h_b, float *h_Y) {
-        cudaMemcpy(d_X, h_X, n * in_features * sizeof(float),
-                   cudaMemcpyHostToDevice);
-        cudaMemcpy(d_W, h_W, in_features * out_features * sizeof(float),
-                   cudaMemcpyHostToDevice);
-        cudaMemcpy(d_b, h_b, out_features * sizeof(float), cudaMemcpyHostToDevice);
+  void forward(float *h_X, float *h_W, float *h_b, float *h_Y) {
+    cudaMemcpy(d_X, h_X, n * in_features * sizeof(float),
+               cudaMemcpyHostToDevice);
+    cudaMemcpy(d_W, h_W, in_features * out_features * sizeof(float),
+               cudaMemcpyHostToDevice);
+    cudaMemcpy(d_b, h_b, out_features * sizeof(float), cudaMemcpyHostToDevice);
 
-        dim3 threadsPerBlock(32, 32);
-        dim3 blocks((out_features + threadsPerBlock.x - 1) / threadsPerBlock.x,
-                    (n + threadsPerBlock.y - 1) / threadsPerBlock.y);
+    dim3 threadsPerBlock(32, 32);
+    dim3 blocks((out_features + threadsPerBlock.x - 1) / threadsPerBlock.x,
+                (n + threadsPerBlock.y - 1) / threadsPerBlock.y);
 
-        linearLayerKernel<<<blocks, threadsPerBlock>>>(d_X, d_W, d_b, d_Y, n,
-                                                       in_features, out_features);
+    linearLayerKernel<<<blocks, threadsPerBlock>>>(d_X, d_W, d_b, d_Y, n,
+                                                   in_features, out_features);
 
-        cudaMemcpy(h_Y, d_Y, n * out_features * sizeof(float),
-                   cudaMemcpyDeviceToHost);
-    }
+    cudaMemcpy(h_Y, d_Y, n * out_features * sizeof(float),
+               cudaMemcpyDeviceToHost);
+  }
 };
 
 class LSTMLayer : public Operation {

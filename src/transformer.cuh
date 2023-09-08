@@ -1,5 +1,7 @@
 #include <cuda_runtime.h>
 
+const short N_THREADS = 256;
+
 __global__ void scaled_dot_product_attention_kernel(
     float *output, const float *queries, const float *keys, const float *values,
     int sequence_length, int d_k, float scaling_factor) {
@@ -68,7 +70,7 @@ __global__ void layer_norm_kernel(float *output, const float *input,
 void layer_normalization(float *output, const float *input, const float *gamma,
                          const float *beta, int batch_size, int feature_size,
                          float epsilon = 1e-5) {
-  dim3 threadsPerBlock(256);
+  dim3 threadsPerBlock(N_THREADS);
   dim3 numBlocks((batch_size + threadsPerBlock.x - 1) / threadsPerBlock.x);
 
   layer_norm_kernel<<<numBlocks, threadsPerBlock>>>(output, input, gamma, beta,
