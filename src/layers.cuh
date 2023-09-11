@@ -115,211 +115,216 @@ public:
     cudaMemset(h, 0, batch_size * hidden_size * sizeof(float));
     cudaMemset(c, 0, batch_size * hidden_size * sizeof(float));
 
+    float *x_t = nullptr;
+
     for (int t = 0; t < sequence_length; t++) {
+      x_t = x + t * batch_size * hidden_size;
+
       lstmKernel<<<num_blocks, num_threads>>>(
-          /*... pass the necessary arguments including x[t] ...*/);
+          x_t, Wf, Wi, Wc, Wo, bf, bi, bc, bo, h, c, hidden_size, batch_size);
 
       cudaMemcpy(&output[t * batch_size * hidden_size], h,
                  batch_size * hidden_size * sizeof(float),
                  cudaMemcpyDeviceToDevice);
     }
   }
-};
 
-__global__ void elmanRnnKernel(float *x, float *h_prev, float *Wxh, float *Whh,
-                               float *b_h, float *Why, float *b_y, float *h,
-                               float *y, int sequence_length) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  __global__ void elmanRnnKernel(float *x, float *h_prev, float *Wxh,
+                                 float *Whh, float *b_h, float *Why, float *b_y,
+                                 float *h, float *y, int sequence_length) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
-  if (idx < sequence_length) {
-    float hidden_sum = 0.0;
-    for (int i = 0; i < HIDDEN_SIZE; i++) {
-      hidden_sum += Wxh[idx * HIDDEN_SIZE + i] * x[idx] + Whh[i] * h_prev[idx];
-    }
-    h[idx] = tanhf(hidden_sum + b_h[idx]);
+    if (idx < sequence_length) {
+      float hidden_sum = 0.0;
+      for (int i = 0; i < HIDDEN_SIZE; i++) {
+        hidden_sum +=
+            Wxh[idx * HIDDEN_SIZE + i] * x[idx] + Whh[i] * h_prev[idx];
+      }
+      h[idx] = tanhf(hidden_sum + b_h[idx]);
 
-    float output_sum = 0.0;
-    for (int i = 0; i < OUTPUT_SIZE; i++) {
-      output_sum += Why[idx * OUTPUT_SIZE + i] * h[idx];
-    }
-    y[idx] = output_sum + b_y[idx];
-  }
-}
-
-class ElmanRNNLayer : public Operation {
-private:
-  float *Wxh, *Whh, *b_h, *Why, *b_y;
-  float *h;
-
-  const int hidden_size = 16;
-  const int output_size = 16;
-  const int batch_size = 256;
-
-public:
-  ElmanRNNLayer() {
-    cudaMalloc(&Wxh, batch_size * hidden_size * sizeof(float));
-    cudaMalloc(&Whh, hidden_size * hidden_size * sizeof(float));
-    cudaMalloc(&b_h, batch_size * hidden_size * sizeof(float));
-    cudaMalloc(&Why, hidden_size * output_size * sizeof(float));
-    cudaMalloc(&b_y, batch_size * output_size * sizeof(float));
-    cudaMalloc(&h, batch_size * hidden_size * sizeof(float));
-
-    cudaMemset(h, 0, batch_size * hidden_size * sizeof(float));
-  }
-
-  ~ElmanRNNLayer() {
-    cudaFree(Wxh);
-    cudaFree(Whh);
-    cudaFree(b_h);
-    cudaFree(Why);
-    cudaFree(b_y);
-    cudaFree(h);
-  }
-
-  void forward(float *x, int sequence_length, float *output) {
-    int num_threads = NUM_THREADS;
-    int num_blocks = (batch_size + num_threads - 1) / num_threads;
-
-    for (int t = 0; t < sequence_length; t++) {
-      elmanRnnKernel<<<num_blocks, num_threads>>>(
-          &x[t * batch_size], // Input at current time step
-          h,                  // Current hidden state
-          Wxh, Whh, b_h, Why, b_y,
-          h, // Updated hidden state (output from kernel)
-          &output[t * batch_size * output_size], // Output at current time step
-          batch_size);
-
-      cudaMemcpy(&output[t * batch_size * output_size], y,
-                 batch_size * output_size * sizeof(float),
-                 cudaMemcpyDeviceToDevice);
+      float output_sum = 0.0;
+      for (int i = 0; i < OUTPUT_SIZE; i++) {
+        output_sum += Why[idx * OUTPUT_SIZE + i] * h[idx];
+      }
+      y[idx] = output_sum + b_y[idx];
     }
   }
-};
 
-__global__ void conv1dKernel(float *input, float *kernel, float *output,
-                             int inputSize, int kernelSize) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  int halfK = kernelSize / 2;
+  class ElmanRNNLayer : public Operation {
+  private:
+    float *Wxh, *Whh, *b_h, *Why, *b_y;
+    float *h;
 
-  if (idx < inputSize) {
-    float sum = 0.0f;
-    for (int i = -halfK; i <= halfK; i++) {
-      if (idx + i >= 0 && idx + i < inputSize) {
-        sum += input[idx + i] * kernel[halfK + i];
+    const int hidden_size = 16;
+    const int output_size = 16;
+    const int batch_size = 256;
+
+  public:
+    ElmanRNNLayer() {
+      cudaMalloc(&Wxh, batch_size * hidden_size * sizeof(float));
+      cudaMalloc(&Whh, hidden_size * hidden_size * sizeof(float));
+      cudaMalloc(&b_h, batch_size * hidden_size * sizeof(float));
+      cudaMalloc(&Why, hidden_size * output_size * sizeof(float));
+      cudaMalloc(&b_y, batch_size * output_size * sizeof(float));
+      cudaMalloc(&h, batch_size * hidden_size * sizeof(float));
+
+      cudaMemset(h, 0, batch_size * hidden_size * sizeof(float));
+    }
+
+    ~ElmanRNNLayer() {
+      cudaFree(Wxh);
+      cudaFree(Whh);
+      cudaFree(b_h);
+      cudaFree(Why);
+      cudaFree(b_y);
+      cudaFree(h);
+    }
+
+    void forward(float *x, int sequence_length, float *output) {
+      int num_threads = NUM_THREADS;
+      int num_blocks = (batch_size + num_threads - 1) / num_threads;
+
+      for (int t = 0; t < sequence_length; t++) {
+        elmanRnnKernel<<<num_blocks, num_threads>>>(
+            &x[t * batch_size], // Input at current time step
+            h,                  // Current hidden state
+            Wxh, Whh, b_h, Why, b_y,
+            h, // Updated hidden state (output from kernel)
+            &output[t * batch_size *
+                    output_size], // Output at current time step
+            batch_size);
+
+        cudaMemcpy(&output[t * batch_size * output_size], y,
+                   batch_size * output_size * sizeof(float),
+                   cudaMemcpyDeviceToDevice);
       }
     }
-    output[idx] = sum;
-  }
-}
+  };
 
-class Conv1DLayer : public Operation {
-private:
-  float *d_input;  // Device input
-  float *d_kernel; // Device kernel/filter
-  float *d_output; // Device output
+  __global__ void conv1dKernel(float *input, float *kernel, float *output,
+                               int inputSize, int kernelSize) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int halfK = kernelSize / 2;
 
-  int inputSize;
-  int kernelSize;
-
-public:
-  Conv1DLayer(int inputSize, int kernelSize)
-      : inputSize(inputSize), kernelSize(kernelSize) {
-    cudaMalloc(&d_input, inputSize * sizeof(float));
-    cudaMalloc(&d_kernel, kernelSize * sizeof(float));
-    cudaMalloc(&d_output, inputSize * sizeof(float));
-  }
-
-  ~Conv1DLayer() {
-    cudaFree(d_input);
-    cudaFree(d_kernel);
-    cudaFree(d_output);
-  }
-
-  void forward(float *h_input, float *h_kernel, float *h_output) {
-    cudaMemcpy(d_input, h_input, inputSize * sizeof(float),
-               cudaMemcpyHostToDevice);
-    cudaMemcpy(d_kernel, h_kernel, kernelSize * sizeof(float),
-               cudaMemcpyHostToDevice);
-
-    int num_threads = 256;
-    int num_blocks = (inputSize + num_threads - 1) / num_threads;
-
-    conv1dKernel<<<num_blocks, num_threads>>>(d_input, d_kernel, d_output,
-                                              inputSize, kernelSize);
-
-    cudaMemcpy(h_output, d_output, inputSize * sizeof(float),
-               cudaMemcpyDeviceToHost);
-  }
-};
-
-__global__ void conv2dKernel(float *input, int inputWidth, int inputHeight,
-                             float *kernel, int kernelWidth, int kernelHeight,
-                             float *output) {
-  int x = blockIdx.x * blockDim.x + threadIdx.x;
-  int y = blockIdx.y * blockDim.y + threadIdx.y;
-
-  int halfKernelWidth = kernelWidth / 2;
-  int halfKernelHeight = kernelHeight / 2;
-
-  float value = 0.0f;
-
-  if (x < inputWidth && y < inputHeight) {
-    for (int ky = -halfKernelHeight; ky <= halfKernelHeight; ky++) {
-      for (int kx = -halfKernelWidth; kx <= halfKernelWidth; kx++) {
-        int inX = x + kx;
-        int inY = y + ky;
-        if (inX >= 0 && inX < inputWidth && inY >= 0 && inY < inputHeight) {
-          value += input[inY * inputWidth + inX] *
-                   kernel[(ky + halfKernelHeight) * kernelWidth +
-                          (kx + halfKernelWidth)];
+    if (idx < inputSize) {
+      float sum = 0.0f;
+      for (int i = -halfK; i <= halfK; i++) {
+        if (idx + i >= 0 && idx + i < inputSize) {
+          sum += input[idx + i] * kernel[halfK + i];
         }
       }
+      output[idx] = sum;
     }
-    output[y * inputWidth + x] = value;
-  }
-}
-
-class Conv2DLayer : public Operation {
-private:
-  float *d_input;  // Device input
-  float *d_kernel; // Device kernel/filter
-  float *d_output; // Device output
-
-  int inputWidth, inputHeight;
-  int kernelWidth, kernelHeight;
-
-public:
-  Conv2DLayer(int inputWidth, int inputHeight, int kernelWidth,
-              int kernelHeight)
-      : inputWidth(inputWidth), inputHeight(inputHeight),
-        kernelWidth(kernelWidth), kernelHeight(kernelHeight) {
-    cudaMalloc(&d_input, inputWidth * inputHeight * sizeof(float));
-    cudaMalloc(&d_kernel, kernelWidth * kernelHeight * sizeof(float));
-    cudaMalloc(&d_output, inputWidth * inputHeight *
-                              sizeof(float)); // Assuming "same" padding
   }
 
-  ~Conv2DLayer() {
-    cudaFree(d_input);
-    cudaFree(d_kernel);
-    cudaFree(d_output);
+  class Conv1DLayer : public Operation {
+  private:
+    float *d_input;  // Device input
+    float *d_kernel; // Device kernel/filter
+    float *d_output; // Device output
+
+    int inputSize;
+    int kernelSize;
+
+  public:
+    Conv1DLayer(int inputSize, int kernelSize)
+        : inputSize(inputSize), kernelSize(kernelSize) {
+      cudaMalloc(&d_input, inputSize * sizeof(float));
+      cudaMalloc(&d_kernel, kernelSize * sizeof(float));
+      cudaMalloc(&d_output, inputSize * sizeof(float));
+    }
+
+    ~Conv1DLayer() {
+      cudaFree(d_input);
+      cudaFree(d_kernel);
+      cudaFree(d_output);
+    }
+
+    void forward(float *h_input, float *h_kernel, float *h_output) {
+      cudaMemcpy(d_input, h_input, inputSize * sizeof(float),
+                 cudaMemcpyHostToDevice);
+      cudaMemcpy(d_kernel, h_kernel, kernelSize * sizeof(float),
+                 cudaMemcpyHostToDevice);
+
+      int num_threads = 256;
+      int num_blocks = (inputSize + num_threads - 1) / num_threads;
+
+      conv1dKernel<<<num_blocks, num_threads>>>(d_input, d_kernel, d_output,
+                                                inputSize, kernelSize);
+
+      cudaMemcpy(h_output, d_output, inputSize * sizeof(float),
+                 cudaMemcpyDeviceToHost);
+    }
+  };
+
+  __global__ void conv2dKernel(float *input, int inputWidth, int inputHeight,
+                               float *kernel, int kernelWidth, int kernelHeight,
+                               float *output) {
+    int x = blockIdx.x * blockDim.x + threadIdx.x;
+    int y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    int halfKernelWidth = kernelWidth / 2;
+    int halfKernelHeight = kernelHeight / 2;
+
+    float value = 0.0f;
+
+    if (x < inputWidth && y < inputHeight) {
+      for (int ky = -halfKernelHeight; ky <= halfKernelHeight; ky++) {
+        for (int kx = -halfKernelWidth; kx <= halfKernelWidth; kx++) {
+          int inX = x + kx;
+          int inY = y + ky;
+          if (inX >= 0 && inX < inputWidth && inY >= 0 && inY < inputHeight) {
+            value += input[inY * inputWidth + inX] *
+                     kernel[(ky + halfKernelHeight) * kernelWidth +
+                            (kx + halfKernelWidth)];
+          }
+        }
+      }
+      output[y * inputWidth + x] = value;
+    }
   }
 
-  void forward(float *h_input, float *h_kernel, float *h_output) {
-    cudaMemcpy(d_input, h_input, inputWidth * inputHeight * sizeof(float),
-               cudaMemcpyHostToDevice);
-    cudaMemcpy(d_kernel, h_kernel, kernelWidth * kernelHeight * sizeof(float),
-               cudaMemcpyHostToDevice);
+  class Conv2DLayer : public Operation {
+  private:
+    float *d_input;  // Device input
+    float *d_kernel; // Device kernel/filter
+    float *d_output; // Device output
 
-    dim3 block_size(16, 16);
-    dim3 grid_size((inputWidth + block_size.x - 1) / block_size.x,
-                   (inputHeight + block_size.y - 1) / block_size.y);
+    int inputWidth, inputHeight;
+    int kernelWidth, kernelHeight;
 
-    conv2dKernel<<<grid_size, block_size>>>(d_input, inputWidth, inputHeight,
-                                            d_kernel, kernelWidth, kernelHeight,
-                                            d_output);
+  public:
+    Conv2DLayer(int inputWidth, int inputHeight, int kernelWidth,
+                int kernelHeight)
+        : inputWidth(inputWidth), inputHeight(inputHeight),
+          kernelWidth(kernelWidth), kernelHeight(kernelHeight) {
+      cudaMalloc(&d_input, inputWidth * inputHeight * sizeof(float));
+      cudaMalloc(&d_kernel, kernelWidth * kernelHeight * sizeof(float));
+      cudaMalloc(&d_output, inputWidth * inputHeight *
+                                sizeof(float)); // Assuming "same" padding
+    }
 
-    cudaMemcpy(h_output, d_output, inputWidth * inputHeight * sizeof(float),
-               cudaMemcpyDeviceToHost);
-  }
-};
+    ~Conv2DLayer() {
+      cudaFree(d_input);
+      cudaFree(d_kernel);
+      cudaFree(d_output);
+    }
+
+    void forward(float *h_input, float *h_kernel, float *h_output) {
+      cudaMemcpy(d_input, h_input, inputWidth * inputHeight * sizeof(float),
+                 cudaMemcpyHostToDevice);
+      cudaMemcpy(d_kernel, h_kernel, kernelWidth * kernelHeight * sizeof(float),
+                 cudaMemcpyHostToDevice);
+
+      dim3 block_size(16, 16);
+      dim3 grid_size((inputWidth + block_size.x - 1) / block_size.x,
+                     (inputHeight + block_size.y - 1) / block_size.y);
+
+      conv2dKernel<<<grid_size, block_size>>>(d_input, inputWidth, inputHeight,
+                                              d_kernel, kernelWidth,
+                                              kernelHeight, d_output);
+
+      cudaMemcpy(h_output, d_output, inputWidth * inputHeight * sizeof(float),
+                 cudaMemcpyDeviceToHost);
+    }
+  };
