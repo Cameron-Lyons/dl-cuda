@@ -45,15 +45,25 @@ __global__ void categoricalCrossEntropyKernel(float *y, float *y_pred,
   }
 }
 
-float computeLoss(float *d_y, float *d_y_pred, int n, bool useMSE = true) {
-  int threadsPerBlock = 256;
-  int blocks = (n + threadsPerBlock - 1) / threadsPerBlock;
-
-  float *d_error;
-  cudaMalloc(&d_error, n * sizeof(float));
-
-  if (useMSE) {
-    squaredErrorKernel<<<blocks, threadsPerBlock>>>(d_y, d_y_pred, d_error, n);
-  } else {
-    absoluteErrorKernel<<<blocks, threadsPerBlock>>>(d_y, d_y_pred, d_error, n);
+void computeLoss(float *y, float *y_pred, float *error, int n, int classes,
+                 LossType loss_type, dim3 blocks, dim3 threads) {
+  switch (loss_type) {
+  case SQUARED_ERROR:
+    squaredErrorKernel<<<blocks, threads>>>(y, y_pred, error, n);
+    break;
+  case ABSOLUTE_ERROR:
+    absoluteErrorKernel<<<blocks, threads>>>(y, y_pred, error, n);
+    break;
+  case BINARY_CROSS_ENTROPY:
+    binaryCrossEntropyKernel<<<blocks, threads>>>(y, y_pred, error, n);
+    break;
+  case CATEGORICAL_CROSS_ENTROPY:
+    categoricalCrossEntropyKernel<<<blocks, threads>>>(y, y_pred, error, n,
+                                                       classes);
+    break;
+  default:
+    printf("Invalid loss type\n");
+    break;
   }
+  cudaDeviceSynchronize(); // Wait for the kernel to finish
+}
