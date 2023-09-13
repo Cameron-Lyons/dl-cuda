@@ -65,5 +65,5 @@ void computeLoss(float *y, float *y_pred, float *error, int n, int classes,
     printf("Invalid loss type\n");
     break;
   }
-  cudaDeviceSynchronize(); // Wait for the kernel to finish
+  cudaDeviceSynchronize();
 }
