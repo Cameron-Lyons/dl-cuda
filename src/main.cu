@@ -9,7 +9,7 @@
 
 int main() {
   std::vector<float *> data;
-  loadCSV("your_data.csv", data);
+  readCSV("your_data.csv", data);
 
   if (data.empty()) {
     std::cerr << "No data loaded from CSV." << std::endl;
