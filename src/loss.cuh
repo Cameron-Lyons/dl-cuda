@@ -1,4 +1,8 @@
+#include <cmath>
 #include <cuda_runtime.h>
+#include <device_launch_parameters.h>
+#include <thrust/device_vector.h>
+#include <thrust/reduce.h>
 
 __global__ void squaredErrorKernel(float *y, float *y_pred, float *error,
                                    int n) {
