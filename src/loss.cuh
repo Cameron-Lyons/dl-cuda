@@ -67,3 +67,21 @@ void computeLoss(float *y, float *y_pred, float *error, int n, int classes,
   }
   cudaDeviceSynchronize();
 }
+
+float computeAccuracy(int *y, int *y_pred, int n) {
+  int *d_correct_preds;
+  cudaMalloc(&d_correct_preds, n * sizeof(int));
+
+  int threadsPerBlock = 256;
+  int blocks = (n + threadsPerBlock - 1) / threadsPerBlock;
+
+  accuracyKernel<<<blocks, threadsPerBlock>>>(y, y_pred, d_correct_preds, n);
+
+  // Sum the correct predictions
+  int correct_count =
+      thrust::reduce(thrust::device, d_correct_preds, d_correct_preds + n);
+
+  cudaFree(d_correct_preds);
+
+  return float(correct_count) / n;
+}
