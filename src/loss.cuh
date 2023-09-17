@@ -113,3 +113,32 @@ float computeF1Score(int *y, int *y_pred, int n) {
              ? 0
              : 2.0 * (precision * recall) / (precision + recall);
 }
+
+float computeMCC(int *y, int *y_pred, int n) {
+  int *d_TP, *d_FP, *d_FN, *d_TN;
+  cudaMalloc(&d_TP, n * sizeof(int));
+  cudaMalloc(&d_FP, n * sizeof(int));
+  cudaMalloc(&d_FN, n * sizeof(int));
+  cudaMalloc(&d_TN, n * sizeof(int));
+
+  int threadsPerBlock = 256;
+  int blocks = (n + threadsPerBlock - 1) / threadsPerBlock;
+
+  mccKernel<<<blocks, threadsPerBlock>>>(y, y_pred, d_TP, d_FP, d_FN, d_TN, n);
+
+  int sum_TP = thrust::reduce(thrust::device, d_TP, d_TP + n);
+  int sum_FP = thrust::reduce(thrust::device, d_FP, d_FP + n);
+  int sum_FN = thrust::reduce(thrust::device, d_FN, d_FN + n);
+  int sum_TN = thrust::reduce(thrust::device, d_TN, d_TN + n);
+
+  cudaFree(d_TP);
+  cudaFree(d_FP);
+  cudaFree(d_FN);
+  cudaFree(d_TN);
+
+  float numerator = sum_TP * sum_TN - sum_FP * sum_FN;
+  float denominator = sqrtf((sum_TP + sum_FP) * (sum_TP + sum_FN) *
+                            (sum_TN + sum_FP) * (sum_TN + sum_FN));
+
+  return (denominator == 0) ? 0 : numerator / denominator;
+}
