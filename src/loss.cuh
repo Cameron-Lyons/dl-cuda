@@ -85,3 +85,31 @@ float computeAccuracy(int *y, int *y_pred, int n) {
 
   return float(correct_count) / n;
 }
+
+float computeF1Score(int *y, int *y_pred, int n) {
+  int *d_TP, *d_FP, *d_FN;
+  cudaMalloc(&d_TP, n * sizeof(int));
+  cudaMalloc(&d_FP, n * sizeof(int));
+  cudaMalloc(&d_FN, n * sizeof(int));
+
+  int threadsPerBlock = 256;
+  int blocks = (n + threadsPerBlock - 1) / threadsPerBlock;
+
+  f1Kernel<<<blocks, threadsPerBlock>>>(y, y_pred, d_TP, d_FP, d_FN, n);
+
+  int sum_TP = thrust::reduce(thrust::device, d_TP, d_TP + n);
+  int sum_FP = thrust::reduce(thrust::device, d_FP, d_FP + n);
+  int sum_FN = thrust::reduce(thrust::device, d_FN, d_FN + n);
+
+  cudaFree(d_TP);
+  cudaFree(d_FP);
+  cudaFree(d_FN);
+
+  float precision =
+      (sum_TP + sum_FP == 0) ? 0 : float(sum_TP) / (sum_TP + sum_FP);
+  float recall = (sum_TP + sum_FN == 0) ? 0 : float(sum_TP) / (sum_TP + sum_FN);
+
+  return (precision + recall == 0)
+             ? 0
+             : 2.0 * (precision * recall) / (precision + recall);
+}
