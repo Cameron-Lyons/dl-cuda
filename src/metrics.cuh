@@ -50,3 +50,29 @@ __global__ void mccKernel(int *y, int *y_pred, int *TP, int *FP, int *FN,
       sqrt((sum_TP + FP) * (sum_TP + FN) * (sum_TN + FP) * (sum_TN + FN));
   return (denominator == 0) ? 0 : numerator / denominator;
 }
+
+float r2Loss(float *y, float *y_pred, float y_mean, int n) {
+  float *d_numerator, *d_denominator;
+  cudaMalloc(&d_numerator, n * sizeof(float));
+  cudaMalloc(&d_denominator, n * sizeof(float));
+
+  int threadsPerBlock = 256;
+  int blocks = (n + threadsPerBlock - 1) / threadsPerBlock;
+
+  r2Kernel<<<blocks, threadsPerBlock>>>(y, y_pred, d_numerator, d_denominator,
+                                        y_mean, n);
+
+  // Reduce the results to get final numerator and denominator
+  float numerator = thrust::reduce(thrust::device, d_numerator, d_numerator + n,
+                                   0.0f, thrust::plus<float>());
+  float denominator =
+      thrust::reduce(thrust::device, d_denominator, d_denominator + n, 0.0f,
+                     thrust::plus<float>());
+
+  cudaFree(d_numerator);
+  cudaFree(d_denominator);
+
+  if (denominator == 0)
+    return 0; // Avoid division by zero
+  return 1.0 - (numerator / denominator);
+}
