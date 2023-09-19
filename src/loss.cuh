@@ -34,8 +34,8 @@ __global__ void binaryCrossEntropyKernel(float *y, float *y_pred, float *error,
 }
 
 __global__ void categoricalCrossEntropyKernel(float *y, float *y_pred,
-                                              float *error, int n,
-                                              int classes) {
+                                              float *error, int n, int classes,
+                                              float epsilon = 1e-10) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
   if (idx < n) {
@@ -43,7 +43,7 @@ __global__ void categoricalCrossEntropyKernel(float *y, float *y_pred,
     for (int c = 0; c < classes; c++) {
       int offset = idx * classes + c;
       loss -= y[offset] *
-              logf(y_pred[offset] + 1e-10); // Added epsilon to avoid log(0)
+              logf(y_pred[offset] + epsilon); // Added epsilon to avoid log(0)
     }
     error[idx] = loss;
   }
