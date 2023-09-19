@@ -6,17 +6,23 @@
 
 __global__ void squaredErrorKernel(float *y, float *y_pred, float *error,
                                    int n) {
+  __shared__ float shared_y[256];
+  __shared__ float shared_y_pred[256];
+
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
   if (idx < n) {
-    float diff = y[idx] - y_pred[idx];
+    shared_y[threadIdx.x] = y[idx];
+    shared_y_pred[threadIdx.x] = y_pred[idx];
+    __syncthreads();
+
+    float diff = shared_y[threadIdx.x] - shared_y_pred[threadIdx.x];
     error[idx] = diff * diff;
   }
 }
 
-__global__ void absoluteErrorKernelCoarsened(float *y, float *y_pred,
-                                             float *error, int n,
-                                             int elements_per_thread) {
+__global__ void absoluteErrorKernel(float *y, float *y_pred, float *error,
+                                    int n, int elements_per_thread) {
   int idx = (blockIdx.x * blockDim.x + threadIdx.x) * ELEMENTS_PER_THREAD;
 
   for (int i = 0; i < elements_per_thread && (idx + i) < n; i++) {
