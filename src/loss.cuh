@@ -30,13 +30,21 @@ __global__ void absoluteErrorKernel(float *y, float *y_pred, float *error,
   }
 }
 
-__global__ void binaryCrossEntropyKernel(float *y, float *y_pred, float *error,
-                                         int n) {
+__global__ void binaryCrossEntropyKernelSafe(float *y, float *y_pred,
+                                             float *error, int n,
+                                             float epsilon = 1e-10) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
   if (idx < n) {
-    error[idx] = -y[idx] * logf(y_pred[idx]) -
-                 (1.0f - y[idx]) * logf(1.0f - y_pred[idx]);
+    float pred_value = y_pred[idx];
+    if (pred_value < epsilon) {
+      pred_value = epsilon;
+    } else if (pred_value > 1.0f - epsilon) {
+      pred_value = 1.0f - epsilon;
+    }
+
+    error[idx] =
+        -y[idx] * logf(pred_value) - (1.0f - y[idx]) * logf(1.0f - pred_value);
   }
 }
 
