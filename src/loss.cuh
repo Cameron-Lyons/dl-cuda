@@ -14,12 +14,13 @@ __global__ void squaredErrorKernel(float *y, float *y_pred, float *error,
   }
 }
 
-__global__ void absoluteErrorKernel(float *y, float *y_pred, float *error,
-                                    int n) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+__global__ void absoluteErrorKernelCoarsened(float *y, float *y_pred,
+                                             float *error, int n,
+                                             int elements_per_thread) {
+  int idx = (blockIdx.x * blockDim.x + threadIdx.x) * ELEMENTS_PER_THREAD;
 
-  if (idx < n) {
-    error[idx] = fabsf(y[idx] - y_pred[idx]);
+  for (int i = 0; i < elements_per_thread && (idx + i) < n; i++) {
+    error[idx + i] = fabsf(y[idx + i] - y_pred[idx + i]);
   }
 }
 
