@@ -9,10 +9,15 @@ __global__ void tanh(float *data, int n, int elements_per_thread) {
 }
 
 __global__ void sigmoid(float *input, float *output, int n) {
+  __shared__ float shared_input[256];
+
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
   if (idx < n) {
-    output[idx] = 1.0f / (1.0f + expf(-input[idx]));
+    shared_input[threadIdx.x] = input[idx];
+    __syncthreads();
+
+    output[idx] = 1.0f / (1.0f + expf(-shared_input[threadIdx.x]));
   }
 }
 
