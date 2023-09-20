@@ -5,7 +5,7 @@ const int THREADS_PER_BLOCK = 256;
 __global__ void initializeCurandStates(curandState_t *states,
                                        unsigned long seed) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  curand_init(seed, idx, 0, &states[idx]);
+  curand_init(seed + idx, idx, 0, &states[idx]); // Add idx to seed for variety
 }
 
 const int ELEMENTS_PER_THREAD = 2;
