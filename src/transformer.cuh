@@ -39,7 +39,7 @@ void scaled_dot_product_attention(float *output, const float *queries,
 }
 
 __global__ void layer_norm_kernel(float *output, const float *input,
-                                  const float *gamma, const float *beta,
+                                  const float *gammas, const float *beta,
                                   int feature_size, float epsilon) {
   int i = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -78,7 +78,6 @@ void layer_normalization(float *output, const float *input, const float *gamma,
 
   cudaDeviceSynchronize();
 }
-
 
 class TransformerLayer : public Operation {
 private:
