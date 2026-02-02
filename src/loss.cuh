@@ -1,8 +1,20 @@
+#pragma once
+
+#include "metrics.cuh"
+#include "sequential.cuh"
 #include <cmath>
-#include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 #include <thrust/device_vector.h>
 #include <thrust/reduce.h>
+
+enum LossType {
+  SQUARED_ERROR,
+  ABSOLUTE_ERROR,
+  BINARY_CROSS_ENTROPY,
+  CATEGORICAL_CROSS_ENTROPY
+};
+
+static const int LOSS_ELEMENTS_PER_THREAD = 2;
 
 __global__ void squaredErrorKernel(float *y, float *y_pred, float *error,
                                    int n) {
@@ -23,7 +35,7 @@ __global__ void squaredErrorKernel(float *y, float *y_pred, float *error,
 
 __global__ void absoluteErrorKernel(float *y, float *y_pred, float *error,
                                     int n, int elements_per_thread) {
-  int idx = (blockIdx.x * blockDim.x + threadIdx.x) * ELEMENTS_PER_THREAD;
+  int idx = (blockIdx.x * blockDim.x + threadIdx.x) * elements_per_thread;
 
   for (int i = 0; i < elements_per_thread && (idx + i) < n; i++) {
     error[idx + i] = fabsf(y[idx + i] - y_pred[idx + i]);
@@ -32,7 +44,7 @@ __global__ void absoluteErrorKernel(float *y, float *y_pred, float *error,
 
 __global__ void binaryCrossEntropyKernelSafe(float *y, float *y_pred,
                                              float *error, int n,
-                                             float epsilon = 1e-10) {
+                                             float epsilon) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
   if (idx < n) {
@@ -50,17 +62,47 @@ __global__ void binaryCrossEntropyKernelSafe(float *y, float *y_pred,
 
 __global__ void categoricalCrossEntropyKernel(float *y, float *y_pred,
                                               float *error, int n, int classes,
-                                              float epsilon = 1e-10) {
+                                              float epsilon) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
   if (idx < n) {
     float loss = 0.0f;
     for (int c = 0; c < classes; c++) {
       int offset = idx * classes + c;
-      loss -= y[offset] *
-              logf(y_pred[offset] + epsilon); // Added epsilon to avoid log(0)
+      loss -= y[offset] * logf(y_pred[offset] + epsilon);
     }
     error[idx] = loss;
+  }
+}
+
+__global__ void squaredErrorBackwardKernel(float *y, float *y_pred,
+                                           float *grad, int n) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < n) {
+    grad[idx] = 2.0f * (y_pred[idx] - y[idx]) / n;
+  }
+}
+
+__global__ void absoluteErrorBackwardKernel(float *y, float *y_pred,
+                                            float *grad, int n) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < n) {
+    float diff = y_pred[idx] - y[idx];
+    grad[idx] = ((diff > 0.0f) ? 1.0f : ((diff < 0.0f) ? -1.0f : 0.0f)) / n;
+  }
+}
+
+__global__ void binaryCrossEntropyBackwardKernel(float *y, float *y_pred,
+                                                 float *grad, int n,
+                                                 float epsilon) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < n) {
+    float p = y_pred[idx];
+    if (p < epsilon)
+      p = epsilon;
+    else if (p > 1.0f - epsilon)
+      p = 1.0f - epsilon;
+    grad[idx] = (-y[idx] / p + (1.0f - y[idx]) / (1.0f - p)) / n;
   }
 }
 
@@ -71,14 +113,16 @@ void computeLoss(float *y, float *y_pred, float *error, int n, int classes,
     squaredErrorKernel<<<blocks, threads>>>(y, y_pred, error, n);
     break;
   case ABSOLUTE_ERROR:
-    absoluteErrorKernel<<<blocks, threads>>>(y, y_pred, error, n);
+    absoluteErrorKernel<<<blocks, threads>>>(y, y_pred, error, n,
+                                             LOSS_ELEMENTS_PER_THREAD);
     break;
   case BINARY_CROSS_ENTROPY:
-    binaryCrossEntropyKernel<<<blocks, threads>>>(y, y_pred, error, n);
+    binaryCrossEntropyKernelSafe<<<blocks, threads>>>(y, y_pred, error, n,
+                                                      1e-10f);
     break;
   case CATEGORICAL_CROSS_ENTROPY:
     categoricalCrossEntropyKernel<<<blocks, threads>>>(y, y_pred, error, n,
-                                                       classes);
+                                                       classes, 1e-10f);
     break;
   default:
     printf("Invalid loss type\n");
@@ -87,77 +131,23 @@ void computeLoss(float *y, float *y_pred, float *error, int n, int classes,
   cudaDeviceSynchronize();
 }
 
-float computeAccuracy(int *y, int *y_pred, int n) {
-  int *d_correct_preds;
-  cudaMalloc(&d_correct_preds, n * sizeof(int));
-
-  int threadsPerBlock = 256;
-  int blocks = (n + threadsPerBlock - 1) / threadsPerBlock;
-
-  accuracyKernel<<<blocks, threadsPerBlock>>>(y, y_pred, d_correct_preds, n);
-
-  // Sum the correct predictions
-  int correct_count =
-      thrust::reduce(thrust::device, d_correct_preds, d_correct_preds + n);
-
-  cudaFree(d_correct_preds);
-
-  return float(correct_count) / n;
-}
-
-float computeF1Score(int *y, int *y_pred, int n) {
-  int *d_TP, *d_FP, *d_FN;
-  cudaMalloc(&d_TP, n * sizeof(int));
-  cudaMalloc(&d_FP, n * sizeof(int));
-  cudaMalloc(&d_FN, n * sizeof(int));
-
-  int threadsPerBlock = 256;
-  int blocks = (n + threadsPerBlock - 1) / threadsPerBlock;
-
-  f1Kernel<<<blocks, threadsPerBlock>>>(y, y_pred, d_TP, d_FP, d_FN, n);
-
-  int sum_TP = thrust::reduce(thrust::device, d_TP, d_TP + n);
-  int sum_FP = thrust::reduce(thrust::device, d_FP, d_FP + n);
-  int sum_FN = thrust::reduce(thrust::device, d_FN, d_FN + n);
-
-  cudaFree(d_TP);
-  cudaFree(d_FP);
-  cudaFree(d_FN);
-
-  float precision =
-      (sum_TP + sum_FP == 0) ? 0 : float(sum_TP) / (sum_TP + sum_FP);
-  float recall = (sum_TP + sum_FN == 0) ? 0 : float(sum_TP) / (sum_TP + sum_FN);
-
-  return (precision + recall == 0)
-             ? 0
-             : 2.0 * (precision * recall) / (precision + recall);
-}
-
-float computeMCC(int *y, int *y_pred, int n) {
-  int *d_TP, *d_FP, *d_FN, *d_TN;
-  cudaMalloc(&d_TP, n * sizeof(int));
-  cudaMalloc(&d_FP, n * sizeof(int));
-  cudaMalloc(&d_FN, n * sizeof(int));
-  cudaMalloc(&d_TN, n * sizeof(int));
-
-  int threadsPerBlock = 256;
-  int blocks = (n + threadsPerBlock - 1) / threadsPerBlock;
-
-  mccKernel<<<blocks, threadsPerBlock>>>(y, y_pred, d_TP, d_FP, d_FN, d_TN, n);
-
-  int sum_TP = thrust::reduce(thrust::device, d_TP, d_TP + n);
-  int sum_FP = thrust::reduce(thrust::device, d_FP, d_FP + n);
-  int sum_FN = thrust::reduce(thrust::device, d_FN, d_FN + n);
-  int sum_TN = thrust::reduce(thrust::device, d_TN, d_TN + n);
-
-  cudaFree(d_TP);
-  cudaFree(d_FP);
-  cudaFree(d_FN);
-  cudaFree(d_TN);
-
-  float numerator = sum_TP * sum_TN - sum_FP * sum_FN;
-  float denominator = sqrtf((sum_TP + sum_FP) * (sum_TP + sum_FN) *
-                            (sum_TN + sum_FP) * (sum_TN + sum_FN));
-
-  return (denominator == 0) ? 0 : numerator / denominator;
+void computeLossBackward(float *y, float *y_pred, float *grad, int n,
+                         LossType loss_type) {
+  int blocks = (n + 255) / 256;
+  switch (loss_type) {
+  case SQUARED_ERROR:
+    squaredErrorBackwardKernel<<<blocks, 256>>>(y, y_pred, grad, n);
+    break;
+  case ABSOLUTE_ERROR:
+    absoluteErrorBackwardKernel<<<blocks, 256>>>(y, y_pred, grad, n);
+    break;
+  case BINARY_CROSS_ENTROPY:
+    binaryCrossEntropyBackwardKernel<<<blocks, 256>>>(y, y_pred, grad, n,
+                                                      1e-10f);
+    break;
+  default:
+    printf("Unsupported loss type for backward\n");
+    break;
+  }
+  cudaDeviceSynchronize();
 }
