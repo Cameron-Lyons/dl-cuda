@@ -67,8 +67,7 @@ int main() {
     model.backward(d_loss_grad, d_input_grad);
     CUDA_CHECK(cudaDeviceSynchronize());
 
-    layer1.update_weights(LR);
-    layer2.update_weights(LR);
+    model.update_weights(LR);
     CUDA_CHECK(cudaDeviceSynchronize());
   }
 

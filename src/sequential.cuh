@@ -18,6 +18,7 @@ class Operation {
 public:
   virtual void forward(float *d_input, float *d_output) = 0;
   virtual void backward(float *d_output_grad, float *d_input_grad) = 0;
+  virtual void update_weights(float /*lr*/) {}
   virtual int input_size() const = 0;
   virtual int output_size() const = 0;
   virtual ~Operation() = default;
@@ -79,6 +80,12 @@ public:
 
     for (auto buf : grad_buffers) {
       CUDA_CHECK(cudaFree(buf));
+    }
+  }
+
+  void update_weights(float lr) {
+    for (auto *op : operations) {
+      op->update_weights(lr);
     }
   }
 
