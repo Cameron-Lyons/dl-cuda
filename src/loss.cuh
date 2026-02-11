@@ -1,6 +1,5 @@
 #pragma once
 
-#include "metrics.cuh"
 #include "sequential.cuh"
 #include <cmath>
 #include <device_launch_parameters.h>

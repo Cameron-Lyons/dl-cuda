@@ -1,7 +1,6 @@
 #pragma once
 
 #include "activation.cuh"
-#include "dropout.cuh"
 #include "layers.cuh"
 #include "sequential.cuh"
 #include <random>
