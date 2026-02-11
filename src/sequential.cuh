@@ -2,6 +2,8 @@
 
 #include <cuda_runtime.h>
 #include <cstdio>
+#include <cstring>
+#include <string>
 #include <vector>
 
 #define CUDA_CHECK(call)                                                       \
@@ -95,6 +97,68 @@ public:
 
   inline void set_optimizer(Optimizer *opt);
   inline void update_weights(float lr);
+  inline float clip_grad_norm(float max_norm);
 
   std::vector<Operation *> &get_operations() { return operations; }
+
+  bool save_weights(const std::string &path) {
+    FILE *f = fopen(path.c_str(), "wb");
+    if (!f)
+      return false;
+    char magic[4] = {'D', 'L', 'C', 'U'};
+    fwrite(magic, 1, 4, f);
+    std::vector<ParamGroup> all_groups;
+    for (auto *op : operations) {
+      auto groups = op->get_param_groups();
+      all_groups.insert(all_groups.end(), groups.begin(), groups.end());
+    }
+    int num_groups = static_cast<int>(all_groups.size());
+    fwrite(&num_groups, sizeof(int), 1, f);
+    for (auto &pg : all_groups) {
+      fwrite(&pg.size, sizeof(int), 1, f);
+      std::vector<float> h_data(pg.size);
+      CUDA_CHECK(cudaMemcpy(h_data.data(), pg.params, pg.size * sizeof(float),
+                             cudaMemcpyDeviceToHost));
+      fwrite(h_data.data(), sizeof(float), pg.size, f);
+    }
+    fclose(f);
+    return true;
+  }
+
+  bool load_weights(const std::string &path) {
+    FILE *f = fopen(path.c_str(), "rb");
+    if (!f)
+      return false;
+    char magic[4];
+    fread(magic, 1, 4, f);
+    if (memcmp(magic, "DLCU", 4) != 0) {
+      fclose(f);
+      return false;
+    }
+    std::vector<ParamGroup> all_groups;
+    for (auto *op : operations) {
+      auto groups = op->get_param_groups();
+      all_groups.insert(all_groups.end(), groups.begin(), groups.end());
+    }
+    int num_groups;
+    fread(&num_groups, sizeof(int), 1, f);
+    if (num_groups != static_cast<int>(all_groups.size())) {
+      fclose(f);
+      return false;
+    }
+    for (auto &pg : all_groups) {
+      int size;
+      fread(&size, sizeof(int), 1, f);
+      if (size != pg.size) {
+        fclose(f);
+        return false;
+      }
+      std::vector<float> h_data(size);
+      fread(h_data.data(), sizeof(float), size, f);
+      CUDA_CHECK(cudaMemcpy(pg.params, h_data.data(), size * sizeof(float),
+                             cudaMemcpyHostToDevice));
+    }
+    fclose(f);
+    return true;
+  }
 };

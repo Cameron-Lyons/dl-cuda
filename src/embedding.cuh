@@ -1,5 +1,6 @@
 #pragma once
 
+#include "layers.cuh"
 #include "sequential.cuh"
 #include <cmath>
 #include <curand_kernel.h>

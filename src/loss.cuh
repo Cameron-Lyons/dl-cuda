@@ -106,6 +106,16 @@ __global__ void binaryCrossEntropyBackwardKernel(float *y, float *y_pred,
   }
 }
 
+__global__ void categoricalCrossEntropyBackwardKernel(float *y, float *y_pred,
+                                                      float *grad, int n,
+                                                      int classes,
+                                                      float epsilon) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < n * classes) {
+    grad[idx] = -y[idx] / (y_pred[idx] + epsilon) / n;
+  }
+}
+
 void computeLoss(float *y, float *y_pred, float *error, int n, int classes,
                  LossType loss_type, dim3 blocks, dim3 threads) {
   switch (loss_type) {
@@ -132,19 +142,31 @@ void computeLoss(float *y, float *y_pred, float *error, int n, int classes,
 }
 
 void computeLossBackward(float *y, float *y_pred, float *grad, int n,
-                         LossType loss_type) {
-  int blocks = (n + 255) / 256;
+                         int classes, LossType loss_type) {
   switch (loss_type) {
-  case SQUARED_ERROR:
+  case SQUARED_ERROR: {
+    int blocks = (n + 255) / 256;
     squaredErrorBackwardKernel<<<blocks, 256>>>(y, y_pred, grad, n);
     break;
-  case ABSOLUTE_ERROR:
+  }
+  case ABSOLUTE_ERROR: {
+    int blocks = (n + 255) / 256;
     absoluteErrorBackwardKernel<<<blocks, 256>>>(y, y_pred, grad, n);
     break;
-  case BINARY_CROSS_ENTROPY:
+  }
+  case BINARY_CROSS_ENTROPY: {
+    int blocks = (n + 255) / 256;
     binaryCrossEntropyBackwardKernel<<<blocks, 256>>>(y, y_pred, grad, n,
                                                       1e-10f);
     break;
+  }
+  case CATEGORICAL_CROSS_ENTROPY: {
+    int total = n * classes;
+    int blocks = (total + 255) / 256;
+    categoricalCrossEntropyBackwardKernel<<<blocks, 256>>>(y, y_pred, grad, n,
+                                                           classes, 1e-10f);
+    break;
+  }
   default:
     printf("Unsupported loss type for backward\n");
     break;

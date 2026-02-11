@@ -80,6 +80,60 @@ public:
   }
 };
 
+class AdamWOptimizer : public Optimizer {
+private:
+  std::vector<ParamGroup> param_groups_;
+  std::vector<float *> m_buffers_;
+  std::vector<float *> v_buffers_;
+  float beta1_, beta2_, epsilon_, weight_decay_;
+  int t_ = 0;
+
+public:
+  AdamWOptimizer(float beta1 = 0.9f, float beta2 = 0.999f,
+                 float epsilon = 1e-8f, float weight_decay = 0.01f)
+      : beta1_(beta1), beta2_(beta2), epsilon_(epsilon),
+        weight_decay_(weight_decay) {}
+
+  ~AdamWOptimizer() {
+    for (auto *p : m_buffers_)
+      cudaFree(p);
+    for (auto *p : v_buffers_)
+      cudaFree(p);
+  }
+
+  void register_params(const std::vector<ParamGroup> &groups) override {
+    for (auto *p : m_buffers_)
+      cudaFree(p);
+    for (auto *p : v_buffers_)
+      cudaFree(p);
+    m_buffers_.clear();
+    v_buffers_.clear();
+
+    param_groups_ = groups;
+    for (auto &pg : param_groups_) {
+      float *m, *v;
+      CUDA_CHECK(cudaMalloc(&m, pg.size * sizeof(float)));
+      CUDA_CHECK(cudaMalloc(&v, pg.size * sizeof(float)));
+      CUDA_CHECK(cudaMemset(m, 0, pg.size * sizeof(float)));
+      CUDA_CHECK(cudaMemset(v, 0, pg.size * sizeof(float)));
+      m_buffers_.push_back(m);
+      v_buffers_.push_back(v);
+    }
+    t_ = 0;
+  }
+
+  void step(float lr) override {
+    t_++;
+    for (size_t i = 0; i < param_groups_.size(); i++) {
+      auto &pg = param_groups_[i];
+      int blocks = (pg.size + 255) / 256;
+      updateAdamW<<<blocks, 256>>>(pg.grads, m_buffers_[i], v_buffers_[i],
+                                   pg.params, lr, beta1_, beta2_, epsilon_,
+                                   weight_decay_, t_, pg.size);
+    }
+  }
+};
+
 class RMSpropOptimizer : public Optimizer {
 private:
   std::vector<ParamGroup> param_groups_;
@@ -127,6 +181,56 @@ inline void Sequential::set_optimizer(Optimizer *opt) {
     all_groups.insert(all_groups.end(), groups.begin(), groups.end());
   }
   optimizer_->register_params(all_groups);
+}
+
+inline float Sequential::clip_grad_norm(float max_norm) {
+  std::vector<ParamGroup> all_groups;
+  for (auto *op : operations) {
+    auto groups = op->get_param_groups();
+    all_groups.insert(all_groups.end(), groups.begin(), groups.end());
+  }
+  if (all_groups.empty())
+    return 0.0f;
+
+  int total_blocks = 0;
+  for (auto &pg : all_groups) {
+    total_blocks += (pg.size + 255) / 256;
+  }
+
+  float *d_partial;
+  CUDA_CHECK(cudaMalloc(&d_partial, total_blocks * sizeof(float)));
+
+  int block_offset = 0;
+  for (auto &pg : all_groups) {
+    int blocks = (pg.size + 255) / 256;
+    gradNormSquaredKernel<<<blocks, 256, 256 * sizeof(float)>>>(
+        pg.grads, d_partial + block_offset, pg.size);
+    block_offset += blocks;
+  }
+  CUDA_CHECK(cudaDeviceSynchronize());
+
+  std::vector<float> h_partial(total_blocks);
+  CUDA_CHECK(cudaMemcpy(h_partial.data(), d_partial,
+                         total_blocks * sizeof(float),
+                         cudaMemcpyDeviceToHost));
+  cudaFree(d_partial);
+
+  float total_norm_sq = 0.0f;
+  for (int i = 0; i < total_blocks; i++) {
+    total_norm_sq += h_partial[i];
+  }
+  float total_norm = sqrtf(total_norm_sq);
+
+  if (total_norm > max_norm) {
+    float clip_coeff = max_norm / (total_norm + 1e-6f);
+    for (auto &pg : all_groups) {
+      int blocks = (pg.size + 255) / 256;
+      clipGradsKernel<<<blocks, 256>>>(pg.grads, clip_coeff, pg.size);
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+  }
+
+  return total_norm;
 }
 
 inline void Sequential::update_weights(float lr) {

@@ -122,3 +122,47 @@ void Adam(float *d_g, float *d_m, float *d_v, float *d_theta, float alpha,
   updateAdam<<<blocksPerGrid, threadsPerBlock>>>(d_g, d_m, d_v, d_theta, alpha,
                                                  beta1, beta2, epsilon, t, n);
 }
+
+__global__ void updateAdamW(float *d_g, float *d_m, float *d_v, float *d_theta,
+                            float alpha, float beta1, float beta2,
+                            float epsilon, float weight_decay, int t, int n) {
+  int idx = threadIdx.x + blockIdx.x * blockDim.x;
+  if (idx < n) {
+    d_m[idx] = beta1 * d_m[idx] + (1.0f - beta1) * d_g[idx];
+    d_v[idx] = beta2 * d_v[idx] + (1.0f - beta2) * d_g[idx] * d_g[idx];
+
+    float m_hat = d_m[idx] / (1.0f - powf(beta1, t));
+    float v_hat = d_v[idx] / (1.0f - powf(beta2, t));
+
+    d_theta[idx] -= alpha * (m_hat / (sqrtf(v_hat) + epsilon) +
+                              weight_decay * d_theta[idx]);
+  }
+}
+
+__global__ void gradNormSquaredKernel(const float *grads, float *partial_sums,
+                                      int n) {
+  extern __shared__ float sdata[];
+  int tid = threadIdx.x;
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+  sdata[tid] = (idx < n) ? grads[idx] * grads[idx] : 0.0f;
+  __syncthreads();
+
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (tid < s) {
+      sdata[tid] += sdata[tid + s];
+    }
+    __syncthreads();
+  }
+
+  if (tid == 0) {
+    partial_sums[blockIdx.x] = sdata[0];
+  }
+}
+
+__global__ void clipGradsKernel(float *grads, float clip_coeff, int n) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < n) {
+    grads[idx] *= clip_coeff;
+  }
+}

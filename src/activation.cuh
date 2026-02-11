@@ -200,6 +200,63 @@ public:
   }
 };
 
+__global__ void geluForwardKernel(const float *input, float *output, int n) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < n) {
+    float x = input[idx];
+    float cdf = 0.5f * (1.0f + tanhf(0.7978845608f * (x + 0.044715f * x * x * x)));
+    output[idx] = x * cdf;
+  }
+}
+
+__global__ void geluBackwardKernel(const float *d_output_grad,
+                                   const float *d_forward_input,
+                                   float *d_input_grad, int n) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < n) {
+    float x = d_forward_input[idx];
+    float x3 = x * x * x;
+    float inner = 0.7978845608f * (x + 0.044715f * x3);
+    float tanh_val = tanhf(inner);
+    float sech2 = 1.0f - tanh_val * tanh_val;
+    float d_inner = 0.7978845608f * (1.0f + 0.134145f * x * x);
+    float cdf = 0.5f * (1.0f + tanh_val);
+    d_input_grad[idx] = d_output_grad[idx] * (cdf + x * 0.5f * sech2 * d_inner);
+  }
+}
+
+class GELUActivation : public Operation {
+private:
+  int size_;
+  float *d_cached_input;
+
+public:
+  GELUActivation(int size) : size_(size), d_cached_input(nullptr) {
+    CUDA_CHECK(cudaMalloc(&d_cached_input, size * sizeof(float)));
+  }
+
+  ~GELUActivation() {
+    if (d_cached_input)
+      cudaFree(d_cached_input);
+  }
+
+  int input_size() const override { return size_; }
+  int output_size() const override { return size_; }
+
+  void forward(float *d_input, float *d_output) override {
+    CUDA_CHECK(cudaMemcpy(d_cached_input, d_input, size_ * sizeof(float),
+                           cudaMemcpyDeviceToDevice));
+    int blocks = (size_ + 255) / 256;
+    geluForwardKernel<<<blocks, 256>>>(d_input, d_output, size_);
+  }
+
+  void backward(float *d_output_grad, float *d_input_grad) override {
+    int blocks = (size_ + 255) / 256;
+    geluBackwardKernel<<<blocks, 256>>>(d_output_grad, d_cached_input,
+                                        d_input_grad, size_);
+  }
+};
+
 class TanhActivation : public Operation {
 private:
   int size_;
