@@ -118,6 +118,88 @@ public:
   }
 };
 
+__global__ void softmaxForwardGeneralKernel(const float *input, float *output,
+                                            int num_rows, int row_width) {
+  int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row < num_rows) {
+    const float *in_row = input + row * row_width;
+    float *out_row = output + row * row_width;
+
+    float max_val = in_row[0];
+    for (int j = 1; j < row_width; j++) {
+      max_val = fmaxf(max_val, in_row[j]);
+    }
+
+    float sum = 0.0f;
+    for (int j = 0; j < row_width; j++) {
+      out_row[j] = expf(in_row[j] - max_val);
+      sum += out_row[j];
+    }
+
+    float inv_sum = 1.0f / sum;
+    for (int j = 0; j < row_width; j++) {
+      out_row[j] *= inv_sum;
+    }
+  }
+}
+
+__global__ void softmaxBackwardGeneralKernel(const float *d_output_grad,
+                                             const float *softmax_output,
+                                             float *d_input_grad, int num_rows,
+                                             int row_width) {
+  int row = blockIdx.x * blockDim.x + threadIdx.x;
+  if (row < num_rows) {
+    const float *dy = d_output_grad + row * row_width;
+    const float *s = softmax_output + row * row_width;
+    float *dx = d_input_grad + row * row_width;
+
+    float dot = 0.0f;
+    for (int j = 0; j < row_width; j++) {
+      dot += dy[j] * s[j];
+    }
+
+    for (int j = 0; j < row_width; j++) {
+      dx[j] = s[j] * (dy[j] - dot);
+    }
+  }
+}
+
+class SoftmaxActivation : public Operation {
+private:
+  int num_rows_, row_width_;
+  float *d_cached_output;
+
+public:
+  SoftmaxActivation(int num_rows, int row_width)
+      : num_rows_(num_rows), row_width_(row_width), d_cached_output(nullptr) {
+    CUDA_CHECK(
+        cudaMalloc(&d_cached_output, num_rows * row_width * sizeof(float)));
+  }
+
+  ~SoftmaxActivation() {
+    if (d_cached_output)
+      cudaFree(d_cached_output);
+  }
+
+  int input_size() const override { return num_rows_ * row_width_; }
+  int output_size() const override { return num_rows_ * row_width_; }
+
+  void forward(float *d_input, float *d_output) override {
+    int blocks = (num_rows_ + 255) / 256;
+    softmaxForwardGeneralKernel<<<blocks, 256>>>(d_input, d_output, num_rows_,
+                                                  row_width_);
+    CUDA_CHECK(cudaMemcpy(d_cached_output, d_output,
+                           num_rows_ * row_width_ * sizeof(float),
+                           cudaMemcpyDeviceToDevice));
+  }
+
+  void backward(float *d_output_grad, float *d_input_grad) override {
+    int blocks = (num_rows_ + 255) / 256;
+    softmaxBackwardGeneralKernel<<<blocks, 256>>>(
+        d_output_grad, d_cached_output, d_input_grad, num_rows_, row_width_);
+  }
+};
+
 class TanhActivation : public Operation {
 private:
   int size_;

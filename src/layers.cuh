@@ -177,6 +177,11 @@ public:
     int blocks_b = (out_features_ + 255) / 256;
     sgdUpdateKernel<<<blocks_b, 256>>>(d_b, d_b_grad, lr, out_features_);
   }
+
+  std::vector<ParamGroup> get_param_groups() override {
+    return {{d_W, d_W_grad, in_features_ * out_features_},
+            {d_b, d_b_grad, out_features_}};
+  }
 };
 
 __global__ void transposeMatVecKernel(const float *d_out, const float *W,
@@ -583,6 +588,15 @@ public:
     sgdUpdateKernel<<<b_blocks, NUM_THREADS>>>(bc, dbc_, lr, hidden_size_);
     sgdUpdateKernel<<<b_blocks, NUM_THREADS>>>(bo, dbo_, lr, hidden_size_);
   }
+
+  std::vector<ParamGroup> get_param_groups() override {
+    int ws = 2 * hidden_size_ * hidden_size_;
+    return {{Wf, dWf_, ws}, {Wi, dWi_, ws}, {Wc, dWc_, ws}, {Wo, dWo_, ws},
+            {bf, dbf_, hidden_size_},
+            {bi, dbi_, hidden_size_},
+            {bc, dbc_, hidden_size_},
+            {bo, dbo_, hidden_size_}};
+  }
 };
 
 __global__ void elmanRnnKernel(const float *x, const float *h_prev,
@@ -806,6 +820,14 @@ public:
     sgdUpdateKernel<<<(output_size_ + 255) / 256, 256>>>(b_y, db_y_, lr,
                                                           output_size_);
   }
+
+  std::vector<ParamGroup> get_param_groups() override {
+    return {{Wxh, dWxh_, input_size_ * hidden_size_},
+            {Whh, dWhh_, hidden_size_ * hidden_size_},
+            {b_h, db_h_, hidden_size_},
+            {Why, dWhy_, hidden_size_ * output_size_},
+            {b_y, db_y_, output_size_}};
+  }
 };
 
 __global__ void conv1dKernel(const float *input, const float *kernel,
@@ -908,6 +930,10 @@ public:
   void update_weights(float lr) override {
     int blocks = (kernelSize_ + 255) / 256;
     sgdUpdateKernel<<<blocks, 256>>>(d_kernel, d_kernel_grad, lr, kernelSize_);
+  }
+
+  std::vector<ParamGroup> get_param_groups() override {
+    return {{d_kernel, d_kernel_grad, kernelSize_}};
   }
 };
 
@@ -1053,5 +1079,9 @@ public:
     int k_size = kernelWidth_ * kernelHeight_;
     int blocks = (k_size + 255) / 256;
     sgdUpdateKernel<<<blocks, 256>>>(d_kernel, d_kernel_grad, lr, k_size);
+  }
+
+  std::vector<ParamGroup> get_param_groups() override {
+    return {{d_kernel, d_kernel_grad, kernelWidth_ * kernelHeight_}};
   }
 };

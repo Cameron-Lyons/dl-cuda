@@ -14,6 +14,14 @@
     }                                                                          \
   } while (0)
 
+struct ParamGroup {
+  float *params;
+  float *grads;
+  int size;
+};
+
+class Optimizer;
+
 class Operation {
 public:
   virtual void forward(float *d_input, float *d_output) = 0;
@@ -21,12 +29,14 @@ public:
   virtual void update_weights(float /*lr*/) {}
   virtual int input_size() const = 0;
   virtual int output_size() const = 0;
+  virtual std::vector<ParamGroup> get_param_groups() { return {}; }
   virtual ~Operation() = default;
 };
 
 class Sequential {
 private:
   std::vector<Operation *> operations;
+  Optimizer *optimizer_ = nullptr;
 
 public:
   void add(Operation *op) { operations.push_back(op); }
@@ -83,11 +93,8 @@ public:
     }
   }
 
-  void update_weights(float lr) {
-    for (auto *op : operations) {
-      op->update_weights(lr);
-    }
-  }
+  inline void set_optimizer(Optimizer *opt);
+  inline void update_weights(float lr);
 
   std::vector<Operation *> &get_operations() { return operations; }
 };

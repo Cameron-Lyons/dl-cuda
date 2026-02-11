@@ -528,4 +528,18 @@ public:
     sgdUpdateKernel<<<d_blocks, 256>>>(d_gamma2_, d_gamma2_grad_, lr, D);
     sgdUpdateKernel<<<d_blocks, 256>>>(d_beta2_, d_beta2_grad_, lr, D);
   }
+
+  std::vector<ParamGroup> get_param_groups() override {
+    int D = d_model_;
+    int w_size = D * D;
+    return {{d_q_weights_, d_q_weights_grad_, w_size},
+            {d_k_weights_, d_k_weights_grad_, w_size},
+            {d_v_weights_, d_v_weights_grad_, w_size},
+            {d_ff_weights_, d_ff_weights_grad_, w_size},
+            {d_ff_bias_, d_ff_bias_grad_, D},
+            {d_gamma1_, d_gamma1_grad_, D},
+            {d_beta1_, d_beta1_grad_, D},
+            {d_gamma2_, d_gamma2_grad_, D},
+            {d_beta2_, d_beta2_grad_, D}};
+  }
 };

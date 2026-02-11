@@ -1,6 +1,7 @@
 #include "activation.cuh"
 #include "layers.cuh"
 #include "loss.cuh"
+#include "optimizer.cuh"
 #include "sequential.cuh"
 #include <cstdio>
 
@@ -9,7 +10,7 @@ int main() {
   const int IN_FEATURES = 2;
   const int HIDDEN = 4;
   const int OUT_FEATURES = 1;
-  const float LR = 0.1f;
+  const float LR = 0.01f;
   const int EPOCHS = 5000;
 
   float h_X[N * IN_FEATURES] = {0, 0, 0, 1, 1, 0, 1, 1};
@@ -34,6 +35,9 @@ int main() {
   model.add(&layer1);
   model.add(&relu1);
   model.add(&layer2);
+
+  AdamOptimizer adam;
+  model.set_optimizer(&adam);
 
   float *d_input_grad;
   CUDA_CHECK(cudaMalloc(&d_input_grad, N * IN_FEATURES * sizeof(float)));
