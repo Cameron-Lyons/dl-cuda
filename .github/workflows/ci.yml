@@ -3,6 +3,7 @@ name: ci
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 jobs:
   build-and-test:
@@ -23,3 +24,21 @@ jobs:
 
       - name: Test
         run: ctest --test-dir build --output-on-failure
+
+  gpu-smoke:
+    if: ${{ vars.ENABLE_GPU_CI == 'true' }}
+    runs-on: [self-hosted, linux, x64, gpu, nvidia]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build -j
+
+      - name: GPU tests
+        run: ctest --test-dir build --output-on-failure -R gpu_correctness_tests
+
+      - name: Char LM smoke
+        run: ./build/dl-cuda-char-lm --epochs 20 --print-every 10 --gen-len 32

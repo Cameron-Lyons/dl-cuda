@@ -22,6 +22,9 @@ A GPU-accelerated deep learning framework written from scratch in CUDA C++.
 
 **Utilities** — Tensor operations, CSV data loading, Sequential model API
 
+**Examples API** — reusable `run_char_lm(...)` and `run_xor(...)` entry points
+via `include/dl_cuda/examples.hpp`
+
 ## Requirements
 
 - CMake 3.18+
@@ -39,11 +42,10 @@ ctest --test-dir build --output-on-failure
 
 ## Usage
 
-The included example trains a small character-level Transformer language model
-on a Shakespeare excerpt, saves weights, and then generates text.
+### Character LM
 
 ```sh
-./build/dl-cuda
+./build/dl-cuda-char-lm --epochs 800 --print-every 50
 ```
 
 ```
@@ -54,6 +56,32 @@ Training on ... chars of Shakespeare for 800 epochs
 Weights saved to model.bin
 Generating text (temp=0.8, top_p=0.9, 200 chars):
   "To be, or not to be, ..."
+```
+
+### XOR
+
+```sh
+./build/dl-cuda-xor --epochs 3000 --lr 0.1
+```
+
+### Programmatic API
+
+```cpp
+#include "dl_cuda/examples.hpp"
+
+int main() {
+  dlcuda::CharLMConfig cfg;
+  cfg.epochs = 100;
+  return dlcuda::run_char_lm(cfg);
+}
+```
+
+### Profiling
+
+See `docs/PROFILING.md` and run:
+
+```sh
+./scripts/profile_char_lm.sh
 ```
 
 ## License

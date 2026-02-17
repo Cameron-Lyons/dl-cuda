@@ -115,6 +115,41 @@ __global__ void categoricalCrossEntropyBackwardKernel(float *y, float *y_pred,
   }
 }
 
+__global__ void categoricalCrossEntropyFromIdsKernel(const int *target_ids,
+                                                     const float *y_pred,
+                                                     float *error, int n,
+                                                     int classes,
+                                                     float epsilon) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < n) {
+    int target = target_ids[idx];
+    int offset = idx * classes + target;
+    float p = y_pred[offset];
+    if (p < epsilon)
+      p = epsilon;
+    error[idx] = -logf(p);
+  }
+}
+
+__global__ void categoricalCrossEntropyBackwardFromIdsKernel(
+    const int *target_ids, const float *y_pred, float *grad, int n, int classes,
+    float epsilon) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = n * classes;
+  if (idx < total) {
+    int row = idx / classes;
+    int col = idx % classes;
+    if (col == target_ids[row]) {
+      float p = y_pred[idx];
+      if (p < epsilon)
+        p = epsilon;
+      grad[idx] = -1.0f / (p * n);
+    } else {
+      grad[idx] = 0.0f;
+    }
+  }
+}
+
 void computeLoss(float *y, float *y_pred, float *error, int n, int classes,
                  LossType loss_type, dim3 blocks, dim3 threads) {
   switch (loss_type) {
@@ -171,4 +206,23 @@ void computeLossBackward(float *y, float *y_pred, float *grad, int n,
     break;
   }
   cudaDeviceSynchronize();
+}
+
+inline void computeCategoricalCrossEntropyFromIds(const int *target_ids,
+                                                  const float *y_pred,
+                                                  float *error, int n,
+                                                  int classes,
+                                                  float epsilon = 1e-10f) {
+  int blocks = (n + 255) / 256;
+  categoricalCrossEntropyFromIdsKernel<<<blocks, 256>>>(
+      target_ids, y_pred, error, n, classes, epsilon);
+}
+
+inline void computeCategoricalCrossEntropyBackwardFromIds(
+    const int *target_ids, const float *y_pred, float *grad, int n, int classes,
+    float epsilon = 1e-10f) {
+  int total = n * classes;
+  int blocks = (total + 255) / 256;
+  categoricalCrossEntropyBackwardFromIdsKernel<<<blocks, 256>>>(
+      target_ids, y_pred, grad, n, classes, epsilon);
 }
