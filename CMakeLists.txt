@@ -16,43 +16,61 @@ endif()
 
 find_package(CUDAToolkit REQUIRED)
 
+option(DL_CUDA_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
+
+function(dl_cuda_enable_warnings target_name)
+  if(DL_CUDA_WARNINGS_AS_ERRORS)
+    target_compile_options(${target_name} PRIVATE
+      $<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra;-Werror>
+      $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra,-Werror>
+    )
+  else()
+    target_compile_options(${target_name} PRIVATE
+      $<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra>
+      $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra>
+    )
+  endif()
+endfunction()
+
 add_library(dl-cuda-core STATIC src/examples_api.cu)
 target_include_directories(dl-cuda-core PUBLIC include src)
 target_link_libraries(dl-cuda-core PUBLIC CUDA::curand)
 set_target_properties(dl-cuda-core PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-target_compile_options(dl-cuda-core PRIVATE
-    $<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra>
-    $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra>
-)
+dl_cuda_enable_warnings(dl-cuda-core)
 
 add_executable(dl-cuda-char-lm examples/char_lm.cu)
 target_include_directories(dl-cuda-char-lm PRIVATE include src)
 target_link_libraries(dl-cuda-char-lm PRIVATE dl-cuda-core CUDA::curand)
 set_target_properties(dl-cuda-char-lm PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-target_compile_options(dl-cuda-char-lm PRIVATE -Xcompiler=-Wall,-Wextra)
+dl_cuda_enable_warnings(dl-cuda-char-lm)
 
 add_executable(dl-cuda-xor examples/xor.cu)
 target_include_directories(dl-cuda-xor PRIVATE include src)
 target_link_libraries(dl-cuda-xor PRIVATE dl-cuda-core CUDA::curand)
 set_target_properties(dl-cuda-xor PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-target_compile_options(dl-cuda-xor PRIVATE -Xcompiler=-Wall,-Wextra)
+dl_cuda_enable_warnings(dl-cuda-xor)
 
 # Backward-compatible binary name.
 add_executable(dl-cuda examples/char_lm.cu)
 target_include_directories(dl-cuda PRIVATE include src)
 target_link_libraries(dl-cuda PRIVATE dl-cuda-core CUDA::curand)
 set_target_properties(dl-cuda PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-target_compile_options(dl-cuda PRIVATE -Xcompiler=-Wall,-Wextra)
+dl_cuda_enable_warnings(dl-cuda)
 
 enable_testing()
 add_executable(dl-cuda-host-tests tests/host_tests.cu)
 target_include_directories(dl-cuda-host-tests PRIVATE src)
-target_compile_options(dl-cuda-host-tests PRIVATE -Xcompiler=-Wall,-Wextra)
 target_link_libraries(dl-cuda-host-tests PRIVATE CUDA::cudart)
+dl_cuda_enable_warnings(dl-cuda-host-tests)
 add_test(NAME host_tests COMMAND dl-cuda-host-tests)
 
 add_executable(dl-cuda-gpu-tests tests/gpu_correctness_tests.cu)
 target_include_directories(dl-cuda-gpu-tests PRIVATE src include)
-target_compile_options(dl-cuda-gpu-tests PRIVATE -Xcompiler=-Wall,-Wextra)
 target_link_libraries(dl-cuda-gpu-tests PRIVATE CUDA::cudart CUDA::curand)
+dl_cuda_enable_warnings(dl-cuda-gpu-tests)
 add_test(NAME gpu_correctness_tests COMMAND dl-cuda-gpu-tests)
+
+add_custom_target(lint
+  COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/scripts/lint.sh
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+)

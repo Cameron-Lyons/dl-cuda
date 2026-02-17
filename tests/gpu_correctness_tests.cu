@@ -29,39 +29,33 @@ bool test_linear_forward_backward() {
   LinearLayer layer(2, 3, 2);
   std::vector<float> w = {1.0f, -1.0f, 2.0f, 0.5f, -0.25f, 1.5f};
   std::vector<float> b = {0.1f, -0.2f};
-  CUDA_CHECK(cudaMemcpy(layer.get_weights(), w.data(), w.size() * sizeof(float),
-                        cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(layer.get_bias(), b.data(), b.size() * sizeof(float),
-                        cudaMemcpyHostToDevice));
+  CUDA_CHECK(
+      cudaMemcpy(layer.get_weights(), w.data(), w.size() * sizeof(float), cudaMemcpyHostToDevice));
+  CUDA_CHECK(
+      cudaMemcpy(layer.get_bias(), b.data(), b.size() * sizeof(float), cudaMemcpyHostToDevice));
 
-  std::vector<float> x = {1.0f, 2.0f, -1.0f,
-                          0.5f, -3.0f, 2.0f};
-  std::vector<float> dout = {0.3f, -0.7f,
-                             1.2f, 0.4f};
+  std::vector<float> x = {1.0f, 2.0f, -1.0f, 0.5f, -3.0f, 2.0f};
+  std::vector<float> dout = {0.3f, -0.7f, 1.2f, 0.4f};
 
   float *d_x = nullptr, *d_y = nullptr, *d_dout = nullptr, *d_dx = nullptr;
   CUDA_CHECK(cudaMalloc(&d_x, x.size() * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_y, 4 * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_dout, dout.size() * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_dx, x.size() * sizeof(float)));
-  CUDA_CHECK(cudaMemcpy(d_x, x.data(), x.size() * sizeof(float),
-                        cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(d_dout, dout.data(), dout.size() * sizeof(float),
-                        cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(d_x, x.data(), x.size() * sizeof(float), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(d_dout, dout.data(), dout.size() * sizeof(float), cudaMemcpyHostToDevice));
 
   layer.forward(d_x, d_y);
   layer.backward(d_dout, d_dx);
   CUDA_CHECK(cudaDeviceSynchronize());
 
   std::vector<float> y(4), dx(6), dw(w.size()), db(b.size());
-  CUDA_CHECK(cudaMemcpy(y.data(), d_y, y.size() * sizeof(float),
+  CUDA_CHECK(cudaMemcpy(y.data(), d_y, y.size() * sizeof(float), cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(dx.data(), d_dx, dx.size() * sizeof(float), cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(dw.data(), layer.get_weight_grad(), dw.size() * sizeof(float),
                         cudaMemcpyDeviceToHost));
-  CUDA_CHECK(cudaMemcpy(dx.data(), d_dx, dx.size() * sizeof(float),
+  CUDA_CHECK(cudaMemcpy(db.data(), layer.get_bias_grad(), db.size() * sizeof(float),
                         cudaMemcpyDeviceToHost));
-  CUDA_CHECK(cudaMemcpy(dw.data(), layer.get_weight_grad(),
-                        dw.size() * sizeof(float), cudaMemcpyDeviceToHost));
-  CUDA_CHECK(cudaMemcpy(db.data(), layer.get_bias_grad(),
-                        db.size() * sizeof(float), cudaMemcpyDeviceToHost));
 
   std::vector<float> y_expected(4, 0.0f);
   std::vector<float> dx_expected(6, 0.0f);
@@ -124,8 +118,7 @@ float run_linear_loss(LinearLayer &layer, float *d_x, int out_size) {
   layer.forward(d_x, d_y);
   CUDA_CHECK(cudaDeviceSynchronize());
   std::vector<float> y(out_size);
-  CUDA_CHECK(cudaMemcpy(y.data(), d_y, out_size * sizeof(float),
-                        cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(y.data(), d_y, out_size * sizeof(float), cudaMemcpyDeviceToHost));
   cudaFree(d_y);
   float loss = 0.0f;
   for (float v : y)
@@ -139,20 +132,18 @@ bool test_linear_finite_difference() {
   LinearLayer layer(2, 2, 2);
   std::vector<float> w = {0.3f, -0.2f, 0.7f, 0.1f};
   std::vector<float> b = {0.05f, -0.04f};
-  CUDA_CHECK(cudaMemcpy(layer.get_weights(), w.data(), w.size() * sizeof(float),
-                        cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(layer.get_bias(), b.data(), b.size() * sizeof(float),
-                        cudaMemcpyHostToDevice));
+  CUDA_CHECK(
+      cudaMemcpy(layer.get_weights(), w.data(), w.size() * sizeof(float), cudaMemcpyHostToDevice));
+  CUDA_CHECK(
+      cudaMemcpy(layer.get_bias(), b.data(), b.size() * sizeof(float), cudaMemcpyHostToDevice));
 
-  std::vector<float> x = {1.0f, 2.0f,
-                          -1.0f, 0.5f};
+  std::vector<float> x = {1.0f, 2.0f, -1.0f, 0.5f};
   float *d_x = nullptr, *d_y = nullptr, *d_dout = nullptr, *d_dx = nullptr;
   CUDA_CHECK(cudaMalloc(&d_x, x.size() * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_y, 4 * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_dout, 4 * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_dx, x.size() * sizeof(float)));
-  CUDA_CHECK(cudaMemcpy(d_x, x.data(), x.size() * sizeof(float),
-                        cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(d_x, x.data(), x.size() * sizeof(float), cudaMemcpyHostToDevice));
 
   layer.forward(d_x, d_y);
   CUDA_CHECK(cudaDeviceSynchronize());
@@ -161,8 +152,8 @@ bool test_linear_finite_difference() {
   CUDA_CHECK(cudaDeviceSynchronize());
 
   std::vector<float> analytic(w.size());
-  CUDA_CHECK(cudaMemcpy(analytic.data(), layer.get_weight_grad(),
-                        analytic.size() * sizeof(float), cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(analytic.data(), layer.get_weight_grad(), analytic.size() * sizeof(float),
+                        cudaMemcpyDeviceToHost));
 
   const float eps = 1e-3f;
   bool ok = true;
@@ -182,16 +173,15 @@ bool test_linear_finite_difference() {
 
     float numeric = (l_plus - l_minus) / (2.0f * eps);
     if (relative_error(numeric, analytic[i]) > 5e-2f) {
-      std::fprintf(stderr,
-                   "finite diff mismatch idx=%zu analytic=%f numeric=%f\n", i,
-                   analytic[i], numeric);
+      std::fprintf(stderr, "finite diff mismatch idx=%zu analytic=%f numeric=%f\n", i, analytic[i],
+                   numeric);
       ok = false;
       break;
     }
   }
 
-  CUDA_CHECK(cudaMemcpy(layer.get_weights(), w.data(), w.size() * sizeof(float),
-                        cudaMemcpyHostToDevice));
+  CUDA_CHECK(
+      cudaMemcpy(layer.get_weights(), w.data(), w.size() * sizeof(float), cudaMemcpyHostToDevice));
 
   cudaFree(d_x);
   cudaFree(d_y);
@@ -209,23 +199,16 @@ bool test_embedding_forward_backward() {
   float *d_grad = groups[0].grads;
 
   std::vector<float> table = {
-      0, 1, 2,
-      3, 4, 5,
-      6, 7, 8,
-      9, 10, 11,
-      12, 13, 14,
+      0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14,
   };
-  CUDA_CHECK(cudaMemcpy(d_table, table.data(), table.size() * sizeof(float),
-                        cudaMemcpyHostToDevice));
+  CUDA_CHECK(
+      cudaMemcpy(d_table, table.data(), table.size() * sizeof(float), cudaMemcpyHostToDevice));
 
   std::vector<int> token_ids = {1, 3, 1, 4};
   embedding.set_token_ids(token_ids.data());
 
   std::vector<float> dout = {
-      1, 1, 1,
-      2, 2, 2,
-      3, 3, 3,
-      4, 4, 4,
+      1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4,
   };
 
   float *d_out = nullptr, *d_dummy = nullptr;
@@ -235,23 +218,17 @@ bool test_embedding_forward_backward() {
   embedding.forward(nullptr, d_out);
   CUDA_CHECK(cudaDeviceSynchronize());
   std::vector<float> out(dout.size());
-  CUDA_CHECK(cudaMemcpy(out.data(), d_out, out.size() * sizeof(float),
-                        cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(out.data(), d_out, out.size() * sizeof(float), cudaMemcpyDeviceToHost));
 
-  CUDA_CHECK(cudaMemcpy(d_out, dout.data(), dout.size() * sizeof(float),
-                        cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(d_out, dout.data(), dout.size() * sizeof(float), cudaMemcpyHostToDevice));
   embedding.backward(d_out, d_dummy);
   CUDA_CHECK(cudaDeviceSynchronize());
 
   std::vector<float> grad(table.size());
-  CUDA_CHECK(cudaMemcpy(grad.data(), d_grad, grad.size() * sizeof(float),
-                        cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(grad.data(), d_grad, grad.size() * sizeof(float), cudaMemcpyDeviceToHost));
 
   std::vector<float> out_expected = {
-      3, 4, 5,
-      9, 10, 11,
-      3, 4, 5,
-      12, 13, 14,
+      3, 4, 5, 9, 10, 11, 3, 4, 5, 12, 13, 14,
   };
   std::vector<float> grad_expected(table.size(), 0.0f);
   for (int d = 0; d < 3; d++) {
@@ -274,8 +251,7 @@ bool test_embedding_forward_backward() {
 bool test_softmax_cross_entropy_grad() {
   SoftmaxActivation softmax(2, 3);
 
-  std::vector<float> logits = {2.0f, 1.0f, 0.1f,
-                               -1.0f, 0.0f, 3.0f};
+  std::vector<float> logits = {2.0f, 1.0f, 0.1f, -1.0f, 0.0f, 3.0f};
   std::vector<int> targets = {2, 0};
 
   float *d_logits = nullptr, *d_probs = nullptr;
@@ -287,22 +263,21 @@ bool test_softmax_cross_entropy_grad() {
   CUDA_CHECK(cudaMalloc(&d_dldp, logits.size() * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_dlogits, logits.size() * sizeof(float)));
 
-  CUDA_CHECK(cudaMemcpy(d_logits, logits.data(), logits.size() * sizeof(float),
-                        cudaMemcpyHostToDevice));
-  CUDA_CHECK(cudaMemcpy(d_targets, targets.data(), targets.size() * sizeof(int),
-                        cudaMemcpyHostToDevice));
+  CUDA_CHECK(
+      cudaMemcpy(d_logits, logits.data(), logits.size() * sizeof(float), cudaMemcpyHostToDevice));
+  CUDA_CHECK(
+      cudaMemcpy(d_targets, targets.data(), targets.size() * sizeof(int), cudaMemcpyHostToDevice));
 
   softmax.forward(d_logits, d_probs);
-  computeCategoricalCrossEntropyBackwardFromIds(d_targets, d_probs, d_dldp, 2,
-                                                3);
+  computeCategoricalCrossEntropyBackwardFromIds(d_targets, d_probs, d_dldp, 2, 3);
   softmax.backward(d_dldp, d_dlogits);
   CUDA_CHECK(cudaDeviceSynchronize());
 
   std::vector<float> probs(logits.size()), dlogits(logits.size());
-  CUDA_CHECK(cudaMemcpy(probs.data(), d_probs, probs.size() * sizeof(float),
+  CUDA_CHECK(
+      cudaMemcpy(probs.data(), d_probs, probs.size() * sizeof(float), cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(dlogits.data(), d_dlogits, dlogits.size() * sizeof(float),
                         cudaMemcpyDeviceToHost));
-  CUDA_CHECK(cudaMemcpy(dlogits.data(), d_dlogits,
-                        dlogits.size() * sizeof(float), cudaMemcpyDeviceToHost));
 
   bool ok = true;
   for (int r = 0; r < 2; r++) {

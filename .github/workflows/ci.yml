@@ -16,11 +16,14 @@ jobs:
         with:
           cuda: "12.4.1"
 
-      - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+      - name: Install linter
+        run: sudo apt-get update && sudo apt-get install -y clang-format
 
-      - name: Build
-        run: cmake --build build -j
+      - name: Lint
+        run: ./scripts/lint.sh
+
+      - name: No-warnings build
+        run: ./scripts/check_no_warnings_build.sh build
 
       - name: Test
         run: ctest --test-dir build --output-on-failure
@@ -32,7 +35,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DDL_CUDA_WARNINGS_AS_ERRORS=ON
 
       - name: Build
         run: cmake --build build -j

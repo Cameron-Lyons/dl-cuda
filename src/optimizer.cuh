@@ -2,9 +2,9 @@
 
 #include "layers.cuh"
 #include "optimizers.cuh"
+#include <cuda/std/functional>
 #include <thrust/device_ptr.h>
 #include <thrust/execution_policy.h>
-#include <thrust/functional.h>
 #include <thrust/transform_reduce.h>
 
 struct SquareOp {
@@ -206,7 +206,7 @@ inline float Sequential::clip_grad_norm(float max_norm) {
     thrust::device_ptr<float> end = begin + pg.size;
     total_norm_sq +=
         thrust::transform_reduce(thrust::device, begin, end, SquareOp(), 0.0f,
-                                 thrust::plus<float>());
+                                 cuda::std::plus<float>());
   }
   float total_norm = sqrtf(total_norm_sq);
 

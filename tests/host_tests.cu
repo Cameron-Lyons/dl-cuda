@@ -26,8 +26,7 @@ int main() {
 
   {
     StepDecayScheduler sched(0.1f, 0.5f, 10);
-    if (!nearly_equal(sched.get_lr(0), 0.1f) ||
-        !nearly_equal(sched.get_lr(10), 0.05f) ||
+    if (!nearly_equal(sched.get_lr(0), 0.1f) || !nearly_equal(sched.get_lr(10), 0.05f) ||
         !nearly_equal(sched.get_lr(20), 0.025f)) {
       std::fprintf(stderr, "Step scheduler mismatch\n");
       return 1;
@@ -50,8 +49,7 @@ int main() {
   {
     std::vector<float> probs = {0.9f, 0.06f, 0.03f, 0.01f};
     applyTopK(probs, 1);
-    if (!(probs[0] > 0.0f && probs[1] == 0.0f && probs[2] == 0.0f &&
-          probs[3] == 0.0f)) {
+    if (!(probs[0] > 0.0f && probs[1] == 0.0f && probs[2] == 0.0f && probs[3] == 0.0f)) {
       std::fprintf(stderr, "Top-k filtering mismatch\n");
       return 1;
     }
@@ -60,8 +58,7 @@ int main() {
   {
     std::vector<float> probs = {0.8f, 0.1f, 0.07f, 0.03f};
     applyTopP(probs, 0.85f);
-    if (!(probs[0] > 0.0f && probs[1] > 0.0f && probs[2] == 0.0f &&
-          probs[3] == 0.0f)) {
+    if (!(probs[0] > 0.0f && probs[1] > 0.0f && probs[2] == 0.0f && probs[3] == 0.0f)) {
       std::fprintf(stderr, "Top-p filtering mismatch\n");
       return 1;
     }

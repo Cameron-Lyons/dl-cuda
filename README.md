@@ -40,6 +40,13 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
+## Lint And Warnings
+
+```sh
+./scripts/lint.sh
+./scripts/check_no_warnings_build.sh build
+```
+
 ## Usage
 
 ### Character LM
