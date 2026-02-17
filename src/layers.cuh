@@ -2,9 +2,23 @@
 
 #include "sequential.cuh"
 #include <cmath>
+#include <cstdint>
 #include <curand_kernel.h>
 
 static const short NUM_THREADS = 256;
+
+inline uint64_t &global_init_seed() {
+  static uint64_t seed = 42ULL;
+  return seed;
+}
+
+inline uint64_t next_init_seed() {
+  static uint64_t counter = 0ULL;
+  counter++;
+  return global_init_seed() + 9973ULL * counter;
+}
+
+inline void set_global_init_seed(uint64_t seed) { global_init_seed() = seed; }
 
 __global__ void linearLayerKernel(const float *d_X, const float *d_W,
                                   const float *d_b, float *d_Y, int n,
@@ -76,10 +90,10 @@ __global__ void sgdUpdateKernel(float *params, const float *grads, float lr,
 }
 
 __global__ void initWeightsKernel(float *data, int n, float scale,
-                                  curandState_t *states) {
+                                  curandState_t *states, uint64_t seed) {
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx < n) {
-    curand_init(42 + idx, idx, 0, &states[idx]);
+    curand_init(seed, idx, 0, &states[idx]);
     data[idx] = curand_normal(&states[idx]) * scale;
   }
 }
@@ -108,8 +122,9 @@ public:
     CUDA_CHECK(cudaMalloc(&d_states, total_w * sizeof(curandState_t)));
     float scale = sqrtf(2.0f / in_features);
     int blocks = (total_w + 255) / 256;
-    initWeightsKernel<<<blocks, 256>>>(d_W, total_w, scale, d_states);
-    CUDA_CHECK(cudaDeviceSynchronize());
+    initWeightsKernel<<<blocks, 256>>>(d_W, total_w, scale, d_states,
+                                       next_init_seed());
+    CUDA_CHECK(cudaGetLastError());
     cudaFree(d_states);
 
     CUDA_CHECK(cudaMemset(d_b, 0, out_features * sizeof(float)));
@@ -503,7 +518,7 @@ public:
           x_t, Wf, Wi, Wc, Wo, bf, bi, bc, bo, h, c, cache_f_ + t * bh,
           cache_i_ + t * bh, cache_c_hat_ + t * bh, cache_o_ + t * bh,
           hidden_size_, batch_size_);
-      CUDA_CHECK(cudaDeviceSynchronize());
+      CUDA_CHECK(cudaGetLastError());
 
       CUDA_CHECK(cudaMemcpy(h_all_ + (t + 1) * bh, h, bh * sizeof(float),
                              cudaMemcpyDeviceToDevice));
@@ -542,14 +557,14 @@ public:
           dh_t, dh_next_, dc_next_, c_prev, c_cur, cache_f_ + t * bh,
           cache_i_ + t * bh, cache_c_hat_ + t * bh, cache_o_ + t * bh,
           dz_f_, dz_i_, dz_c_, dz_o_, dc_next_, bh);
-      CUDA_CHECK(cudaDeviceSynchronize());
+      CUDA_CHECK(cudaGetLastError());
 
       int concat_total = batch_size_ * 2 * hidden_size_;
       int concat_blocks = (concat_total + NUM_THREADS - 1) / NUM_THREADS;
       lstmBackwardConcatKernel<<<concat_blocks, NUM_THREADS>>>(
           dz_f_, dz_i_, dz_c_, dz_o_, Wf, Wi, Wc, Wo, dx_t, dh_next_,
           batch_size_, hidden_size_);
-      CUDA_CHECK(cudaDeviceSynchronize());
+      CUDA_CHECK(cudaGetLastError());
 
       int w_blocks = (weight_size + NUM_THREADS - 1) / NUM_THREADS;
       lstmWeightGradKernel<<<w_blocks, NUM_THREADS>>>(
@@ -570,7 +585,7 @@ public:
           dz_c_, dbc_, batch_size_, hidden_size_);
       biasGradAccumKernel<<<b_blocks, NUM_THREADS>>>(
           dz_o_, dbo_, batch_size_, hidden_size_);
-      CUDA_CHECK(cudaDeviceSynchronize());
+      CUDA_CHECK(cudaGetLastError());
     }
   }
 
@@ -728,7 +743,7 @@ public:
       elmanRnnKernel<<<num_blocks, NUM_THREADS>>>(
           x_t, h, Wxh, Whh, b_h, Why, b_y, h, y_t, batch_size_, input_size_,
           hidden_size_, output_size_);
-      CUDA_CHECK(cudaDeviceSynchronize());
+      CUDA_CHECK(cudaGetLastError());
 
       CUDA_CHECK(cudaMemcpy(h_all_ + (t + 1) * bh, h, bh * sizeof(float),
                              cudaMemcpyDeviceToDevice));
@@ -760,15 +775,15 @@ public:
 
       transposeMatVecKernel<<<bh_blocks, NUM_THREADS>>>(
           dy_t, Why, dh_buf_, batch_size_, hidden_size_, output_size_);
-      CUDA_CHECK(cudaDeviceSynchronize());
+      CUDA_CHECK(cudaGetLastError());
 
       addVectorsKernel<<<bh_blocks, NUM_THREADS>>>(
           dh_buf_, dh_next_, dh_buf_, bh);
-      CUDA_CHECK(cudaDeviceSynchronize());
+      CUDA_CHECK(cudaGetLastError());
 
       tanhBackwardElementKernel<<<bh_blocks, NUM_THREADS>>>(
           dh_buf_, h_t, d_pre_h_, bh);
-      CUDA_CHECK(cudaDeviceSynchronize());
+      CUDA_CHECK(cudaGetLastError());
 
       int bi_blocks = (bi_size + NUM_THREADS - 1) / NUM_THREADS;
       transposeMatVecKernel<<<bi_blocks, NUM_THREADS>>>(
@@ -776,7 +791,7 @@ public:
 
       transposeMatVecKernel<<<bh_blocks, NUM_THREADS>>>(
           d_pre_h_, Whh, dh_next_, batch_size_, hidden_size_, hidden_size_);
-      CUDA_CHECK(cudaDeviceSynchronize());
+      CUDA_CHECK(cudaGetLastError());
 
       int wxh_size = input_size_ * hidden_size_;
       int wxh_blocks = (wxh_size + NUM_THREADS - 1) / NUM_THREADS;
@@ -800,7 +815,7 @@ public:
       int by_blocks = (output_size_ + NUM_THREADS - 1) / NUM_THREADS;
       biasGradAccumKernel<<<by_blocks, NUM_THREADS>>>(
           dy_t, db_y_, batch_size_, output_size_);
-      CUDA_CHECK(cudaDeviceSynchronize());
+      CUDA_CHECK(cudaGetLastError());
     }
   }
 

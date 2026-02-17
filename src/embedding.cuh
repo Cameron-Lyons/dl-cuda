@@ -50,8 +50,8 @@ public:
     float scale = sqrtf(2.0f / embedding_dim);
     int blocks = (table_size + 255) / 256;
     initWeightsKernel<<<blocks, 256>>>(d_embedding_, table_size, scale,
-                                       d_states);
-    CUDA_CHECK(cudaDeviceSynchronize());
+                                       d_states, next_init_seed());
+    CUDA_CHECK(cudaGetLastError());
     cudaFree(d_states);
   }
 

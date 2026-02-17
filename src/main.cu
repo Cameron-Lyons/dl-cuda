@@ -46,6 +46,9 @@ __global__ void argmaxKernel(const float *logits, int *result, int num_rows,
 }
 
 int main() {
+  const uint64_t INIT_SEED = 12345ULL;
+  set_global_init_seed(INIT_SEED);
+
   const std::string text =
       "To be, or not to be, that is the question. "
       "Whether tis nobler in the mind to suffer "
@@ -89,6 +92,10 @@ int main() {
 
   int num_tokens = SEQ_LEN;
   int text_len = static_cast<int>(text.size());
+  if (text_len <= SEQ_LEN + 1) {
+    fprintf(stderr, "Dataset text must be longer than seq_len + 1.\n");
+    return EXIT_FAILURE;
+  }
 
   std::vector<int> h_input_ids(num_tokens);
   std::vector<int> h_target_ids(num_tokens);
@@ -136,7 +143,7 @@ int main() {
   int oh_blocks = (oh_total + 255) / 256;
   buildOneHotTargetsKernel<<<oh_blocks, 256>>>(d_target_ids, d_targets,
                                                 num_tokens, vocab_size);
-  CUDA_CHECK(cudaDeviceSynchronize());
+  CUDA_CHECK(cudaGetLastError());
 
   float *d_dummy_input;
   CUDA_CHECK(cudaMalloc(&d_dummy_input, num_tokens * sizeof(float)));
@@ -154,7 +161,7 @@ int main() {
 
   for (int epoch = 0; epoch < EPOCHS; epoch++) {
     int max_offset = text_len - SEQ_LEN - 1;
-    int offset = offset_rng() % max_offset;
+    int offset = offset_rng() % (max_offset + 1);
     for (int i = 0; i < num_tokens; i++) {
       h_input_ids[i] =
           char_to_id[static_cast<unsigned char>(text[offset + i])];
@@ -166,16 +173,15 @@ int main() {
                            num_tokens * sizeof(int), cudaMemcpyHostToDevice));
     buildOneHotTargetsKernel<<<oh_blocks, 256>>>(d_target_ids, d_targets,
                                                   num_tokens, vocab_size);
-    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaGetLastError());
 
     model.forward(d_dummy_input, d_pred);
-    CUDA_CHECK(cudaDeviceSynchronize());
 
     if (epoch % PRINT_EVERY == 0) {
       dim3 loss_blocks((num_tokens + 255) / 256);
       categoricalCrossEntropyKernel<<<loss_blocks, 256>>>(
           d_targets, d_pred, d_error, num_tokens, vocab_size, 1e-10f);
-      CUDA_CHECK(cudaDeviceSynchronize());
+      CUDA_CHECK(cudaGetLastError());
 
       std::vector<float> h_error(num_tokens);
       CUDA_CHECK(cudaMemcpy(h_error.data(), d_error,
@@ -189,7 +195,7 @@ int main() {
 
       argmaxKernel<<<(num_tokens + 255) / 256, 256>>>(d_pred, d_pred_ids,
                                                        num_tokens, vocab_size);
-      CUDA_CHECK(cudaDeviceSynchronize());
+      CUDA_CHECK(cudaGetLastError());
       std::vector<int> h_pred_ids(num_tokens);
       CUDA_CHECK(cudaMemcpy(h_pred_ids.data(), d_pred_ids,
                              num_tokens * sizeof(int),
@@ -211,16 +217,17 @@ int main() {
                         CATEGORICAL_CROSS_ENTROPY);
 
     model.backward(d_loss_grad, d_input_grad);
-    CUDA_CHECK(cudaDeviceSynchronize());
 
     model.clip_grad_norm(GRAD_CLIP);
 
     float lr = scheduler.get_lr(epoch);
     model.update_weights(lr);
-    CUDA_CHECK(cudaDeviceSynchronize());
   }
 
-  model.save_weights("model.bin");
+  if (!model.save_weights("model.bin")) {
+    fprintf(stderr, "Failed to save model weights to model.bin\n");
+    return EXIT_FAILURE;
+  }
   printf("\nWeights saved to model.bin\n");
 
   printf("\nGenerating text (temp=%.1f, top_p=%.1f, %d chars):\n", TEMPERATURE,
@@ -246,7 +253,6 @@ int main() {
     embedding.set_token_ids(context.data());
 
     model.forward(d_dummy_input, d_gen_pred);
-    CUDA_CHECK(cudaDeviceSynchronize());
 
     float *last_row = d_gen_pred + (num_tokens - 1) * vocab_size;
     std::vector<float> h_probs(vocab_size);

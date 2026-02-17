@@ -2,6 +2,14 @@
 
 #include "layers.cuh"
 #include "optimizers.cuh"
+#include <thrust/device_ptr.h>
+#include <thrust/execution_policy.h>
+#include <thrust/functional.h>
+#include <thrust/transform_reduce.h>
+
+struct SquareOp {
+  __host__ __device__ float operator()(float x) const { return x * x; }
+};
 
 class Optimizer {
 public:
@@ -192,32 +200,13 @@ inline float Sequential::clip_grad_norm(float max_norm) {
   if (all_groups.empty())
     return 0.0f;
 
-  int total_blocks = 0;
-  for (auto &pg : all_groups) {
-    total_blocks += (pg.size + 255) / 256;
-  }
-
-  float *d_partial;
-  CUDA_CHECK(cudaMalloc(&d_partial, total_blocks * sizeof(float)));
-
-  int block_offset = 0;
-  for (auto &pg : all_groups) {
-    int blocks = (pg.size + 255) / 256;
-    gradNormSquaredKernel<<<blocks, 256, 256 * sizeof(float)>>>(
-        pg.grads, d_partial + block_offset, pg.size);
-    block_offset += blocks;
-  }
-  CUDA_CHECK(cudaDeviceSynchronize());
-
-  std::vector<float> h_partial(total_blocks);
-  CUDA_CHECK(cudaMemcpy(h_partial.data(), d_partial,
-                         total_blocks * sizeof(float),
-                         cudaMemcpyDeviceToHost));
-  cudaFree(d_partial);
-
   float total_norm_sq = 0.0f;
-  for (int i = 0; i < total_blocks; i++) {
-    total_norm_sq += h_partial[i];
+  for (auto &pg : all_groups) {
+    thrust::device_ptr<float> begin(pg.grads);
+    thrust::device_ptr<float> end = begin + pg.size;
+    total_norm_sq +=
+        thrust::transform_reduce(thrust::device, begin, end, SquareOp(), 0.0f,
+                                 thrust::plus<float>());
   }
   float total_norm = sqrtf(total_norm_sq);
 
@@ -227,7 +216,6 @@ inline float Sequential::clip_grad_norm(float max_norm) {
       int blocks = (pg.size + 255) / 256;
       clipGradsKernel<<<blocks, 256>>>(pg.grads, clip_coeff, pg.size);
     }
-    CUDA_CHECK(cudaDeviceSynchronize());
   }
 
   return total_norm;

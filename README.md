@@ -16,7 +16,7 @@ A GPU-accelerated deep learning framework written from scratch in CUDA C++.
 
 **Loss Functions** — MSE, MAE, Binary Cross-Entropy, Categorical Cross-Entropy
 
-**Optimizers** — SGD, RMSprop, Adam
+**Optimizers** — SGD, RMSprop, Adam, AdamW
 
 **Metrics** — R², Accuracy, F1 Score, Matthews Correlation Coefficient
 
@@ -26,6 +26,7 @@ A GPU-accelerated deep learning framework written from scratch in CUDA C++.
 
 - CMake 3.18+
 - NVIDIA CUDA Toolkit
+- NVIDIA driver compatible with the CUDA runtime/toolkit version
 - C++17 compiler
 
 ## Build
@@ -33,26 +34,26 @@ A GPU-accelerated deep learning framework written from scratch in CUDA C++.
 ```sh
 cmake -B build
 cmake --build build
+ctest --test-dir build --output-on-failure
 ```
 
 ## Usage
 
-The included example trains a two-layer network on the XOR problem:
+The included example trains a small character-level Transformer language model
+on a Shakespeare excerpt, saves weights, and then generates text.
 
 ```sh
 ./build/dl-cuda
 ```
 
 ```
-Epoch 0, MSE Loss: 0.372253
-Epoch 500, MSE Loss: 0.001204
+Char-level LM | vocab=..., seq_len=64, d_model=64, d_ff=256, heads=4, layers=3
+Optimizer: AdamW (wd=0.01) | Grad clip: 1.0 | Sampling: temp=0.8, top_p=0.9
+Training on ... chars of Shakespeare for 800 epochs
 ...
-
-Final predictions:
-  [0, 0] -> 0.0197 (expected 0)
-  [0, 1] -> 0.9718 (expected 1)
-  [1, 0] -> 0.9726 (expected 1)
-  [1, 1] -> 0.0362 (expected 0)
+Weights saved to model.bin
+Generating text (temp=0.8, top_p=0.9, 200 chars):
+  "To be, or not to be, ..."
 ```
 
 ## License
