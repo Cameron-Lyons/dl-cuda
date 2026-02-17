@@ -2,8 +2,11 @@
 #include "embedding.cuh"
 #include "layers.cuh"
 #include "loss.cuh"
+#include "sequential.cuh"
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <string>
 #include <vector>
 
 namespace {
@@ -297,6 +300,48 @@ bool test_softmax_cross_entropy_grad() {
   return ok;
 }
 
+bool test_checkpoint_roundtrip() {
+  set_global_init_seed(4);
+
+  LinearLayer l1(2, 2, 2);
+  std::vector<float> w = {0.11f, -0.22f, 0.33f, -0.44f};
+  std::vector<float> b = {0.55f, -0.66f};
+  CUDA_CHECK(
+      cudaMemcpy(l1.get_weights(), w.data(), w.size() * sizeof(float), cudaMemcpyHostToDevice));
+  CUDA_CHECK(cudaMemcpy(l1.get_bias(), b.data(), b.size() * sizeof(float), cudaMemcpyHostToDevice));
+
+  Sequential m1;
+  m1.add(&l1);
+  const std::string path = "/tmp/dl_cuda_roundtrip_test.bin";
+  if (!m1.save_weights(path)) {
+    return false;
+  }
+
+  LinearLayer l2(2, 2, 2);
+  Sequential m2;
+  m2.add(&l2);
+  if (!m2.load_weights(path)) {
+    std::remove(path.c_str());
+    return false;
+  }
+  std::remove(path.c_str());
+
+  std::vector<float> w_loaded(w.size()), b_loaded(b.size());
+  CUDA_CHECK(cudaMemcpy(w_loaded.data(), l2.get_weights(), w_loaded.size() * sizeof(float),
+                        cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpy(b_loaded.data(), l2.get_bias(), b_loaded.size() * sizeof(float),
+                        cudaMemcpyDeviceToHost));
+
+  bool ok = true;
+  for (size_t i = 0; i < w.size(); i++) {
+    ok &= nearly_equal(w[i], w_loaded[i], 1e-6f);
+  }
+  for (size_t i = 0; i < b.size(); i++) {
+    ok &= nearly_equal(b[i], b_loaded[i], 1e-6f);
+  }
+  return ok;
+}
+
 } // namespace
 
 int main() {
@@ -319,6 +364,10 @@ int main() {
   }
   if (!test_softmax_cross_entropy_grad()) {
     std::fprintf(stderr, "test_softmax_cross_entropy_grad failed\n");
+    return 1;
+  }
+  if (!test_checkpoint_roundtrip()) {
+    std::fprintf(stderr, "test_checkpoint_roundtrip failed\n");
     return 1;
   }
 

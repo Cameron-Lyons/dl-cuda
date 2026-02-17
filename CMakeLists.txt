@@ -74,3 +74,8 @@ add_custom_target(lint
   COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/scripts/lint.sh
   WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
 )
+
+add_custom_target(format
+  COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/scripts/format.sh
+  WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+)

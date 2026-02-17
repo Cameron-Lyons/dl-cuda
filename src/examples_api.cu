@@ -11,6 +11,7 @@
 #include "../include/dl_cuda/examples.hpp"
 #include <algorithm>
 #include <cmath>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <random>
@@ -127,6 +128,16 @@ int run_char_lm(const CharLMConfig &cfg) {
 
   std::mt19937 offset_rng(static_cast<uint32_t>(cfg.init_seed));
 
+  if (cfg.load_weights) {
+    if (!model.load_weights(cfg.weights_path)) {
+      std::fprintf(stderr, "Failed to load model weights from %s\n", cfg.weights_path.c_str());
+      return EXIT_FAILURE;
+    }
+    std::printf("Loaded weights from %s\n", cfg.weights_path.c_str());
+  }
+
+  auto train_start = std::chrono::steady_clock::now();
+
   for (int epoch = 0; epoch < cfg.epochs; epoch++) {
     int max_offset = text_len - cfg.seq_len - 1;
     int offset = static_cast<int>(offset_rng() % (max_offset + 1));
@@ -182,11 +193,22 @@ int run_char_lm(const CharLMConfig &cfg) {
     model.update_weights(lr);
   }
 
-  if (!model.save_weights("model.bin")) {
-    std::fprintf(stderr, "Failed to save model weights to model.bin\n");
-    return EXIT_FAILURE;
+  auto train_end = std::chrono::steady_clock::now();
+  if (cfg.epochs > 0) {
+    double train_sec =
+        std::chrono::duration_cast<std::chrono::duration<double>>(train_end - train_start).count();
+    double tokens = static_cast<double>(cfg.epochs) * cfg.seq_len;
+    double tok_per_sec = train_sec > 0.0 ? tokens / train_sec : 0.0;
+    std::printf("Training throughput: %.2f tokens/s (%.3f s)\n", tok_per_sec, train_sec);
   }
-  std::printf("\nWeights saved to model.bin\n");
+
+  if (cfg.save_weights) {
+    if (!model.save_weights(cfg.weights_path)) {
+      std::fprintf(stderr, "Failed to save model weights to %s\n", cfg.weights_path.c_str());
+      return EXIT_FAILURE;
+    }
+    std::printf("\nWeights saved to %s\n", cfg.weights_path.c_str());
+  }
 
   std::printf("\nGenerating text (temp=%.2f, top_p=%.2f, %d chars):\n", cfg.temperature, cfg.top_p,
               cfg.gen_len);

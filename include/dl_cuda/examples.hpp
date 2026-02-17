@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
 
 namespace dlcuda {
 
@@ -22,6 +23,9 @@ struct CharLMConfig {
   int warmup_steps = 50;
   uint64_t init_seed = 12345ULL;
   uint64_t sample_seed = 123ULL;
+  std::string weights_path = "model.bin";
+  bool load_weights = false;
+  bool save_weights = true;
 };
 
 struct XorConfig {

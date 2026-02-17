@@ -44,6 +44,7 @@ ctest --test-dir build --output-on-failure
 
 ```sh
 ./scripts/lint.sh
+./scripts/format.sh
 ./scripts/check_no_warnings_build.sh build
 ```
 
@@ -53,6 +54,8 @@ ctest --test-dir build --output-on-failure
 
 ```sh
 ./build/dl-cuda-char-lm --epochs 800 --print-every 50
+# Reuse existing checkpoint and skip saving:
+./build/dl-cuda-char-lm --epochs 0 --load-weights --weights model.bin --no-save
 ```
 
 ```
@@ -89,6 +92,7 @@ See `docs/PROFILING.md` and run:
 
 ```sh
 ./scripts/profile_char_lm.sh
+./scripts/bench_char_lm.sh 200 64
 ```
 
 ## License
