@@ -10,7 +10,6 @@ A GPU-accelerated deep learning framework written from scratch in CUDA C++.
 - LSTM
 - Elman RNN
 - Transformer (multi-head attention, layer norm, residual connections)
-- Dropout
 
 **Activations** — ReLU, Sigmoid, Tanh
 
@@ -18,9 +17,7 @@ A GPU-accelerated deep learning framework written from scratch in CUDA C++.
 
 **Optimizers** — SGD, RMSprop, Adam, AdamW
 
-**Metrics** — R², Accuracy, F1 Score, Matthews Correlation Coefficient
-
-**Utilities** — Tensor operations, CSV data loading, Sequential model API
+**Utilities** — Sequential model API
 
 **Examples API** — reusable `run_char_lm(...)` and `run_xor(...)` entry points
 via `include/dl_cuda/examples.hpp`
