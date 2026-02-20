@@ -40,6 +40,47 @@ __global__ void argmaxKernel(const float *logits, int *result, int num_rows, int
 int run_char_lm(const CharLMConfig &cfg) {
   set_global_init_seed(cfg.init_seed);
 
+  if (cfg.seq_len <= 0) {
+    std::fprintf(stderr, "seq_len must be > 0.\n");
+    return EXIT_FAILURE;
+  }
+  if (cfg.batch_size != 1) {
+    std::fprintf(stderr, "Only batch_size=1 is currently supported.\n");
+    return EXIT_FAILURE;
+  }
+  if (cfg.d_model <= 0 || cfg.d_ff <= 0 || cfg.num_heads <= 0 || cfg.num_layers <= 0) {
+    std::fprintf(stderr, "Model dimensions and layer counts must be > 0.\n");
+    return EXIT_FAILURE;
+  }
+  if (cfg.epochs < 0 || cfg.gen_len < 0) {
+    std::fprintf(stderr, "epochs and gen_len must be >= 0.\n");
+    return EXIT_FAILURE;
+  }
+  if (cfg.print_every <= 0) {
+    std::fprintf(stderr, "print_every must be > 0.\n");
+    return EXIT_FAILURE;
+  }
+  if (cfg.lr_max <= 0.0f || cfg.lr_min < 0.0f || cfg.lr_min > cfg.lr_max) {
+    std::fprintf(stderr, "Learning rates must satisfy 0 <= lr_min <= lr_max and lr_max > 0.\n");
+    return EXIT_FAILURE;
+  }
+  if (cfg.warmup_steps < 0) {
+    std::fprintf(stderr, "warmup_steps must be >= 0.\n");
+    return EXIT_FAILURE;
+  }
+  if (cfg.grad_clip <= 0.0f) {
+    std::fprintf(stderr, "grad_clip must be > 0.\n");
+    return EXIT_FAILURE;
+  }
+  if (cfg.temperature <= 0.0f) {
+    std::fprintf(stderr, "temperature must be > 0.\n");
+    return EXIT_FAILURE;
+  }
+  if (cfg.top_p <= 0.0f || cfg.top_p > 1.0f) {
+    std::fprintf(stderr, "top_p must be in (0, 1].\n");
+    return EXIT_FAILURE;
+  }
+
   const std::string text = "To be, or not to be, that is the question. "
                            "Whether tis nobler in the mind to suffer "
                            "the slings and arrows of outrageous fortune, "
@@ -106,8 +147,37 @@ int run_char_lm(const CharLMConfig &cfg) {
   float *d_loss_grad = nullptr;
   float *d_error = nullptr;
   float *d_input_grad = nullptr;
+  float *d_dummy_input = nullptr;
+  float *d_gen_pred = nullptr;
   int *d_target_ids = nullptr;
   int *d_pred_ids = nullptr;
+  auto cleanup = [&]() {
+    if (d_pred)
+      cudaFree(d_pred);
+    if (d_loss_grad)
+      cudaFree(d_loss_grad);
+    if (d_error)
+      cudaFree(d_error);
+    if (d_input_grad)
+      cudaFree(d_input_grad);
+    if (d_target_ids)
+      cudaFree(d_target_ids);
+    if (d_pred_ids)
+      cudaFree(d_pred_ids);
+    if (d_dummy_input)
+      cudaFree(d_dummy_input);
+    if (d_gen_pred)
+      cudaFree(d_gen_pred);
+  };
+
+  if (cfg.load_weights) {
+    if (!model.load_weights(cfg.weights_path)) {
+      std::fprintf(stderr, "Failed to load model weights from %s\n", cfg.weights_path.c_str());
+      return EXIT_FAILURE;
+    }
+    std::printf("Loaded weights from %s\n", cfg.weights_path.c_str());
+  }
+
   CUDA_CHECK(cudaMalloc(&d_pred, out_total * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_loss_grad, out_total * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_error, num_tokens * sizeof(float)));
@@ -115,7 +185,6 @@ int run_char_lm(const CharLMConfig &cfg) {
   CUDA_CHECK(cudaMalloc(&d_target_ids, num_tokens * sizeof(int)));
   CUDA_CHECK(cudaMalloc(&d_pred_ids, num_tokens * sizeof(int)));
 
-  float *d_dummy_input = nullptr;
   CUDA_CHECK(cudaMalloc(&d_dummy_input, num_tokens * sizeof(float)));
 
   std::printf("Char-level LM | vocab=%d, seq_len=%d, d_model=%d, d_ff=%d, "
@@ -127,14 +196,6 @@ int run_char_lm(const CharLMConfig &cfg) {
   std::printf("Training on %d chars for %d epochs\n\n", text_len, cfg.epochs);
 
   std::mt19937 offset_rng(static_cast<uint32_t>(cfg.init_seed));
-
-  if (cfg.load_weights) {
-    if (!model.load_weights(cfg.weights_path)) {
-      std::fprintf(stderr, "Failed to load model weights from %s\n", cfg.weights_path.c_str());
-      return EXIT_FAILURE;
-    }
-    std::printf("Loaded weights from %s\n", cfg.weights_path.c_str());
-  }
 
   auto train_start = std::chrono::steady_clock::now();
 
@@ -193,6 +254,7 @@ int run_char_lm(const CharLMConfig &cfg) {
     model.update_weights(lr);
   }
 
+  CUDA_CHECK(cudaDeviceSynchronize());
   auto train_end = std::chrono::steady_clock::now();
   if (cfg.epochs > 0) {
     double train_sec =
@@ -205,6 +267,7 @@ int run_char_lm(const CharLMConfig &cfg) {
   if (cfg.save_weights) {
     if (!model.save_weights(cfg.weights_path)) {
       std::fprintf(stderr, "Failed to save model weights to %s\n", cfg.weights_path.c_str());
+      cleanup();
       return EXIT_FAILURE;
     }
     std::printf("\nWeights saved to %s\n", cfg.weights_path.c_str());
@@ -225,7 +288,6 @@ int run_char_lm(const CharLMConfig &cfg) {
     generated += id_to_char[gen_ids[i]];
   }
 
-  float *d_gen_pred = nullptr;
   CUDA_CHECK(cudaMalloc(&d_gen_pred, num_tokens * vocab_size * sizeof(float)));
 
   for (int step = 0; step < cfg.gen_len; step++) {
@@ -246,20 +308,26 @@ int run_char_lm(const CharLMConfig &cfg) {
 
   std::printf("  \"%s\"\n", generated.c_str());
 
-  cudaFree(d_pred);
-  cudaFree(d_loss_grad);
-  cudaFree(d_error);
-  cudaFree(d_input_grad);
-  cudaFree(d_target_ids);
-  cudaFree(d_pred_ids);
-  cudaFree(d_dummy_input);
-  cudaFree(d_gen_pred);
+  cleanup();
 
   return 0;
 }
 
 int run_xor(const XorConfig &cfg) {
   set_global_init_seed(cfg.init_seed);
+
+  if (cfg.epochs < 0) {
+    std::fprintf(stderr, "epochs must be >= 0.\n");
+    return EXIT_FAILURE;
+  }
+  if (cfg.print_every <= 0) {
+    std::fprintf(stderr, "print_every must be > 0.\n");
+    return EXIT_FAILURE;
+  }
+  if (cfg.lr <= 0.0f) {
+    std::fprintf(stderr, "lr must be > 0.\n");
+    return EXIT_FAILURE;
+  }
 
   constexpr int N = 4;
   constexpr int IN = 2;
@@ -322,6 +390,8 @@ int run_xor(const XorConfig &cfg) {
     model.update_weights(cfg.lr);
   }
 
+  model.forward(d_x, d_pred);
+  CUDA_CHECK(cudaDeviceSynchronize());
   std::vector<float> h_pred(N);
   CUDA_CHECK(cudaMemcpy(h_pred.data(), d_pred, N * sizeof(float), cudaMemcpyDeviceToHost));
   std::printf("Final predictions:\n");

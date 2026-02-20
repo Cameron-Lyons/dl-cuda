@@ -40,6 +40,12 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
+If your GPU architecture is not detected by default, set it explicitly:
+
+```sh
+cmake -B build -DCMAKE_CUDA_ARCHITECTURES=89
+```
+
 ## Lint And Warnings
 
 ```sh

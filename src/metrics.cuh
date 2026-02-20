@@ -1,10 +1,24 @@
 #pragma once
 
+#include <cstdio>
+#include <cstdlib>
 #include <cuda_runtime.h>
 #include <cuda/std/functional>
 #include <thrust/device_ptr.h>
 #include <thrust/execution_policy.h>
 #include <thrust/reduce.h>
+
+#ifndef CUDA_CHECK
+#define CUDA_CHECK(call)                                                       \
+  do {                                                                         \
+    cudaError_t err = (call);                                                  \
+    if (err != cudaSuccess) {                                                  \
+      fprintf(stderr, "CUDA error at %s:%d: %s\n", __FILE__, __LINE__,        \
+              cudaGetErrorString(err));                                         \
+      exit(EXIT_FAILURE);                                                      \
+    }                                                                          \
+  } while (0)
+#endif
 
 __global__ void r2Kernel(float *y, float *y_pred, float *numerator,
                          float *denominator, float y_mean, int n) {
@@ -42,23 +56,26 @@ __global__ void computeMetricsKernel(int *y, int *y_pred, int *TP, int *FP,
 
 float r2Loss(float *y, float *y_pred, float y_mean, int n) {
   float *d_numerator, *d_denominator;
-  cudaMalloc(&d_numerator, n * sizeof(float));
-  cudaMalloc(&d_denominator, n * sizeof(float));
+  CUDA_CHECK(cudaMalloc(&d_numerator, n * sizeof(float)));
+  CUDA_CHECK(cudaMalloc(&d_denominator, n * sizeof(float)));
 
   int threadsPerBlock = 256;
   int blocks = (n + threadsPerBlock - 1) / threadsPerBlock;
 
   r2Kernel<<<blocks, threadsPerBlock>>>(y, y_pred, d_numerator, d_denominator,
                                         y_mean, n);
+  CUDA_CHECK(cudaGetLastError());
 
   float numerator = thrust::reduce(thrust::device, d_numerator, d_numerator + n,
                                    0.0f, cuda::std::plus<float>());
+  CUDA_CHECK(cudaGetLastError());
   float denominator =
       thrust::reduce(thrust::device, d_denominator, d_denominator + n, 0.0f,
                      cuda::std::plus<float>());
+  CUDA_CHECK(cudaGetLastError());
 
-  cudaFree(d_numerator);
-  cudaFree(d_denominator);
+  CUDA_CHECK(cudaFree(d_numerator));
+  CUDA_CHECK(cudaFree(d_denominator));
 
   if (denominator == 0)
     return 0;
@@ -67,42 +84,46 @@ float r2Loss(float *y, float *y_pred, float y_mean, int n) {
 
 float computeAccuracy(int *y, int *y_pred, int n) {
   int *d_correct_preds;
-  cudaMalloc(&d_correct_preds, n * sizeof(int));
+  CUDA_CHECK(cudaMalloc(&d_correct_preds, n * sizeof(int)));
 
   int threadsPerBlock = 256;
   int blocks = (n + threadsPerBlock - 1) / threadsPerBlock;
 
   accuracyKernel<<<blocks, threadsPerBlock>>>(y, y_pred, d_correct_preds, n);
+  CUDA_CHECK(cudaGetLastError());
 
   int correct_count =
       thrust::reduce(thrust::device, d_correct_preds, d_correct_preds + n);
+  CUDA_CHECK(cudaGetLastError());
 
-  cudaFree(d_correct_preds);
+  CUDA_CHECK(cudaFree(d_correct_preds));
 
   return float(correct_count) / n;
 }
 
 float computeF1Score(int *y, int *y_pred, int n) {
   int *d_TP, *d_FP, *d_FN, *d_TN;
-  cudaMalloc(&d_TP, n * sizeof(int));
-  cudaMalloc(&d_FP, n * sizeof(int));
-  cudaMalloc(&d_FN, n * sizeof(int));
-  cudaMalloc(&d_TN, n * sizeof(int));
+  CUDA_CHECK(cudaMalloc(&d_TP, n * sizeof(int)));
+  CUDA_CHECK(cudaMalloc(&d_FP, n * sizeof(int)));
+  CUDA_CHECK(cudaMalloc(&d_FN, n * sizeof(int)));
+  CUDA_CHECK(cudaMalloc(&d_TN, n * sizeof(int)));
 
   int threadsPerBlock = 256;
   int blocks = (n + threadsPerBlock - 1) / threadsPerBlock;
 
   computeMetricsKernel<<<blocks, threadsPerBlock>>>(y, y_pred, d_TP, d_FP,
                                                     d_FN, d_TN, n);
+  CUDA_CHECK(cudaGetLastError());
 
   int sum_TP = thrust::reduce(thrust::device, d_TP, d_TP + n);
   int sum_FP = thrust::reduce(thrust::device, d_FP, d_FP + n);
   int sum_FN = thrust::reduce(thrust::device, d_FN, d_FN + n);
+  CUDA_CHECK(cudaGetLastError());
 
-  cudaFree(d_TP);
-  cudaFree(d_FP);
-  cudaFree(d_FN);
-  cudaFree(d_TN);
+  CUDA_CHECK(cudaFree(d_TP));
+  CUDA_CHECK(cudaFree(d_FP));
+  CUDA_CHECK(cudaFree(d_FN));
+  CUDA_CHECK(cudaFree(d_TN));
 
   float precision =
       (sum_TP + sum_FP == 0) ? 0.0f : float(sum_TP) / (sum_TP + sum_FP);
@@ -116,26 +137,28 @@ float computeF1Score(int *y, int *y_pred, int n) {
 
 float computeMCC(int *y, int *y_pred, int n) {
   int *d_TP, *d_FP, *d_FN, *d_TN;
-  cudaMalloc(&d_TP, n * sizeof(int));
-  cudaMalloc(&d_FP, n * sizeof(int));
-  cudaMalloc(&d_FN, n * sizeof(int));
-  cudaMalloc(&d_TN, n * sizeof(int));
+  CUDA_CHECK(cudaMalloc(&d_TP, n * sizeof(int)));
+  CUDA_CHECK(cudaMalloc(&d_FP, n * sizeof(int)));
+  CUDA_CHECK(cudaMalloc(&d_FN, n * sizeof(int)));
+  CUDA_CHECK(cudaMalloc(&d_TN, n * sizeof(int)));
 
   int threadsPerBlock = 256;
   int blocks = (n + threadsPerBlock - 1) / threadsPerBlock;
 
   computeMetricsKernel<<<blocks, threadsPerBlock>>>(y, y_pred, d_TP, d_FP,
                                                     d_FN, d_TN, n);
+  CUDA_CHECK(cudaGetLastError());
 
   int sum_TP = thrust::reduce(thrust::device, d_TP, d_TP + n);
   int sum_FP = thrust::reduce(thrust::device, d_FP, d_FP + n);
   int sum_FN = thrust::reduce(thrust::device, d_FN, d_FN + n);
   int sum_TN = thrust::reduce(thrust::device, d_TN, d_TN + n);
+  CUDA_CHECK(cudaGetLastError());
 
-  cudaFree(d_TP);
-  cudaFree(d_FP);
-  cudaFree(d_FN);
-  cudaFree(d_TN);
+  CUDA_CHECK(cudaFree(d_TP));
+  CUDA_CHECK(cudaFree(d_FP));
+  CUDA_CHECK(cudaFree(d_FN));
+  CUDA_CHECK(cudaFree(d_TN));
 
   float numerator = float(sum_TP * sum_TN - sum_FP * sum_FN);
   float denominator = sqrtf(float((sum_TP + sum_FP) * (sum_TP + sum_FN) *
