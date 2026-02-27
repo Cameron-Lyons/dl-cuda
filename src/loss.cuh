@@ -17,17 +17,10 @@ static const int LOSS_ELEMENTS_PER_THREAD = 2;
 
 __global__ void squaredErrorKernel(float *y, float *y_pred, float *error,
                                    int n) {
-  __shared__ float shared_y[256];
-  __shared__ float shared_y_pred[256];
-
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
   if (idx < n) {
-    shared_y[threadIdx.x] = y[idx];
-    shared_y_pred[threadIdx.x] = y_pred[idx];
-    __syncthreads();
-
-    float diff = shared_y[threadIdx.x] - shared_y_pred[threadIdx.x];
+    float diff = y[idx] - y_pred[idx];
     error[idx] = diff * diff;
   }
 }
@@ -172,7 +165,7 @@ void computeLoss(float *y, float *y_pred, float *error, int n, int classes,
     printf("Invalid loss type\n");
     break;
   }
-  cudaDeviceSynchronize();
+  CUDA_CHECK(cudaGetLastError());
 }
 
 void computeLossBackward(float *y, float *y_pred, float *grad, int n,
@@ -205,7 +198,7 @@ void computeLossBackward(float *y, float *y_pred, float *grad, int n,
     printf("Unsupported loss type for backward\n");
     break;
   }
-  cudaDeviceSynchronize();
+  CUDA_CHECK(cudaGetLastError());
 }
 
 inline void computeCategoricalCrossEntropyFromIds(const int *target_ids,

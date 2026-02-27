@@ -2,6 +2,7 @@
 
 #include "layers.cuh"
 #include "optimizers.cuh"
+#include <cmath>
 #include <cuda/std/functional>
 #include <thrust/device_ptr.h>
 #include <thrust/execution_policy.h>
@@ -78,11 +79,16 @@ public:
 
   void step(float lr) override {
     t_++;
+    float inv_bias_correction1 =
+        1.0f / (1.0f - powf(beta1_, static_cast<float>(t_)));
+    float inv_bias_correction2 =
+        1.0f / (1.0f - powf(beta2_, static_cast<float>(t_)));
     for (size_t i = 0; i < param_groups_.size(); i++) {
       auto &pg = param_groups_[i];
       int blocks = (pg.size + 255) / 256;
       updateAdam<<<blocks, 256>>>(pg.grads, m_buffers_[i], v_buffers_[i],
-                                  pg.params, lr, beta1_, beta2_, epsilon_, t_,
+                                  pg.params, lr, beta1_, beta2_, epsilon_,
+                                  inv_bias_correction1, inv_bias_correction2,
                                   pg.size);
     }
   }
@@ -132,12 +138,17 @@ public:
 
   void step(float lr) override {
     t_++;
+    float inv_bias_correction1 =
+        1.0f / (1.0f - powf(beta1_, static_cast<float>(t_)));
+    float inv_bias_correction2 =
+        1.0f / (1.0f - powf(beta2_, static_cast<float>(t_)));
     for (size_t i = 0; i < param_groups_.size(); i++) {
       auto &pg = param_groups_[i];
       int blocks = (pg.size + 255) / 256;
       updateAdamW<<<blocks, 256>>>(pg.grads, m_buffers_[i], v_buffers_[i],
                                    pg.params, lr, beta1_, beta2_, epsilon_,
-                                   weight_decay_, t_, pg.size);
+                                   weight_decay_, inv_bias_correction1,
+                                   inv_bias_correction2, pg.size);
     }
   }
 };

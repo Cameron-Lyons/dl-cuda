@@ -196,6 +196,8 @@ int run_char_lm(const CharLMConfig &cfg) {
   std::printf("Training on %d chars for %d epochs\n\n", text_len, cfg.epochs);
 
   std::mt19937 offset_rng(static_cast<uint32_t>(cfg.init_seed));
+  std::vector<float> h_error(num_tokens);
+  std::vector<int> h_pred_ids(num_tokens);
 
   auto train_start = std::chrono::steady_clock::now();
 
@@ -212,12 +214,12 @@ int run_char_lm(const CharLMConfig &cfg) {
                           cudaMemcpyHostToDevice));
 
     model.forward(d_dummy_input, d_pred);
+    float lr = scheduler.get_lr(epoch);
 
     if (epoch % cfg.print_every == 0) {
       computeCategoricalCrossEntropyFromIds(d_target_ids, d_pred, d_error, num_tokens, vocab_size);
       CUDA_CHECK(cudaGetLastError());
 
-      std::vector<float> h_error(num_tokens);
       CUDA_CHECK(
           cudaMemcpy(h_error.data(), d_error, num_tokens * sizeof(float), cudaMemcpyDeviceToHost));
       float total_loss = 0.0f;
@@ -229,7 +231,6 @@ int run_char_lm(const CharLMConfig &cfg) {
 
       argmaxKernel<<<(num_tokens + 255) / 256, 256>>>(d_pred, d_pred_ids, num_tokens, vocab_size);
       CUDA_CHECK(cudaGetLastError());
-      std::vector<int> h_pred_ids(num_tokens);
       CUDA_CHECK(cudaMemcpy(h_pred_ids.data(), d_pred_ids, num_tokens * sizeof(int),
                             cudaMemcpyDeviceToHost));
       int correct = 0;
@@ -239,7 +240,6 @@ int run_char_lm(const CharLMConfig &cfg) {
       }
       float accuracy = 100.0f * correct / num_tokens;
 
-      float lr = scheduler.get_lr(epoch);
       std::printf("Epoch %4d | Loss: %.4f | PPL: %7.2f | Acc: %5.1f%% | LR: "
                   "%.6f\n",
                   epoch, total_loss, perplexity, accuracy, lr);
@@ -250,7 +250,6 @@ int run_char_lm(const CharLMConfig &cfg) {
     model.backward(d_loss_grad, d_input_grad);
     model.clip_grad_norm(cfg.grad_clip);
 
-    float lr = scheduler.get_lr(epoch);
     model.update_weights(lr);
   }
 
@@ -278,32 +277,32 @@ int run_char_lm(const CharLMConfig &cfg) {
 
   std::mt19937 sample_rng(static_cast<uint32_t>(cfg.sample_seed));
 
-  std::vector<int> gen_ids(cfg.seq_len);
+  std::vector<int> context(cfg.seq_len);
   for (int i = 0; i < cfg.seq_len; i++) {
-    gen_ids[i] = char_to_id[static_cast<unsigned char>(text[i])];
+    context[i] = char_to_id[static_cast<unsigned char>(text[i])];
   }
 
   std::string generated;
   for (int i = 0; i < cfg.seq_len; i++) {
-    generated += id_to_char[gen_ids[i]];
+    generated += id_to_char[context[i]];
   }
 
   CUDA_CHECK(cudaMalloc(&d_gen_pred, num_tokens * vocab_size * sizeof(float)));
+  std::vector<float> h_probs(vocab_size);
 
   for (int step = 0; step < cfg.gen_len; step++) {
-    std::vector<int> context(gen_ids.end() - cfg.seq_len, gen_ids.end());
     embedding.set_token_ids(context.data());
 
     model.forward(d_dummy_input, d_gen_pred);
 
     float *last_row = d_gen_pred + (num_tokens - 1) * vocab_size;
-    std::vector<float> h_probs(vocab_size);
     CUDA_CHECK(
         cudaMemcpy(h_probs.data(), last_row, vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
 
     int next_id = sampleWithStrategy(h_probs, cfg.temperature, 0, cfg.top_p, sample_rng);
-    gen_ids.push_back(next_id);
     generated += id_to_char[next_id];
+    std::move(context.begin() + 1, context.end(), context.begin());
+    context.back() = next_id;
   }
 
   std::printf("  \"%s\"\n", generated.c_str());
