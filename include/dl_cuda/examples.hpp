@@ -26,6 +26,9 @@ struct CharLMConfig {
   std::string weights_path = "model.bin";
   bool load_weights = false;
   bool save_weights = true;
+  bool enable_cuda_graph = true;
+  bool enable_cublas_linear = true;
+  bool enable_tf32 = true;
 };
 
 struct XorConfig {
@@ -33,6 +36,8 @@ struct XorConfig {
   int print_every = 300;
   float lr = 0.1f;
   uint64_t init_seed = 777ULL;
+  bool enable_cublas_linear = true;
+  bool enable_tf32 = true;
 };
 
 int run_char_lm(const CharLMConfig &cfg);

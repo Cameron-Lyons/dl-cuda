@@ -64,10 +64,10 @@ public:
   int input_size() const override { return num_tokens_; }
   int output_size() const override { return num_tokens_ * embedding_dim_; }
 
-  void set_token_ids(const int *h_token_ids) {
-    CUDA_CHECK(cudaMemcpy(d_token_ids_, h_token_ids,
-                           num_tokens_ * sizeof(int),
-                           cudaMemcpyHostToDevice));
+  void set_token_ids(const int *h_token_ids, cudaStream_t stream = 0) {
+    CUDA_CHECK(cudaMemcpyAsync(d_token_ids_, h_token_ids,
+                               num_tokens_ * sizeof(int),
+                               cudaMemcpyHostToDevice, stream));
   }
 
   void forward(float *d_input, float *d_output) override {

@@ -22,6 +22,10 @@ A GPU-accelerated deep learning framework written from scratch in CUDA C++.
 **Examples API** — reusable `run_char_lm(...)` and `run_xor(...)` entry points
 via `include/dl_cuda/examples.hpp`
 
+**Runtime Perf** — CUDA Graph replay for Char-LM train step, pinned host buffers,
+async host↔device transfers, and cuBLAS-backed linear/Transformer GEMMs with
+optional TF32 tensor-core math
+
 ## Requirements
 
 - CMake 3.18+
@@ -59,6 +63,10 @@ cmake -B build -DCMAKE_CUDA_ARCHITECTURES=89
 ./build/dl-cuda-char-lm --epochs 800 --print-every 50
 # Reuse existing checkpoint and skip saving:
 ./build/dl-cuda-char-lm --epochs 0 --load-weights --weights model.bin --no-save
+# Disable CUDA Graph capture/replay if needed:
+./build/dl-cuda-char-lm --no-cuda-graph
+# Force custom kernels instead of cuBLAS and disable TF32:
+./build/dl-cuda-char-lm --no-cublas-linear --no-tf32
 ```
 
 ```
@@ -75,6 +83,8 @@ Generating text (temp=0.8, top_p=0.9, 200 chars):
 
 ```sh
 ./build/dl-cuda-xor --epochs 3000 --lr 0.1
+# Optional backend controls:
+./build/dl-cuda-xor --no-cublas-linear --no-tf32
 ```
 
 ### Programmatic API

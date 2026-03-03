@@ -13,6 +13,8 @@ int main(int argc, char **argv) {
     std::puts("  --print-every N");
     std::puts("  --lr F");
     std::puts("  --seed N");
+    std::puts("  --no-cublas-linear");
+    std::puts("  --no-tf32");
     std::puts("  --help");
   };
 
@@ -38,6 +40,10 @@ int main(int argc, char **argv) {
         return cli_parse::invalid_value("--seed", nullptr, print_usage);
       if (!cli_parse::parse_u64(argv[++i], &cfg.init_seed))
         return cli_parse::invalid_value("--seed", argv[i], print_usage);
+    } else if (arg == "--no-cublas-linear") {
+      cfg.enable_cublas_linear = false;
+    } else if (arg == "--no-tf32") {
+      cfg.enable_tf32 = false;
     } else if (arg == "--help") {
       print_usage();
       return 0;

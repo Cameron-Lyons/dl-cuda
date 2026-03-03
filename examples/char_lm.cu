@@ -21,6 +21,9 @@ int main(int argc, char **argv) {
     std::puts("  --weights PATH");
     std::puts("  --load-weights");
     std::puts("  --no-save");
+    std::puts("  --no-cuda-graph");
+    std::puts("  --no-cublas-linear");
+    std::puts("  --no-tf32");
     std::puts("  --help");
   };
 
@@ -74,6 +77,12 @@ int main(int argc, char **argv) {
       cfg.load_weights = true;
     } else if (arg == "--no-save") {
       cfg.save_weights = false;
+    } else if (arg == "--no-cuda-graph") {
+      cfg.enable_cuda_graph = false;
+    } else if (arg == "--no-cublas-linear") {
+      cfg.enable_cublas_linear = false;
+    } else if (arg == "--no-tf32") {
+      cfg.enable_tf32 = false;
     } else if (arg == "--help") {
       print_usage();
       return 0;

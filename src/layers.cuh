@@ -3,6 +3,7 @@
 #include "sequential.cuh"
 #include <cmath>
 #include <cstdint>
+#include <cublas_v2.h>
 #include <curand_kernel.h>
 
 static const short NUM_THREADS = 256;
@@ -19,6 +20,95 @@ inline uint64_t next_init_seed() {
 }
 
 inline void set_global_init_seed(uint64_t seed) { global_init_seed() = seed; }
+
+inline const char *cublas_status_to_string(cublasStatus_t status) {
+  switch (status) {
+  case CUBLAS_STATUS_SUCCESS:
+    return "CUBLAS_STATUS_SUCCESS";
+  case CUBLAS_STATUS_NOT_INITIALIZED:
+    return "CUBLAS_STATUS_NOT_INITIALIZED";
+  case CUBLAS_STATUS_ALLOC_FAILED:
+    return "CUBLAS_STATUS_ALLOC_FAILED";
+  case CUBLAS_STATUS_INVALID_VALUE:
+    return "CUBLAS_STATUS_INVALID_VALUE";
+  case CUBLAS_STATUS_ARCH_MISMATCH:
+    return "CUBLAS_STATUS_ARCH_MISMATCH";
+  case CUBLAS_STATUS_MAPPING_ERROR:
+    return "CUBLAS_STATUS_MAPPING_ERROR";
+  case CUBLAS_STATUS_EXECUTION_FAILED:
+    return "CUBLAS_STATUS_EXECUTION_FAILED";
+  case CUBLAS_STATUS_INTERNAL_ERROR:
+    return "CUBLAS_STATUS_INTERNAL_ERROR";
+#if defined(CUBLAS_STATUS_NOT_SUPPORTED)
+  case CUBLAS_STATUS_NOT_SUPPORTED:
+    return "CUBLAS_STATUS_NOT_SUPPORTED";
+#endif
+#if defined(CUBLAS_STATUS_LICENSE_ERROR)
+  case CUBLAS_STATUS_LICENSE_ERROR:
+    return "CUBLAS_STATUS_LICENSE_ERROR";
+#endif
+  default:
+    return "CUBLAS_STATUS_UNKNOWN";
+  }
+}
+
+inline void cublas_check_impl(cublasStatus_t status, const char *expr,
+                              const char *file, int line) {
+  if (status != CUBLAS_STATUS_SUCCESS) {
+    std::fprintf(stderr, "cuBLAS error at %s:%d for %s: %s\n", file, line, expr,
+                 cublas_status_to_string(status));
+    std::exit(EXIT_FAILURE);
+  }
+}
+
+#define CUBLAS_CHECK(call)                                                     \
+  do {                                                                         \
+    cublas_check_impl((call), #call, __FILE__, __LINE__);                     \
+  } while (0)
+
+inline bool &cublas_linear_enabled() {
+  static bool enabled = true;
+  return enabled;
+}
+
+inline bool &cublas_tf32_enabled() {
+  static bool enabled = true;
+  return enabled;
+}
+
+inline cublasHandle_t &global_cublas_handle() {
+  static cublasHandle_t handle = nullptr;
+  return handle;
+}
+
+inline cublasMath_t requested_cublas_math_mode() {
+#if defined(CUBLAS_TF32_TENSOR_OP_MATH)
+  return cublas_tf32_enabled() ? CUBLAS_TF32_TENSOR_OP_MATH : CUBLAS_DEFAULT_MATH;
+#else
+  return CUBLAS_DEFAULT_MATH;
+#endif
+}
+
+inline cublasHandle_t ensure_cublas_handle() {
+  cublasHandle_t &handle = global_cublas_handle();
+  if (handle == nullptr) {
+    CUBLAS_CHECK(cublasCreate(&handle));
+    CUBLAS_CHECK(cublasSetMathMode(handle, requested_cublas_math_mode()));
+  }
+  return handle;
+}
+
+inline void set_cublas_linear_enabled(bool enabled) {
+  cublas_linear_enabled() = enabled;
+}
+
+inline void set_cublas_tf32_enabled(bool enabled) {
+  cublas_tf32_enabled() = enabled;
+  cublasHandle_t &handle = global_cublas_handle();
+  if (handle != nullptr) {
+    CUBLAS_CHECK(cublasSetMathMode(handle, requested_cublas_math_mode()));
+  }
+}
 
 __global__ void linearLayerKernel(const float *d_X, const float *d_W,
                                   const float *d_b, float *d_Y, int n,
@@ -79,6 +169,85 @@ __global__ void linearBackwardBiasKernel(const float *d_output_grad,
     }
     d_b_grad[col] = sum;
   }
+}
+
+__global__ void addBiasKernel(float *d_output, const float *d_bias, int n,
+                              int out_features) {
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  int total = n * out_features;
+  if (idx < total) {
+    d_output[idx] += d_bias[idx % out_features];
+  }
+}
+
+inline void linearForward(const float *d_X, const float *d_W, const float *d_b,
+                          float *d_Y, int n, int in_features, int out_features,
+                          cudaStream_t stream = 0) {
+  if (cublas_linear_enabled()) {
+    cublasHandle_t handle = ensure_cublas_handle();
+    CUBLAS_CHECK(cublasSetStream(handle, stream));
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, out_features, n,
+                             in_features, &alpha, d_W, out_features, d_X,
+                             in_features, &beta, d_Y, out_features));
+    if (d_b != nullptr) {
+      int total = n * out_features;
+      int blocks = (total + 255) / 256;
+      addBiasKernel<<<blocks, 256, 0, stream>>>(d_Y, d_b, n, out_features);
+    }
+    return;
+  }
+
+  dim3 threads_per_block(16, 16);
+  dim3 blocks((out_features + threads_per_block.x - 1) / threads_per_block.x,
+              (n + threads_per_block.y - 1) / threads_per_block.y);
+  linearLayerKernel<<<blocks, threads_per_block, 0, stream>>>(
+      d_X, d_W, d_b, d_Y, n, in_features, out_features);
+}
+
+inline void linearBackwardInput(const float *d_output_grad, const float *d_W,
+                                float *d_input_grad, int n, int in_features,
+                                int out_features, cudaStream_t stream = 0) {
+  if (cublas_linear_enabled()) {
+    cublasHandle_t handle = ensure_cublas_handle();
+    CUBLAS_CHECK(cublasSetStream(handle, stream));
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, in_features, n,
+                             out_features, &alpha, d_W, out_features,
+                             d_output_grad, out_features, &beta, d_input_grad,
+                             in_features));
+    return;
+  }
+
+  dim3 threads_per_block(16, 16);
+  dim3 blocks((in_features + threads_per_block.x - 1) / threads_per_block.x,
+              (n + threads_per_block.y - 1) / threads_per_block.y);
+  linearBackwardInputKernel<<<blocks, threads_per_block, 0, stream>>>(
+      d_output_grad, d_W, d_input_grad, n, in_features, out_features);
+}
+
+inline void linearBackwardWeight(const float *d_X, const float *d_output_grad,
+                                 float *d_W_grad, int n, int in_features,
+                                 int out_features, cudaStream_t stream = 0) {
+  if (cublas_linear_enabled()) {
+    cublasHandle_t handle = ensure_cublas_handle();
+    CUBLAS_CHECK(cublasSetStream(handle, stream));
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, out_features,
+                             in_features, n, &alpha, d_output_grad,
+                             out_features, d_X, in_features, &beta, d_W_grad,
+                             out_features));
+    return;
+  }
+
+  dim3 threads_per_block(16, 16);
+  dim3 blocks((out_features + threads_per_block.x - 1) / threads_per_block.x,
+              (in_features + threads_per_block.y - 1) / threads_per_block.y);
+  linearBackwardWeightKernel<<<blocks, threads_per_block, 0, stream>>>(
+      d_X, d_output_grad, d_W_grad, n, in_features, out_features);
 }
 
 __global__ void sgdUpdateKernel(float *params, const float *grads, float lr,
@@ -153,31 +322,14 @@ public:
     CUDA_CHECK(cudaMemcpy(d_cached_input, d_input,
                            n_ * in_features_ * sizeof(float),
                            cudaMemcpyDeviceToDevice));
-
-    dim3 threadsPerBlock(16, 16);
-    dim3 blocks((out_features_ + threadsPerBlock.x - 1) / threadsPerBlock.x,
-                (n_ + threadsPerBlock.y - 1) / threadsPerBlock.y);
-
-    linearLayerKernel<<<blocks, threadsPerBlock>>>(d_input, d_W, d_b, d_output,
-                                                   n_, in_features_,
-                                                   out_features_);
+    linearForward(d_input, d_W, d_b, d_output, n_, in_features_, out_features_);
   }
 
   void backward(float *d_output_grad, float *d_input_grad) override {
-    dim3 threadsPerBlock(16, 16);
-
-    dim3 blocks_input(
-        (in_features_ + threadsPerBlock.x - 1) / threadsPerBlock.x,
-        (n_ + threadsPerBlock.y - 1) / threadsPerBlock.y);
-    linearBackwardInputKernel<<<blocks_input, threadsPerBlock>>>(
-        d_output_grad, d_W, d_input_grad, n_, in_features_, out_features_);
-
-    dim3 blocks_weight(
-        (out_features_ + threadsPerBlock.x - 1) / threadsPerBlock.x,
-        (in_features_ + threadsPerBlock.y - 1) / threadsPerBlock.y);
-    linearBackwardWeightKernel<<<blocks_weight, threadsPerBlock>>>(
-        d_cached_input, d_output_grad, d_W_grad, n_, in_features_,
-        out_features_);
+    linearBackwardInput(d_output_grad, d_W, d_input_grad, n_, in_features_,
+                        out_features_);
+    linearBackwardWeight(d_cached_input, d_output_grad, d_W_grad, n_,
+                         in_features_, out_features_);
 
     int blocks_bias = (out_features_ + 255) / 256;
     linearBackwardBiasKernel<<<blocks_bias, 256>>>(d_output_grad, d_b_grad, n_,

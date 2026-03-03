@@ -440,14 +440,10 @@ public:
                            cudaMemcpyDeviceToDevice));
 
     dim3 threads(16, 16);
-    dim3 proj_blocks((D + 15) / 16, (ST + 15) / 16);
 
-    linearLayerKernel<<<proj_blocks, threads>>>(input, d_q_weights_, nullptr,
-                                                d_queries_, ST, D, D);
-    linearLayerKernel<<<proj_blocks, threads>>>(input, d_k_weights_, nullptr,
-                                                d_keys_, ST, D, D);
-    linearLayerKernel<<<proj_blocks, threads>>>(input, d_v_weights_, nullptr,
-                                                d_values_, ST, D, D);
+    linearForward(input, d_q_weights_, nullptr, d_queries_, ST, D, D);
+    linearForward(input, d_k_weights_, nullptr, d_keys_, ST, D, D);
+    linearForward(input, d_v_weights_, nullptr, d_values_, ST, D, D);
     CUDA_CHECK(cudaGetLastError());
 
     int reshape_blocks = (head_total + 255) / 256;
@@ -491,9 +487,8 @@ public:
                                                      hd);
     CUDA_CHECK(cudaGetLastError());
 
-    linearLayerKernel<<<proj_blocks, threads>>>(d_attn_concat_, d_wo_weights_,
-                                                nullptr, d_attn_output_, ST, D,
-                                                D);
+    linearForward(d_attn_concat_, d_wo_weights_, nullptr, d_attn_output_, ST, D,
+                  D);
     CUDA_CHECK(cudaGetLastError());
 
     int elem_blocks = (total + 255) / 256;
@@ -506,10 +501,8 @@ public:
         d_inv_std1_, ST, D, 1e-5f);
     CUDA_CHECK(cudaGetLastError());
 
-    dim3 ff1_blocks((F + 15) / 16, (ST + 15) / 16);
-    linearLayerKernel<<<ff1_blocks, threads>>>(d_ln1_output_, d_ff1_weights_,
-                                                d_ff1_bias_, d_ff_pre_act_, ST,
-                                                D, F);
+    linearForward(d_ln1_output_, d_ff1_weights_, d_ff1_bias_, d_ff_pre_act_, ST,
+                  D, F);
     CUDA_CHECK(cudaGetLastError());
 
     int ff_elem_blocks = (ff_total + 255) / 256;
@@ -517,10 +510,8 @@ public:
                                                 ff_total);
     CUDA_CHECK(cudaGetLastError());
 
-    dim3 ff2_blocks((D + 15) / 16, (ST + 15) / 16);
-    linearLayerKernel<<<ff2_blocks, threads>>>(d_ff_post_act_, d_ff2_weights_,
-                                                d_ff2_bias_, d_ff_output_, ST,
-                                                F, D);
+    linearForward(d_ff_post_act_, d_ff2_weights_, d_ff2_bias_, d_ff_output_, ST,
+                  F, D);
     CUDA_CHECK(cudaGetLastError());
 
     transformerResidualAddKernel<<<elem_blocks, 256>>>(
@@ -548,8 +539,6 @@ public:
     float inv_scale = 1.0f / sqrtf(static_cast<float>(hd));
 
     dim3 threads(16, 16);
-    dim3 proj_blocks((D + 15) / 16, (ST + 15) / 16);
-    dim3 attn_w_blocks((D + 15) / 16, (D + 15) / 16);
     int elem_blocks = (total + 255) / 256;
     int ff_elem_blocks = (ff_total + 255) / 256;
     int reshape_blocks = (head_total + 255) / 256;
@@ -560,14 +549,11 @@ public:
         d_output_grad, d_x_hat2_, d_gamma2_grad_, d_beta2_grad_, ST, D);
     CUDA_CHECK(cudaGetLastError());
 
-    dim3 ff2_input_blocks((F + 15) / 16, (ST + 15) / 16);
-    linearBackwardInputKernel<<<ff2_input_blocks, threads>>>(
-        d_grad_buf_, d_ff2_weights_, d_ff_grad_buf_, ST, F, D);
+    linearBackwardInput(d_grad_buf_, d_ff2_weights_, d_ff_grad_buf_, ST, F, D);
     CUDA_CHECK(cudaGetLastError());
 
-    dim3 ff2_w_blocks((D + 15) / 16, (F + 15) / 16);
-    linearBackwardWeightKernel<<<ff2_w_blocks, threads>>>(
-        d_ff_post_act_, d_grad_buf_, d_ff2_weights_grad_, ST, F, D);
+    linearBackwardWeight(d_ff_post_act_, d_grad_buf_, d_ff2_weights_grad_, ST,
+                         F, D);
     linearBackwardBiasKernel<<<(D + 255) / 256, 256>>>(
         d_grad_buf_, d_ff2_bias_grad_, ST, D);
     CUDA_CHECK(cudaGetLastError());
@@ -576,17 +562,15 @@ public:
                                                  d_ff_grad_buf_, ff_total);
     CUDA_CHECK(cudaGetLastError());
 
-    linearBackwardInputKernel<<<proj_blocks, threads>>>(
-        d_ff_grad_buf_, d_ff1_weights_, d_ff_output_, ST, D, F);
+    linearBackwardInput(d_ff_grad_buf_, d_ff1_weights_, d_ff_output_, ST, D, F);
     CUDA_CHECK(cudaGetLastError());
 
     transformerResidualAddKernel<<<elem_blocks, 256>>>(
         d_grad_buf_, d_ff_output_, d_grad_buf_, total);
     CUDA_CHECK(cudaGetLastError());
 
-    dim3 ff1_w_blocks((F + 15) / 16, (D + 15) / 16);
-    linearBackwardWeightKernel<<<ff1_w_blocks, threads>>>(
-        d_ln1_output_, d_ff_grad_buf_, d_ff1_weights_grad_, ST, D, F);
+    linearBackwardWeight(d_ln1_output_, d_ff_grad_buf_, d_ff1_weights_grad_, ST,
+                         D, F);
     linearBackwardBiasKernel<<<(F + 255) / 256, 256>>>(
         d_ff_grad_buf_, d_ff1_bias_grad_, ST, F);
     CUDA_CHECK(cudaGetLastError());
@@ -601,12 +585,11 @@ public:
     CUDA_CHECK(cudaMemcpy(d_input_grad, d_residual_buf_,
                            total * sizeof(float), cudaMemcpyDeviceToDevice));
 
-    linearBackwardInputKernel<<<proj_blocks, threads>>>(
-        d_residual_buf_, d_wo_weights_, d_d_concat_, ST, D, D);
+    linearBackwardInput(d_residual_buf_, d_wo_weights_, d_d_concat_, ST, D, D);
     CUDA_CHECK(cudaGetLastError());
 
-    linearBackwardWeightKernel<<<attn_w_blocks, threads>>>(
-        d_attn_concat_, d_residual_buf_, d_wo_weights_grad_, ST, D, D);
+    linearBackwardWeight(d_attn_concat_, d_residual_buf_, d_wo_weights_grad_, ST,
+                         D, D);
     CUDA_CHECK(cudaGetLastError());
 
     reshapeToHeadsKernel<<<reshape_blocks, 256>>>(d_d_concat_, d_dQ_heads_, B,
@@ -638,9 +621,8 @@ public:
           d_score_grad_ + off_SS, inv_scale, S * S);
       CUDA_CHECK(cudaGetLastError());
 
-      linearLayerKernel<<<sd_blocks, threads>>>(
-          d_score_grad_ + off_SS, d_k_heads_ + off_Shd, nullptr,
-          d_dQ_heads_ + off_Shd, S, S, hd);
+      linearForward(d_score_grad_ + off_SS, d_k_heads_ + off_Shd, nullptr,
+                    d_dQ_heads_ + off_Shd, S, S, hd);
       CUDA_CHECK(cudaGetLastError());
 
       matMulATKernel<<<sd_blocks, threads>>>(
@@ -657,31 +639,25 @@ public:
                                                      H, hd);
     CUDA_CHECK(cudaGetLastError());
 
-    linearBackwardInputKernel<<<proj_blocks, threads>>>(
-        d_dQ_, d_q_weights_, d_grad_buf_, ST, D, D);
+    linearBackwardInput(d_dQ_, d_q_weights_, d_grad_buf_, ST, D, D);
     CUDA_CHECK(cudaGetLastError());
     transformerResidualAddKernel<<<elem_blocks, 256>>>(
         d_input_grad, d_grad_buf_, d_input_grad, total);
 
-    linearBackwardInputKernel<<<proj_blocks, threads>>>(
-        d_dK_, d_k_weights_, d_grad_buf_, ST, D, D);
+    linearBackwardInput(d_dK_, d_k_weights_, d_grad_buf_, ST, D, D);
     CUDA_CHECK(cudaGetLastError());
     transformerResidualAddKernel<<<elem_blocks, 256>>>(
         d_input_grad, d_grad_buf_, d_input_grad, total);
 
-    linearBackwardInputKernel<<<proj_blocks, threads>>>(
-        d_dV_, d_v_weights_, d_grad_buf_, ST, D, D);
+    linearBackwardInput(d_dV_, d_v_weights_, d_grad_buf_, ST, D, D);
     CUDA_CHECK(cudaGetLastError());
     transformerResidualAddKernel<<<elem_blocks, 256>>>(
         d_input_grad, d_grad_buf_, d_input_grad, total);
     CUDA_CHECK(cudaGetLastError());
 
-    linearBackwardWeightKernel<<<attn_w_blocks, threads>>>(
-        d_input_cached_, d_dQ_, d_q_weights_grad_, ST, D, D);
-    linearBackwardWeightKernel<<<attn_w_blocks, threads>>>(
-        d_input_cached_, d_dK_, d_k_weights_grad_, ST, D, D);
-    linearBackwardWeightKernel<<<attn_w_blocks, threads>>>(
-        d_input_cached_, d_dV_, d_v_weights_grad_, ST, D, D);
+    linearBackwardWeight(d_input_cached_, d_dQ_, d_q_weights_grad_, ST, D, D);
+    linearBackwardWeight(d_input_cached_, d_dK_, d_k_weights_grad_, ST, D, D);
+    linearBackwardWeight(d_input_cached_, d_dV_, d_v_weights_grad_, ST, D, D);
     CUDA_CHECK(cudaGetLastError());
   }
 

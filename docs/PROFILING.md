@@ -23,6 +23,10 @@ The script writes an `.nsys-rep` report under `profiles/` and prints a CLI summa
 - Replaced one-hot CE loss/backward with target-id CE kernels.
 - Reused `Sequential` forward/backward workspaces to avoid per-step allocations.
 - Reduced global `cudaDeviceSynchronize()` calls in the hot training path.
+- Added CUDA Graph replay for Char-LM forward+backward train step.
+- Switched hot-path host/device copies to async transfers with pinned host buffers.
+- Replaced major linear/Transformer GEMMs with cuBLAS calls (TF32 tensor-core
+  math enabled by default where available).
 
 ## What to inspect first in Nsight
 

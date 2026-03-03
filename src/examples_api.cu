@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <random>
 #include <set>
 #include <string>
@@ -37,8 +38,14 @@ __global__ void argmaxKernel(const float *logits, int *result, int num_rows, int
   }
 }
 
+inline void print_cuda_warning(const char *context, cudaError_t err) {
+  std::fprintf(stderr, "Warning: %s: %s\n", context, cudaGetErrorString(err));
+}
+
 int run_char_lm(const CharLMConfig &cfg) {
   set_global_init_seed(cfg.init_seed);
+  set_cublas_linear_enabled(cfg.enable_cublas_linear);
+  set_cublas_tf32_enabled(cfg.enable_tf32);
 
   if (cfg.seq_len <= 0) {
     std::fprintf(stderr, "seq_len must be > 0.\n");
@@ -115,8 +122,18 @@ int run_char_lm(const CharLMConfig &cfg) {
     return EXIT_FAILURE;
   }
 
-  std::vector<int> h_input_ids(num_tokens);
-  std::vector<int> h_target_ids(num_tokens);
+  int *h_input_ids = nullptr;
+  int *h_target_ids = nullptr;
+  float *h_error = nullptr;
+  int *h_pred_ids = nullptr;
+  float *h_probs = nullptr;
+  int *h_context = nullptr;
+  CUDA_CHECK(cudaHostAlloc(&h_input_ids, num_tokens * sizeof(int), cudaHostAllocDefault));
+  CUDA_CHECK(cudaHostAlloc(&h_target_ids, num_tokens * sizeof(int), cudaHostAllocDefault));
+  CUDA_CHECK(cudaHostAlloc(&h_error, num_tokens * sizeof(float), cudaHostAllocDefault));
+  CUDA_CHECK(cudaHostAlloc(&h_pred_ids, num_tokens * sizeof(int), cudaHostAllocDefault));
+  CUDA_CHECK(cudaHostAlloc(&h_probs, vocab_size * sizeof(float), cudaHostAllocDefault));
+  CUDA_CHECK(cudaHostAlloc(&h_context, cfg.seq_len * sizeof(int), cudaHostAllocDefault));
   for (int i = 0; i < num_tokens; i++) {
     h_input_ids[i] = char_to_id[static_cast<unsigned char>(text[i % text_len])];
     h_target_ids[i] = char_to_id[static_cast<unsigned char>(text[(i + 1) % text_len])];
@@ -151,7 +168,14 @@ int run_char_lm(const CharLMConfig &cfg) {
   float *d_gen_pred = nullptr;
   int *d_target_ids = nullptr;
   int *d_pred_ids = nullptr;
+  cudaGraph_t train_graph = nullptr;
+  cudaGraphExec_t train_graph_exec = nullptr;
+  bool graph_enabled = false;
   auto cleanup = [&]() {
+    if (train_graph_exec)
+      cudaGraphExecDestroy(train_graph_exec);
+    if (train_graph)
+      cudaGraphDestroy(train_graph);
     if (d_pred)
       cudaFree(d_pred);
     if (d_loss_grad)
@@ -168,11 +192,24 @@ int run_char_lm(const CharLMConfig &cfg) {
       cudaFree(d_dummy_input);
     if (d_gen_pred)
       cudaFree(d_gen_pred);
+    if (h_input_ids)
+      cudaFreeHost(h_input_ids);
+    if (h_target_ids)
+      cudaFreeHost(h_target_ids);
+    if (h_error)
+      cudaFreeHost(h_error);
+    if (h_pred_ids)
+      cudaFreeHost(h_pred_ids);
+    if (h_probs)
+      cudaFreeHost(h_probs);
+    if (h_context)
+      cudaFreeHost(h_context);
   };
 
   if (cfg.load_weights) {
     if (!model.load_weights(cfg.weights_path)) {
       std::fprintf(stderr, "Failed to load model weights from %s\n", cfg.weights_path.c_str());
+      cleanup();
       return EXIT_FAILURE;
     }
     std::printf("Loaded weights from %s\n", cfg.weights_path.c_str());
@@ -193,11 +230,50 @@ int run_char_lm(const CharLMConfig &cfg) {
   std::printf("Optimizer: AdamW (wd=0.01) | Grad clip: %.1f | Sampling: "
               "temp=%.2f, top_p=%.2f\n",
               cfg.grad_clip, cfg.temperature, cfg.top_p);
+  std::printf("Linear backend: %s | TF32: %s\n",
+              cfg.enable_cublas_linear ? "cuBLAS" : "custom kernels",
+              cfg.enable_tf32 ? "on" : "off");
   std::printf("Training on %d chars for %d epochs\n\n", text_len, cfg.epochs);
 
   std::mt19937 offset_rng(static_cast<uint32_t>(cfg.init_seed));
-  std::vector<float> h_error(num_tokens);
-  std::vector<int> h_pred_ids(num_tokens);
+  embedding.set_token_ids(h_input_ids);
+  CUDA_CHECK(cudaMemcpyAsync(d_target_ids, h_target_ids, num_tokens * sizeof(int),
+                             cudaMemcpyHostToDevice, 0));
+  CUDA_CHECK(cudaStreamSynchronize(0));
+
+  if (cfg.enable_cuda_graph && cfg.epochs > 0) {
+    cudaError_t capture_status = cudaStreamBeginCapture(0, cudaStreamCaptureModeGlobal);
+    if (capture_status == cudaSuccess) {
+      model.forward(d_dummy_input, d_pred);
+      computeCategoricalCrossEntropyBackwardFromIds(d_target_ids, d_pred, d_loss_grad, num_tokens,
+                                                    vocab_size);
+      model.backward(d_loss_grad, d_input_grad);
+      cudaError_t end_status = cudaStreamEndCapture(0, &train_graph);
+      if (end_status == cudaSuccess && train_graph != nullptr) {
+        cudaError_t instantiate_status =
+            cudaGraphInstantiate(&train_graph_exec, train_graph, nullptr, nullptr, 0);
+        if (instantiate_status == cudaSuccess) {
+          graph_enabled = true;
+        } else {
+          print_cuda_warning("cudaGraphInstantiate failed; continuing without CUDA Graph",
+                             instantiate_status);
+          cudaGraphDestroy(train_graph);
+          train_graph = nullptr;
+        }
+      } else {
+        print_cuda_warning("cudaStreamEndCapture failed; continuing without CUDA Graph",
+                           end_status);
+        if (train_graph) {
+          cudaGraphDestroy(train_graph);
+          train_graph = nullptr;
+        }
+      }
+    } else {
+      print_cuda_warning("cudaStreamBeginCapture failed; continuing without CUDA Graph",
+                         capture_status);
+    }
+  }
+  std::printf("CUDA Graph replay: %s\n", graph_enabled ? "enabled" : "disabled");
 
   auto train_start = std::chrono::steady_clock::now();
 
@@ -209,20 +285,28 @@ int run_char_lm(const CharLMConfig &cfg) {
       h_target_ids[i] = char_to_id[static_cast<unsigned char>(text[offset + i + 1])];
     }
 
-    embedding.set_token_ids(h_input_ids.data());
-    CUDA_CHECK(cudaMemcpy(d_target_ids, h_target_ids.data(), num_tokens * sizeof(int),
-                          cudaMemcpyHostToDevice));
-
-    model.forward(d_dummy_input, d_pred);
     float lr = scheduler.get_lr(epoch);
+    embedding.set_token_ids(h_input_ids);
+    CUDA_CHECK(cudaMemcpyAsync(d_target_ids, h_target_ids, num_tokens * sizeof(int),
+                               cudaMemcpyHostToDevice, 0));
+
+    if (graph_enabled) {
+      CUDA_CHECK(cudaGraphLaunch(train_graph_exec, 0));
+    } else {
+      model.forward(d_dummy_input, d_pred);
+      computeCategoricalCrossEntropyBackwardFromIds(d_target_ids, d_pred, d_loss_grad, num_tokens,
+                                                    vocab_size);
+      model.backward(d_loss_grad, d_input_grad);
+    }
 
     if (epoch % cfg.print_every == 0) {
       computeCategoricalCrossEntropyFromIds(d_target_ids, d_pred, d_error, num_tokens, vocab_size);
       CUDA_CHECK(cudaGetLastError());
 
-      CUDA_CHECK(
-          cudaMemcpy(h_error.data(), d_error, num_tokens * sizeof(float), cudaMemcpyDeviceToHost));
+      CUDA_CHECK(cudaMemcpyAsync(h_error, d_error, num_tokens * sizeof(float), cudaMemcpyDeviceToHost,
+                                 0));
       float total_loss = 0.0f;
+      CUDA_CHECK(cudaStreamSynchronize(0));
       for (int i = 0; i < num_tokens; i++) {
         total_loss += h_error[i];
       }
@@ -231,8 +315,9 @@ int run_char_lm(const CharLMConfig &cfg) {
 
       argmaxKernel<<<(num_tokens + 255) / 256, 256>>>(d_pred, d_pred_ids, num_tokens, vocab_size);
       CUDA_CHECK(cudaGetLastError());
-      CUDA_CHECK(cudaMemcpy(h_pred_ids.data(), d_pred_ids, num_tokens * sizeof(int),
-                            cudaMemcpyDeviceToHost));
+      CUDA_CHECK(cudaMemcpyAsync(h_pred_ids, d_pred_ids, num_tokens * sizeof(int),
+                                 cudaMemcpyDeviceToHost, 0));
+      CUDA_CHECK(cudaStreamSynchronize(0));
       int correct = 0;
       for (int i = 0; i < num_tokens; i++) {
         if (h_pred_ids[i] == h_target_ids[i])
@@ -245,9 +330,6 @@ int run_char_lm(const CharLMConfig &cfg) {
                   epoch, total_loss, perplexity, accuracy, lr);
     }
 
-    computeCategoricalCrossEntropyBackwardFromIds(d_target_ids, d_pred, d_loss_grad, num_tokens,
-                                                  vocab_size);
-    model.backward(d_loss_grad, d_input_grad);
     model.clip_grad_norm(cfg.grad_clip);
 
     model.update_weights(lr);
@@ -277,32 +359,33 @@ int run_char_lm(const CharLMConfig &cfg) {
 
   std::mt19937 sample_rng(static_cast<uint32_t>(cfg.sample_seed));
 
-  std::vector<int> context(cfg.seq_len);
   for (int i = 0; i < cfg.seq_len; i++) {
-    context[i] = char_to_id[static_cast<unsigned char>(text[i])];
+    h_context[i] = char_to_id[static_cast<unsigned char>(text[i])];
   }
 
   std::string generated;
   for (int i = 0; i < cfg.seq_len; i++) {
-    generated += id_to_char[context[i]];
+    generated += id_to_char[h_context[i]];
   }
 
   CUDA_CHECK(cudaMalloc(&d_gen_pred, num_tokens * vocab_size * sizeof(float)));
-  std::vector<float> h_probs(vocab_size);
+  std::vector<float> probs(vocab_size);
 
   for (int step = 0; step < cfg.gen_len; step++) {
-    embedding.set_token_ids(context.data());
+    embedding.set_token_ids(h_context);
 
     model.forward(d_dummy_input, d_gen_pred);
 
     float *last_row = d_gen_pred + (num_tokens - 1) * vocab_size;
-    CUDA_CHECK(
-        cudaMemcpy(h_probs.data(), last_row, vocab_size * sizeof(float), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpyAsync(h_probs, last_row, vocab_size * sizeof(float), cudaMemcpyDeviceToHost,
+                               0));
+    CUDA_CHECK(cudaStreamSynchronize(0));
+    std::memcpy(probs.data(), h_probs, vocab_size * sizeof(float));
 
-    int next_id = sampleWithStrategy(h_probs, cfg.temperature, 0, cfg.top_p, sample_rng);
+    int next_id = sampleWithStrategy(probs, cfg.temperature, 0, cfg.top_p, sample_rng);
     generated += id_to_char[next_id];
-    std::move(context.begin() + 1, context.end(), context.begin());
-    context.back() = next_id;
+    std::memmove(h_context, h_context + 1, static_cast<size_t>(cfg.seq_len - 1) * sizeof(int));
+    h_context[cfg.seq_len - 1] = next_id;
   }
 
   std::printf("  \"%s\"\n", generated.c_str());
@@ -314,6 +397,8 @@ int run_char_lm(const CharLMConfig &cfg) {
 
 int run_xor(const XorConfig &cfg) {
   set_global_init_seed(cfg.init_seed);
+  set_cublas_linear_enabled(cfg.enable_cublas_linear);
+  set_cublas_tf32_enabled(cfg.enable_tf32);
 
   if (cfg.epochs < 0) {
     std::fprintf(stderr, "epochs must be >= 0.\n");
@@ -358,16 +443,22 @@ int run_xor(const XorConfig &cfg) {
   float *d_loss = nullptr;
   float *d_loss_grad = nullptr;
   float *d_input_grad = nullptr;
+  float *h_loss = nullptr;
+  float *h_pred = nullptr;
   CUDA_CHECK(cudaMalloc(&d_x, N * IN * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_pred, N * OUT * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_y, N * OUT * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_loss, N * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_loss_grad, N * OUT * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_input_grad, N * IN * sizeof(float)));
+  CUDA_CHECK(cudaHostAlloc(&h_loss, N * sizeof(float), cudaHostAllocDefault));
+  CUDA_CHECK(cudaHostAlloc(&h_pred, N * sizeof(float), cudaHostAllocDefault));
   CUDA_CHECK(cudaMemcpy(d_x, h_x.data(), N * IN * sizeof(float), cudaMemcpyHostToDevice));
   CUDA_CHECK(cudaMemcpy(d_y, h_y.data(), N * OUT * sizeof(float), cudaMemcpyHostToDevice));
 
-  std::printf("XOR | epochs=%d lr=%.4f\n", cfg.epochs, cfg.lr);
+  std::printf("XOR | epochs=%d lr=%.4f | backend=%s | TF32=%s\n", cfg.epochs,
+              cfg.lr, cfg.enable_cublas_linear ? "cuBLAS" : "custom",
+              cfg.enable_tf32 ? "on" : "off");
   for (int epoch = 0; epoch < cfg.epochs; epoch++) {
     model.forward(d_x, d_pred);
 
@@ -375,11 +466,11 @@ int run_xor(const XorConfig &cfg) {
     computeLoss(d_y, d_pred, d_loss, N, 1, BINARY_CROSS_ENTROPY, blocks, dim3(256));
 
     if (epoch % cfg.print_every == 0) {
-      std::vector<float> h_loss(N);
-      CUDA_CHECK(cudaMemcpy(h_loss.data(), d_loss, N * sizeof(float), cudaMemcpyDeviceToHost));
+      CUDA_CHECK(cudaMemcpyAsync(h_loss, d_loss, N * sizeof(float), cudaMemcpyDeviceToHost, 0));
+      CUDA_CHECK(cudaStreamSynchronize(0));
       float avg = 0.0f;
-      for (float v : h_loss)
-        avg += v;
+      for (int i = 0; i < N; i++)
+        avg += h_loss[i];
       avg /= N;
       std::printf("Epoch %4d | BCE: %.6f\n", epoch, avg);
     }
@@ -391,8 +482,8 @@ int run_xor(const XorConfig &cfg) {
 
   model.forward(d_x, d_pred);
   CUDA_CHECK(cudaDeviceSynchronize());
-  std::vector<float> h_pred(N);
-  CUDA_CHECK(cudaMemcpy(h_pred.data(), d_pred, N * sizeof(float), cudaMemcpyDeviceToHost));
+  CUDA_CHECK(cudaMemcpyAsync(h_pred, d_pred, N * sizeof(float), cudaMemcpyDeviceToHost, 0));
+  CUDA_CHECK(cudaStreamSynchronize(0));
   std::printf("Final predictions:\n");
   std::printf("  [0, 0] -> %.4f (expected 0)\n", h_pred[0]);
   std::printf("  [0, 1] -> %.4f (expected 1)\n", h_pred[1]);
@@ -405,6 +496,8 @@ int run_xor(const XorConfig &cfg) {
   cudaFree(d_loss);
   cudaFree(d_loss_grad);
   cudaFree(d_input_grad);
+  cudaFreeHost(h_loss);
+  cudaFreeHost(h_pred);
 
   return 0;
 }
