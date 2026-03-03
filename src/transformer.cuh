@@ -3,55 +3,66 @@
 #include "activation.cuh"
 #include "layers.cuh"
 #include "sequential.cuh"
+#include <cfloat>
 #include <random>
 
-__global__ void attnScoresBatchedKernel(const float *Q, const float *K,
-                                        float *scores, int seq_len, int d_k,
-                                        float inv_scale, int num_batches) {
-  int j = blockIdx.x * blockDim.x + threadIdx.x;
-  int i = blockIdx.y * blockDim.y + threadIdx.y;
-  int batch = blockIdx.z;
-  if (batch < num_batches && i < seq_len && j < seq_len) {
-    int head_offset = batch * seq_len * d_k;
-    int score_offset = batch * seq_len * seq_len;
+__global__ void maskedScaledSoftmaxFromQKBatchedKernel(
+    const float *Q, const float *K, float *scores, int seq_len, int d_k,
+    float inv_scale, int num_batches, int causal) {
+  int batch = blockIdx.x;
+  int row = blockIdx.y;
+  int tid = threadIdx.x;
+  if (batch >= num_batches || row >= seq_len) {
+    return;
+  }
+
+  int q_row_offset = (batch * seq_len + row) * d_k;
+  int score_row_offset = (batch * seq_len + row) * seq_len;
+
+  float local_max = -FLT_MAX;
+  for (int j = tid; j < seq_len; j += blockDim.x) {
+    int k_row_offset = (batch * seq_len + j) * d_k;
     float sum = 0.0f;
     for (int d = 0; d < d_k; d++) {
-      sum += Q[head_offset + i * d_k + d] * K[head_offset + j * d_k + d];
+      sum += Q[q_row_offset + d] * K[k_row_offset + d];
     }
-    scores[score_offset + i * seq_len + j] = sum * inv_scale;
+    float val = sum * inv_scale;
+    if (causal && j > row) {
+      val = -1e9f;
+    }
+    scores[score_row_offset + j] = val;
+    local_max = fmaxf(local_max, val);
   }
-}
 
-__global__ void applyCausalMaskBatchedKernel(float *scores, int seq_len,
-                                             int num_batches) {
-  int j = blockIdx.x * blockDim.x + threadIdx.x;
-  int i = blockIdx.y * blockDim.y + threadIdx.y;
-  int batch = blockIdx.z;
-  if (batch < num_batches && i < seq_len && j < seq_len && j > i) {
-    int score_offset = batch * seq_len * seq_len;
-    scores[score_offset + i * seq_len + j] = -1e9f;
+  extern __shared__ float sdata[];
+  sdata[tid] = local_max;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      sdata[tid] = fmaxf(sdata[tid], sdata[tid + stride]);
+    }
+    __syncthreads();
   }
-}
+  float row_max = sdata[0];
 
-__global__ void softmaxForwardBatchedKernel(float *scores, int seq_len,
-                                            int num_batches) {
-  int row = blockIdx.x * blockDim.x + threadIdx.x;
-  int total_rows = num_batches * seq_len;
-  if (row < total_rows) {
-    float *row_ptr = scores + row * seq_len;
-    float max_val = row_ptr[0];
-    for (int j = 1; j < seq_len; j++) {
-      max_val = fmaxf(max_val, row_ptr[j]);
+  float local_sum = 0.0f;
+  for (int j = tid; j < seq_len; j += blockDim.x) {
+    float e = expf(scores[score_row_offset + j] - row_max);
+    scores[score_row_offset + j] = e;
+    local_sum += e;
+  }
+  sdata[tid] = local_sum;
+  __syncthreads();
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (tid < stride) {
+      sdata[tid] += sdata[tid + stride];
     }
-    float sum = 0.0f;
-    for (int j = 0; j < seq_len; j++) {
-      row_ptr[j] = expf(row_ptr[j] - max_val);
-      sum += row_ptr[j];
-    }
-    float inv_sum = 1.0f / sum;
-    for (int j = 0; j < seq_len; j++) {
-      row_ptr[j] *= inv_sum;
-    }
+    __syncthreads();
+  }
+  float inv_sum = 1.0f / (sdata[0] + 1e-20f);
+
+  for (int j = tid; j < seq_len; j += blockDim.x) {
+    scores[score_row_offset + j] *= inv_sum;
   }
 }
 
@@ -73,20 +84,30 @@ __global__ void attnApplyBatchedKernel(const float *scores, const float *V,
   }
 }
 
-__global__ void softmaxBackwardBatchedKernel(float *d_scores,
-                                             const float *scores, int seq_len,
-                                             int num_batches) {
+__global__ void softmaxScaleMaskBackwardBatchedKernel(
+    float *d_scores, const float *scores, int seq_len, int num_batches,
+    float inv_scale, int causal) {
   int row = blockIdx.x * blockDim.x + threadIdx.x;
   int total_rows = num_batches * seq_len;
   if (row < total_rows) {
+    int row_in_seq = row % seq_len;
     float *ds_row = d_scores + row * seq_len;
     const float *s_row = scores + row * seq_len;
     float dot = 0.0f;
     for (int j = 0; j < seq_len; j++) {
-      dot += ds_row[j] * s_row[j];
+      float g = ds_row[j];
+      if (causal && j > row_in_seq) {
+        g = 0.0f;
+      }
+      ds_row[j] = g;
+      dot += g * s_row[j];
     }
     for (int j = 0; j < seq_len; j++) {
-      ds_row[j] = s_row[j] * (ds_row[j] - dot);
+      float out = s_row[j] * (ds_row[j] - dot) * inv_scale;
+      if (causal && j > row_in_seq) {
+        out = 0.0f;
+      }
+      ds_row[j] = out;
     }
   }
 }
@@ -253,13 +274,6 @@ __global__ void layerNormParamGradKernel(const float *dy, const float *x_hat,
     }
     d_gamma[d] = dg;
     d_beta[d] = db;
-  }
-}
-
-__global__ void scaleBufferKernel(float *data, float scale, int n) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if (idx < n) {
-    data[idx] *= scale;
   }
 }
 
@@ -505,19 +519,11 @@ public:
                                                    H, hd);
     CUDA_CHECK(cudaGetLastError());
 
-    dim3 score_blocks((S + 15) / 16, (S + 15) / 16, BH);
-    attnScoresBatchedKernel<<<score_blocks, threads>>>(
-        d_q_heads_, d_k_heads_, d_attn_scores_, S, hd, inv_scale, BH);
-    CUDA_CHECK(cudaGetLastError());
-
-    if (causal_) {
-      applyCausalMaskBatchedKernel<<<score_blocks, threads>>>(d_attn_scores_, S,
-                                                               BH);
-      CUDA_CHECK(cudaGetLastError());
-    }
-
-    softmaxForwardBatchedKernel<<<(BH * S + 255) / 256, 256>>>(
-        d_attn_scores_, S, BH);
+    dim3 softmax_blocks(BH, S);
+    maskedScaledSoftmaxFromQKBatchedKernel<<<softmax_blocks, 128,
+                                             128 * sizeof(float)>>>(
+        d_q_heads_, d_k_heads_, d_attn_scores_, S, hd, inv_scale, BH,
+        causal_ ? 1 : 0);
     CUDA_CHECK(cudaGetLastError());
 
     dim3 apply_blocks((hd + 15) / 16, (S + 15) / 16, BH);
@@ -651,12 +657,8 @@ public:
         d_attn_scores_, d_dQ_heads_, d_dV_heads_, S, S, hd, BH);
     CUDA_CHECK(cudaGetLastError());
 
-    softmaxBackwardBatchedKernel<<<(BH * S + 255) / 256, 256>>>(
-        d_score_grad_, d_attn_scores_, S, BH);
-    CUDA_CHECK(cudaGetLastError());
-
-    scaleBufferKernel<<<(BH * S * S + 255) / 256, 256>>>(
-        d_score_grad_, inv_scale, BH * S * S);
+    softmaxScaleMaskBackwardBatchedKernel<<<(BH * S + 255) / 256, 256>>>(
+        d_score_grad_, d_attn_scores_, S, BH, inv_scale, causal_ ? 1 : 0);
     CUDA_CHECK(cudaGetLastError());
 
     attnApplyBatchedKernel<<<sd_blocks, threads>>>(

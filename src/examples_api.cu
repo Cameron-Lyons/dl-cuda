@@ -20,21 +20,86 @@
 #include <string>
 #include <vector>
 
+#if __has_include(<nvtx3/nvToolsExt.h>)
+#include <nvtx3/nvToolsExt.h>
+#define DLCUDA_NVTX_ENABLED 1
+#elif __has_include(<nvToolsExt.h>)
+#include <nvToolsExt.h>
+#define DLCUDA_NVTX_ENABLED 1
+#else
+#define DLCUDA_NVTX_ENABLED 0
+#endif
+
 namespace dlcuda {
 
-__global__ void argmaxKernel(const float *logits, int *result, int num_rows, int row_width) {
-  int row = blockIdx.x * blockDim.x + threadIdx.x;
-  if (row < num_rows) {
-    const float *row_ptr = logits + row * row_width;
+class NvtxScopedRange {
+public:
+  explicit NvtxScopedRange(const char *name) {
+#if DLCUDA_NVTX_ENABLED
+    nvtxRangePushA(name);
+#else
+    (void)name;
+#endif
+  }
+  ~NvtxScopedRange() {
+#if DLCUDA_NVTX_ENABLED
+    nvtxRangePop();
+#endif
+  }
+};
+
+__global__ void lossAndAccuracyKernel(const int *target_ids, const float *pred,
+                                      float *metrics, int num_tokens,
+                                      int vocab_size) {
+  float local_loss = 0.0f;
+  float local_correct = 0.0f;
+
+  int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (idx < num_tokens) {
+    int target = target_ids[idx];
+    const float *row = pred + idx * vocab_size;
+    float p = row[target];
+    p = fmaxf(1e-8f, fminf(1.0f, p));
+    local_loss = -logf(p);
+
     int best = 0;
-    float best_val = row_ptr[0];
-    for (int j = 1; j < row_width; j++) {
-      if (row_ptr[j] > best_val) {
-        best_val = row_ptr[j];
+    float best_val = row[0];
+    for (int j = 1; j < vocab_size; j++) {
+      float v = row[j];
+      if (v > best_val) {
+        best_val = v;
         best = j;
       }
     }
-    result[row] = best;
+    local_correct = (best == target) ? 1.0f : 0.0f;
+  }
+
+  __shared__ float loss_shared[256];
+  __shared__ float correct_shared[256];
+  loss_shared[threadIdx.x] = local_loss;
+  correct_shared[threadIdx.x] = local_correct;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+    if (threadIdx.x < stride) {
+      loss_shared[threadIdx.x] += loss_shared[threadIdx.x + stride];
+      correct_shared[threadIdx.x] += correct_shared[threadIdx.x + stride];
+    }
+    __syncthreads();
+  }
+
+  if (threadIdx.x == 0) {
+    atomicAdd(metrics, loss_shared[0]);
+    atomicAdd(metrics + 1, correct_shared[0]);
+  }
+}
+
+__global__ void shiftAppendTokenKernel(int *context, int seq_len, int next_id) {
+  if (blockIdx.x == 0 && threadIdx.x == 0 && seq_len > 0) {
+    for (int i = 0; i < seq_len - 1; i++) {
+      context[i] = context[i + 1];
+    }
+    context[seq_len - 1] = next_id;
   }
 }
 
@@ -134,15 +199,12 @@ int run_char_lm(const CharLMConfig &cfg) {
 
   int *h_input_ids = nullptr;
   int *h_target_ids = nullptr;
-  float *h_error = nullptr;
-  int *h_pred_ids = nullptr;
+  float *h_metrics = nullptr;
   float *h_probs = nullptr;
   int *h_context = nullptr;
   void *h_pinned_block = nullptr;
-  size_t error_bytes =
-      cfg.track_train_metrics ? static_cast<size_t>(num_tokens) * sizeof(float) : 0;
-  size_t pred_bytes =
-      cfg.track_train_metrics ? static_cast<size_t>(num_tokens) * sizeof(int) : 0;
+  size_t metrics_bytes =
+      cfg.track_train_metrics ? static_cast<size_t>(2) * sizeof(float) : 0;
   size_t offset = 0;
   size_t input_offset = offset;
   offset += static_cast<size_t>(num_tokens) * sizeof(int);
@@ -150,11 +212,8 @@ int run_char_lm(const CharLMConfig &cfg) {
   size_t target_offset = offset;
   offset += static_cast<size_t>(num_tokens) * sizeof(int);
   offset = align_up(offset, alignof(float));
-  size_t error_offset = offset;
-  offset += error_bytes;
-  offset = align_up(offset, alignof(int));
-  size_t pred_offset = offset;
-  offset += pred_bytes;
+  size_t metrics_offset = offset;
+  offset += metrics_bytes;
   offset = align_up(offset, alignof(float));
   size_t probs_offset = offset;
   offset += static_cast<size_t>(vocab_size) * sizeof(float);
@@ -166,8 +225,7 @@ int run_char_lm(const CharLMConfig &cfg) {
   char *host_base = static_cast<char *>(h_pinned_block);
   h_input_ids = reinterpret_cast<int *>(host_base + input_offset);
   h_target_ids = reinterpret_cast<int *>(host_base + target_offset);
-  h_error = reinterpret_cast<float *>(host_base + error_offset);
-  h_pred_ids = reinterpret_cast<int *>(host_base + pred_offset);
+  h_metrics = reinterpret_cast<float *>(host_base + metrics_offset);
   h_probs = reinterpret_cast<float *>(host_base + probs_offset);
   h_context = reinterpret_cast<int *>(host_base + context_offset);
   for (int i = 0; i < num_tokens; i++) {
@@ -198,12 +256,12 @@ int run_char_lm(const CharLMConfig &cfg) {
   int out_total = num_tokens * vocab_size;
   float *d_pred = nullptr;
   float *d_loss_grad = nullptr;
-  float *d_error = nullptr;
+  float *d_metrics = nullptr;
   float *d_input_grad = nullptr;
   float *d_dummy_input = nullptr;
   float *d_gen_pred = nullptr;
   int *d_target_ids = nullptr;
-  int *d_pred_ids = nullptr;
+  int *d_context_ids = nullptr;
   cudaGraph_t train_graph = nullptr;
   cudaGraphExec_t train_graph_exec = nullptr;
   bool graph_enabled = false;
@@ -216,14 +274,14 @@ int run_char_lm(const CharLMConfig &cfg) {
       cudaFree(d_pred);
     if (d_loss_grad)
       cudaFree(d_loss_grad);
-    if (d_error)
-      cudaFree(d_error);
+    if (d_metrics)
+      cudaFree(d_metrics);
     if (d_input_grad)
       cudaFree(d_input_grad);
     if (d_target_ids)
       cudaFree(d_target_ids);
-    if (d_pred_ids)
-      cudaFree(d_pred_ids);
+    if (d_context_ids)
+      cudaFree(d_context_ids);
     if (d_dummy_input)
       cudaFree(d_dummy_input);
     if (d_gen_pred)
@@ -245,9 +303,9 @@ int run_char_lm(const CharLMConfig &cfg) {
   CUDA_CHECK(cudaMalloc(&d_loss_grad, out_total * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_input_grad, num_tokens * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_target_ids, num_tokens * sizeof(int)));
+  CUDA_CHECK(cudaMalloc(&d_context_ids, num_tokens * sizeof(int)));
   if (cfg.track_train_metrics) {
-    CUDA_CHECK(cudaMalloc(&d_error, num_tokens * sizeof(float)));
-    CUDA_CHECK(cudaMalloc(&d_pred_ids, num_tokens * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_metrics, 2 * sizeof(float)));
   }
 
   CUDA_CHECK(cudaMalloc(&d_dummy_input, num_tokens * sizeof(float)));
@@ -317,6 +375,7 @@ int run_char_lm(const CharLMConfig &cfg) {
   auto train_start = std::chrono::steady_clock::now();
 
   for (int epoch = 0; epoch < cfg.epochs; epoch++) {
+    NvtxScopedRange epoch_range("char_lm_epoch");
     int max_offset = text_len - cfg.seq_len - 1;
     int offset = static_cast<int>(offset_rng() % (max_offset + 1));
     for (int i = 0; i < num_tokens; i++) {
@@ -339,31 +398,19 @@ int run_char_lm(const CharLMConfig &cfg) {
     }
 
     if (cfg.track_train_metrics && epoch % cfg.print_every == 0) {
-      computeCategoricalCrossEntropyFromIds(d_target_ids, d_pred, d_error, num_tokens, vocab_size);
+      NvtxScopedRange metrics_range("char_lm_metrics");
+      CUDA_CHECK(cudaMemsetAsync(d_metrics, 0, 2 * sizeof(float), 0));
+      lossAndAccuracyKernel<<<(num_tokens + 255) / 256, 256>>>(
+          d_target_ids, d_pred, d_metrics, num_tokens, vocab_size);
       CUDA_CHECK(cudaGetLastError());
 
-      argmaxKernel<<<(num_tokens + 255) / 256, 256>>>(d_pred, d_pred_ids, num_tokens, vocab_size);
-      CUDA_CHECK(cudaGetLastError());
-
-      CUDA_CHECK(cudaMemcpyAsync(h_error, d_error, num_tokens * sizeof(float), cudaMemcpyDeviceToHost,
-                                 0));
-      CUDA_CHECK(cudaMemcpyAsync(h_pred_ids, d_pred_ids, num_tokens * sizeof(int),
+      CUDA_CHECK(cudaMemcpyAsync(h_metrics, d_metrics, 2 * sizeof(float),
                                  cudaMemcpyDeviceToHost, 0));
       CUDA_CHECK(cudaStreamSynchronize(0));
 
-      float total_loss = 0.0f;
-      for (int i = 0; i < num_tokens; i++) {
-        total_loss += h_error[i];
-      }
-      total_loss /= num_tokens;
+      float total_loss = h_metrics[0] / num_tokens;
       float perplexity = expf(total_loss);
-
-      int correct = 0;
-      for (int i = 0; i < num_tokens; i++) {
-        if (h_pred_ids[i] == h_target_ids[i])
-          correct++;
-      }
-      float accuracy = 100.0f * correct / num_tokens;
+      float accuracy = 100.0f * h_metrics[1] / num_tokens;
 
       std::printf("Epoch %4d | Loss: %.4f | PPL: %7.2f | Acc: %5.1f%% | LR: "
                   "%.6f\n",
@@ -402,6 +449,9 @@ int run_char_lm(const CharLMConfig &cfg) {
   for (int i = 0; i < cfg.seq_len; i++) {
     h_context[i] = char_to_id[static_cast<unsigned char>(text[i])];
   }
+  CUDA_CHECK(cudaMemcpyAsync(d_context_ids, h_context,
+                             static_cast<size_t>(cfg.seq_len) * sizeof(int),
+                             cudaMemcpyHostToDevice, 0));
 
   std::string generated;
   for (int i = 0; i < cfg.seq_len; i++) {
@@ -412,7 +462,8 @@ int run_char_lm(const CharLMConfig &cfg) {
   std::vector<float> probs(vocab_size);
 
   for (int step = 0; step < cfg.gen_len; step++) {
-    embedding.set_token_ids(h_context);
+    NvtxScopedRange gen_step_range("char_lm_generate_step");
+    embedding.set_token_ids_device(d_context_ids);
 
     model.forward(d_dummy_input, d_gen_pred);
 
@@ -424,8 +475,8 @@ int run_char_lm(const CharLMConfig &cfg) {
 
     int next_id = sampleWithStrategy(probs, cfg.temperature, 0, cfg.top_p, sample_rng);
     generated += id_to_char[next_id];
-    std::memmove(h_context, h_context + 1, static_cast<size_t>(cfg.seq_len - 1) * sizeof(int));
-    h_context[cfg.seq_len - 1] = next_id;
+    shiftAppendTokenKernel<<<1, 1>>>(d_context_ids, cfg.seq_len, next_id);
+    CUDA_CHECK(cudaGetLastError());
   }
 
   std::printf("  \"%s\"\n", generated.c_str());

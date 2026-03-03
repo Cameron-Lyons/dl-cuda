@@ -70,6 +70,12 @@ public:
                                cudaMemcpyHostToDevice, stream));
   }
 
+  void set_token_ids_device(const int *d_token_ids, cudaStream_t stream = 0) {
+    CUDA_CHECK(cudaMemcpyAsync(d_token_ids_, d_token_ids,
+                               num_tokens_ * sizeof(int),
+                               cudaMemcpyDeviceToDevice, stream));
+  }
+
   void forward(float *d_input, float *d_output) override {
     (void)d_input;
     int total = num_tokens_ * embedding_dim_;
