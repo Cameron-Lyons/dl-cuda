@@ -436,8 +436,8 @@ public:
     int head_total = BH * S * hd;
     float inv_scale = 1.0f / sqrtf(static_cast<float>(hd));
 
-    CUDA_CHECK(cudaMemcpy(d_input_cached_, input, total * sizeof(float),
-                           cudaMemcpyDeviceToDevice));
+    CUDA_CHECK(cudaMemcpyAsync(d_input_cached_, input, total * sizeof(float),
+                               cudaMemcpyDeviceToDevice, 0));
 
     dim3 threads(16, 16);
 
@@ -582,8 +582,9 @@ public:
         d_grad_buf_, d_x_hat1_, d_gamma1_grad_, d_beta1_grad_, ST, D);
     CUDA_CHECK(cudaGetLastError());
 
-    CUDA_CHECK(cudaMemcpy(d_input_grad, d_residual_buf_,
-                           total * sizeof(float), cudaMemcpyDeviceToDevice));
+    CUDA_CHECK(cudaMemcpyAsync(d_input_grad, d_residual_buf_,
+                               total * sizeof(float),
+                               cudaMemcpyDeviceToDevice, 0));
 
     linearBackwardInput(d_residual_buf_, d_wo_weights_, d_d_concat_, ST, D, D);
     CUDA_CHECK(cudaGetLastError());

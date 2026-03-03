@@ -65,7 +65,8 @@ public:
 
   void backward(float *d_output_grad, float *d_input_grad) override {
     int total = batch_size_ * seq_len_ * d_model_;
-    CUDA_CHECK(cudaMemcpy(d_input_grad, d_output_grad, total * sizeof(float),
-                           cudaMemcpyDeviceToDevice));
+    CUDA_CHECK(cudaMemcpyAsync(d_input_grad, d_output_grad,
+                               total * sizeof(float),
+                               cudaMemcpyDeviceToDevice, 0));
   }
 };

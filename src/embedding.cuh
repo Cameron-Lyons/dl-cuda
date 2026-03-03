@@ -82,7 +82,8 @@ public:
   void backward(float *d_output_grad, float *d_input_grad) override {
     (void)d_input_grad;
     int table_size = vocab_size_ * embedding_dim_;
-    CUDA_CHECK(cudaMemset(d_embedding_grad_, 0, table_size * sizeof(float)));
+    CUDA_CHECK(
+        cudaMemsetAsync(d_embedding_grad_, 0, table_size * sizeof(float), 0));
 
     int total = num_tokens_ * embedding_dim_;
     int blocks = (total + 255) / 256;

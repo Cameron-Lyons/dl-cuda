@@ -319,9 +319,9 @@ public:
   int get_n() const { return n_; }
 
   void forward(float *d_input, float *d_output) override {
-    CUDA_CHECK(cudaMemcpy(d_cached_input, d_input,
-                           n_ * in_features_ * sizeof(float),
-                           cudaMemcpyDeviceToDevice));
+    CUDA_CHECK(cudaMemcpyAsync(d_cached_input, d_input,
+                               n_ * in_features_ * sizeof(float),
+                               cudaMemcpyDeviceToDevice, 0));
     linearForward(d_input, d_W, d_b, d_output, n_, in_features_, out_features_);
   }
 

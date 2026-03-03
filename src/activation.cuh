@@ -188,9 +188,9 @@ public:
     int blocks = (num_rows_ + 255) / 256;
     softmaxForwardGeneralKernel<<<blocks, 256>>>(d_input, d_output, num_rows_,
                                                   row_width_);
-    CUDA_CHECK(cudaMemcpy(d_cached_output, d_output,
-                           num_rows_ * row_width_ * sizeof(float),
-                           cudaMemcpyDeviceToDevice));
+    CUDA_CHECK(cudaMemcpyAsync(d_cached_output, d_output,
+                               num_rows_ * row_width_ * sizeof(float),
+                               cudaMemcpyDeviceToDevice, 0));
   }
 
   void backward(float *d_output_grad, float *d_input_grad) override {
