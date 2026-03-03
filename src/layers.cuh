@@ -98,6 +98,17 @@ inline cublasHandle_t ensure_cublas_handle() {
   return handle;
 }
 
+inline cudaStream_t canonical_stream(cudaStream_t stream) {
+  if (stream != 0) {
+    return stream;
+  }
+#if defined(CUDA_API_PER_THREAD_DEFAULT_STREAM)
+  return cudaStreamPerThread;
+#else
+  return cudaStreamLegacy;
+#endif
+}
+
 inline void set_cublas_linear_enabled(bool enabled) {
   cublas_linear_enabled() = enabled;
 }
@@ -185,7 +196,7 @@ inline void linearForward(const float *d_X, const float *d_W, const float *d_b,
                           cudaStream_t stream = 0) {
   if (cublas_linear_enabled()) {
     cublasHandle_t handle = ensure_cublas_handle();
-    CUBLAS_CHECK(cublasSetStream(handle, stream));
+    CUBLAS_CHECK(cublasSetStream(handle, canonical_stream(stream)));
     const float alpha = 1.0f;
     const float beta = 0.0f;
     CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, out_features, n,
@@ -211,7 +222,7 @@ inline void linearBackwardInput(const float *d_output_grad, const float *d_W,
                                 int out_features, cudaStream_t stream = 0) {
   if (cublas_linear_enabled()) {
     cublasHandle_t handle = ensure_cublas_handle();
-    CUBLAS_CHECK(cublasSetStream(handle, stream));
+    CUBLAS_CHECK(cublasSetStream(handle, canonical_stream(stream)));
     const float alpha = 1.0f;
     const float beta = 0.0f;
     CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, in_features, n,
@@ -233,7 +244,7 @@ inline void linearBackwardWeight(const float *d_X, const float *d_output_grad,
                                  int out_features, cudaStream_t stream = 0) {
   if (cublas_linear_enabled()) {
     cublasHandle_t handle = ensure_cublas_handle();
-    CUBLAS_CHECK(cublasSetStream(handle, stream));
+    CUBLAS_CHECK(cublasSetStream(handle, canonical_stream(stream)));
     const float alpha = 1.0f;
     const float beta = 0.0f;
     CUBLAS_CHECK(cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, out_features,
