@@ -47,6 +47,11 @@ inline void clear_cuda_error_state() {
   }
 }
 
+inline size_t align_up(size_t value, size_t alignment) {
+  size_t mask = alignment - 1;
+  return (value + mask) & ~mask;
+}
+
 int run_char_lm(const CharLMConfig &cfg) {
   set_global_init_seed(cfg.init_seed);
   set_cublas_linear_enabled(cfg.enable_cublas_linear);
@@ -133,12 +138,38 @@ int run_char_lm(const CharLMConfig &cfg) {
   int *h_pred_ids = nullptr;
   float *h_probs = nullptr;
   int *h_context = nullptr;
-  CUDA_CHECK(cudaHostAlloc(&h_input_ids, num_tokens * sizeof(int), cudaHostAllocDefault));
-  CUDA_CHECK(cudaHostAlloc(&h_target_ids, num_tokens * sizeof(int), cudaHostAllocDefault));
-  CUDA_CHECK(cudaHostAlloc(&h_error, num_tokens * sizeof(float), cudaHostAllocDefault));
-  CUDA_CHECK(cudaHostAlloc(&h_pred_ids, num_tokens * sizeof(int), cudaHostAllocDefault));
-  CUDA_CHECK(cudaHostAlloc(&h_probs, vocab_size * sizeof(float), cudaHostAllocDefault));
-  CUDA_CHECK(cudaHostAlloc(&h_context, cfg.seq_len * sizeof(int), cudaHostAllocDefault));
+  void *h_pinned_block = nullptr;
+  size_t error_bytes =
+      cfg.track_train_metrics ? static_cast<size_t>(num_tokens) * sizeof(float) : 0;
+  size_t pred_bytes =
+      cfg.track_train_metrics ? static_cast<size_t>(num_tokens) * sizeof(int) : 0;
+  size_t offset = 0;
+  size_t input_offset = offset;
+  offset += static_cast<size_t>(num_tokens) * sizeof(int);
+  offset = align_up(offset, alignof(int));
+  size_t target_offset = offset;
+  offset += static_cast<size_t>(num_tokens) * sizeof(int);
+  offset = align_up(offset, alignof(float));
+  size_t error_offset = offset;
+  offset += error_bytes;
+  offset = align_up(offset, alignof(int));
+  size_t pred_offset = offset;
+  offset += pred_bytes;
+  offset = align_up(offset, alignof(float));
+  size_t probs_offset = offset;
+  offset += static_cast<size_t>(vocab_size) * sizeof(float);
+  offset = align_up(offset, alignof(int));
+  size_t context_offset = offset;
+  offset += static_cast<size_t>(cfg.seq_len) * sizeof(int);
+
+  CUDA_CHECK(cudaHostAlloc(&h_pinned_block, offset, cudaHostAllocDefault));
+  char *host_base = static_cast<char *>(h_pinned_block);
+  h_input_ids = reinterpret_cast<int *>(host_base + input_offset);
+  h_target_ids = reinterpret_cast<int *>(host_base + target_offset);
+  h_error = reinterpret_cast<float *>(host_base + error_offset);
+  h_pred_ids = reinterpret_cast<int *>(host_base + pred_offset);
+  h_probs = reinterpret_cast<float *>(host_base + probs_offset);
+  h_context = reinterpret_cast<int *>(host_base + context_offset);
   for (int i = 0; i < num_tokens; i++) {
     h_input_ids[i] = char_to_id[static_cast<unsigned char>(text[i % text_len])];
     h_target_ids[i] = char_to_id[static_cast<unsigned char>(text[(i + 1) % text_len])];
@@ -197,18 +228,8 @@ int run_char_lm(const CharLMConfig &cfg) {
       cudaFree(d_dummy_input);
     if (d_gen_pred)
       cudaFree(d_gen_pred);
-    if (h_input_ids)
-      cudaFreeHost(h_input_ids);
-    if (h_target_ids)
-      cudaFreeHost(h_target_ids);
-    if (h_error)
-      cudaFreeHost(h_error);
-    if (h_pred_ids)
-      cudaFreeHost(h_pred_ids);
-    if (h_probs)
-      cudaFreeHost(h_probs);
-    if (h_context)
-      cudaFreeHost(h_context);
+    if (h_pinned_block)
+      cudaFreeHost(h_pinned_block);
   };
 
   if (cfg.load_weights) {
@@ -222,10 +243,12 @@ int run_char_lm(const CharLMConfig &cfg) {
 
   CUDA_CHECK(cudaMalloc(&d_pred, out_total * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_loss_grad, out_total * sizeof(float)));
-  CUDA_CHECK(cudaMalloc(&d_error, num_tokens * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_input_grad, num_tokens * sizeof(float)));
   CUDA_CHECK(cudaMalloc(&d_target_ids, num_tokens * sizeof(int)));
-  CUDA_CHECK(cudaMalloc(&d_pred_ids, num_tokens * sizeof(int)));
+  if (cfg.track_train_metrics) {
+    CUDA_CHECK(cudaMalloc(&d_error, num_tokens * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&d_pred_ids, num_tokens * sizeof(int)));
+  }
 
   CUDA_CHECK(cudaMalloc(&d_dummy_input, num_tokens * sizeof(float)));
 
@@ -233,8 +256,9 @@ int run_char_lm(const CharLMConfig &cfg) {
               "heads=%d, layers=%d\n",
               vocab_size, cfg.seq_len, cfg.d_model, cfg.d_ff, cfg.num_heads, cfg.num_layers);
   std::printf("Optimizer: AdamW (wd=0.01) | Grad clip: %.1f | Sampling: "
-              "temp=%.2f, top_p=%.2f\n",
-              cfg.grad_clip, cfg.temperature, cfg.top_p);
+              "temp=%.2f, top_p=%.2f | Metrics: %s\n",
+              cfg.grad_clip, cfg.temperature, cfg.top_p,
+              cfg.track_train_metrics ? "on" : "off");
   std::printf("Linear backend: %s | TF32: %s\n",
               cfg.enable_cublas_linear ? "cuBLAS" : "custom kernels",
               cfg.enable_tf32 ? "on" : "off");
@@ -244,7 +268,6 @@ int run_char_lm(const CharLMConfig &cfg) {
   embedding.set_token_ids(h_input_ids);
   CUDA_CHECK(cudaMemcpyAsync(d_target_ids, h_target_ids, num_tokens * sizeof(int),
                              cudaMemcpyHostToDevice, 0));
-  CUDA_CHECK(cudaStreamSynchronize(0));
 
   if (cfg.enable_cuda_graph && cfg.epochs > 0) {
     // Warm up kernels/libraries once so capture doesn't include lazy init.
@@ -315,25 +338,26 @@ int run_char_lm(const CharLMConfig &cfg) {
       model.backward(d_loss_grad, d_input_grad);
     }
 
-    if (epoch % cfg.print_every == 0) {
+    if (cfg.track_train_metrics && epoch % cfg.print_every == 0) {
       computeCategoricalCrossEntropyFromIds(d_target_ids, d_pred, d_error, num_tokens, vocab_size);
+      CUDA_CHECK(cudaGetLastError());
+
+      argmaxKernel<<<(num_tokens + 255) / 256, 256>>>(d_pred, d_pred_ids, num_tokens, vocab_size);
       CUDA_CHECK(cudaGetLastError());
 
       CUDA_CHECK(cudaMemcpyAsync(h_error, d_error, num_tokens * sizeof(float), cudaMemcpyDeviceToHost,
                                  0));
-      float total_loss = 0.0f;
+      CUDA_CHECK(cudaMemcpyAsync(h_pred_ids, d_pred_ids, num_tokens * sizeof(int),
+                                 cudaMemcpyDeviceToHost, 0));
       CUDA_CHECK(cudaStreamSynchronize(0));
+
+      float total_loss = 0.0f;
       for (int i = 0; i < num_tokens; i++) {
         total_loss += h_error[i];
       }
       total_loss /= num_tokens;
       float perplexity = expf(total_loss);
 
-      argmaxKernel<<<(num_tokens + 255) / 256, 256>>>(d_pred, d_pred_ids, num_tokens, vocab_size);
-      CUDA_CHECK(cudaGetLastError());
-      CUDA_CHECK(cudaMemcpyAsync(h_pred_ids, d_pred_ids, num_tokens * sizeof(int),
-                                 cudaMemcpyDeviceToHost, 0));
-      CUDA_CHECK(cudaStreamSynchronize(0));
       int correct = 0;
       for (int i = 0; i < num_tokens; i++) {
         if (h_pred_ids[i] == h_target_ids[i])

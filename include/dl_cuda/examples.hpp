@@ -29,6 +29,7 @@ struct CharLMConfig {
   bool enable_cuda_graph = true;
   bool enable_cublas_linear = true;
   bool enable_tf32 = true;
+  bool track_train_metrics = true;
 };
 
 struct XorConfig {

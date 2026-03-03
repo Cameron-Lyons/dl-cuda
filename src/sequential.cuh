@@ -44,6 +44,11 @@ private:
   std::vector<float *> backward_buffers_;
   std::vector<int> forward_buffer_sizes_;
   std::vector<int> backward_buffer_sizes_;
+  std::vector<ParamGroup> param_groups_;
+  float **d_grad_ptrs_ = nullptr;
+  int *d_group_sizes_ = nullptr;
+  float *d_total_grad_norm_sq_ = nullptr;
+  int num_param_groups_ = 0;
 
   void clear_buffers(std::vector<float *> &buffers) {
     for (auto *buf : buffers) {
@@ -58,6 +63,54 @@ private:
     clear_buffers(backward_buffers_);
     forward_buffer_sizes_.clear();
     backward_buffer_sizes_.clear();
+  }
+
+  void clear_param_group_cache() {
+    if (d_grad_ptrs_) {
+      CUDA_CHECK(cudaFree(d_grad_ptrs_));
+      d_grad_ptrs_ = nullptr;
+    }
+    if (d_group_sizes_) {
+      CUDA_CHECK(cudaFree(d_group_sizes_));
+      d_group_sizes_ = nullptr;
+    }
+    if (d_total_grad_norm_sq_) {
+      CUDA_CHECK(cudaFree(d_total_grad_norm_sq_));
+      d_total_grad_norm_sq_ = nullptr;
+    }
+    param_groups_.clear();
+    num_param_groups_ = 0;
+  }
+
+  void rebuild_param_group_cache() {
+    clear_param_group_cache();
+    for (auto *op : operations) {
+      auto groups = op->get_param_groups();
+      param_groups_.insert(param_groups_.end(), groups.begin(), groups.end());
+    }
+    num_param_groups_ = static_cast<int>(param_groups_.size());
+    if (num_param_groups_ == 0) {
+      return;
+    }
+
+    std::vector<float *> h_grad_ptrs(static_cast<size_t>(num_param_groups_));
+    std::vector<int> h_group_sizes(static_cast<size_t>(num_param_groups_));
+    for (int i = 0; i < num_param_groups_; i++) {
+      h_grad_ptrs[static_cast<size_t>(i)] = param_groups_[static_cast<size_t>(i)].grads;
+      h_group_sizes[static_cast<size_t>(i)] = param_groups_[static_cast<size_t>(i)].size;
+    }
+
+    CUDA_CHECK(
+        cudaMalloc(&d_grad_ptrs_, static_cast<size_t>(num_param_groups_) * sizeof(float *)));
+    CUDA_CHECK(cudaMalloc(&d_group_sizes_, static_cast<size_t>(num_param_groups_) * sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_total_grad_norm_sq_, sizeof(float)));
+
+    CUDA_CHECK(cudaMemcpy(d_grad_ptrs_, h_grad_ptrs.data(),
+                          static_cast<size_t>(num_param_groups_) * sizeof(float *),
+                          cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_group_sizes_, h_group_sizes.data(),
+                          static_cast<size_t>(num_param_groups_) * sizeof(int),
+                          cudaMemcpyHostToDevice));
   }
 
   void ensure_forward_workspace() {
@@ -109,11 +162,15 @@ private:
   }
 
 public:
-  ~Sequential() { release_workspaces(); }
+  ~Sequential() {
+    release_workspaces();
+    clear_param_group_cache();
+  }
 
   void add(Operation *op) {
     operations.push_back(op);
     release_workspaces();
+    clear_param_group_cache();
   }
 
   void forward(float *d_input, float *d_output) {
