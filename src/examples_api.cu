@@ -42,6 +42,11 @@ inline void print_cuda_warning(const char *context, cudaError_t err) {
   std::fprintf(stderr, "Warning: %s: %s\n", context, cudaGetErrorString(err));
 }
 
+inline void clear_cuda_error_state() {
+  while (cudaGetLastError() != cudaSuccess) {
+  }
+}
+
 int run_char_lm(const CharLMConfig &cfg) {
   set_global_init_seed(cfg.init_seed);
   set_cublas_linear_enabled(cfg.enable_cublas_linear);
@@ -257,12 +262,14 @@ int run_char_lm(const CharLMConfig &cfg) {
         } else {
           print_cuda_warning("cudaGraphInstantiate failed; continuing without CUDA Graph",
                              instantiate_status);
+          clear_cuda_error_state();
           cudaGraphDestroy(train_graph);
           train_graph = nullptr;
         }
       } else {
         print_cuda_warning("cudaStreamEndCapture failed; continuing without CUDA Graph",
                            end_status);
+        clear_cuda_error_state();
         if (train_graph) {
           cudaGraphDestroy(train_graph);
           train_graph = nullptr;
@@ -271,6 +278,7 @@ int run_char_lm(const CharLMConfig &cfg) {
     } else {
       print_cuda_warning("cudaStreamBeginCapture failed; continuing without CUDA Graph",
                          capture_status);
+      clear_cuda_error_state();
     }
   }
   std::printf("CUDA Graph replay: %s\n", graph_enabled ? "enabled" : "disabled");

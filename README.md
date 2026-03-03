@@ -47,6 +47,12 @@ If your GPU architecture is not detected by default, set it explicitly:
 cmake -B build -DCMAKE_CUDA_ARCHITECTURES=89
 ```
 
+If nvcc emits deprecated-gpu-target warnings from your local toolchain defaults:
+
+```sh
+cmake -B build -DDL_CUDA_SUPPRESS_DEPRECATED_GPU_TARGETS_WARNING=ON
+```
+
 ## Lint And Warnings
 
 ```sh

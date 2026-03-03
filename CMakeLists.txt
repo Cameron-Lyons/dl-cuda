@@ -26,6 +26,10 @@ endif()
 find_package(CUDAToolkit REQUIRED)
 
 option(DL_CUDA_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" ON)
+option(DL_CUDA_SUPPRESS_DEPRECATED_GPU_TARGETS_WARNING
+  "Suppress nvcc deprecated GPU targets warning"
+  ON
+)
 
 function(dl_cuda_enable_warnings target_name)
   if(DL_CUDA_WARNINGS_AS_ERRORS)
@@ -37,6 +41,12 @@ function(dl_cuda_enable_warnings target_name)
     target_compile_options(${target_name} PRIVATE
       $<$<COMPILE_LANGUAGE:CXX>:-Wall;-Wextra>
       $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-Wall,-Wextra>
+    )
+  endif()
+  if(DL_CUDA_SUPPRESS_DEPRECATED_GPU_TARGETS_WARNING
+     AND CMAKE_CUDA_COMPILER_ID STREQUAL "NVIDIA")
+    target_compile_options(${target_name} PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:-Wno-deprecated-gpu-targets>
     )
   endif()
 endfunction()
