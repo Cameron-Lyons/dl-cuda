@@ -53,6 +53,13 @@ If nvcc emits deprecated-gpu-target warnings from your local toolchain defaults:
 cmake -B build -DDL_CUDA_SUPPRESS_DEPRECATED_GPU_TARGETS_WARNING=ON
 ```
 
+If CUDA Graph capture reports stream-capture restrictions in your runtime,
+reconfigure with per-thread default stream (enabled by default):
+
+```sh
+cmake -B build -DDL_CUDA_PER_THREAD_DEFAULT_STREAM=ON
+```
+
 ## Lint And Warnings
 
 ```sh
