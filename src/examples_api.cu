@@ -247,7 +247,8 @@ int run_char_lm(const CharLMConfig &cfg) {
   CUDA_CHECK(cudaStreamSynchronize(0));
 
   if (cfg.enable_cuda_graph && cfg.epochs > 0) {
-    cudaError_t capture_status = cudaStreamBeginCapture(0, cudaStreamCaptureModeGlobal);
+    cudaError_t capture_status =
+        cudaStreamBeginCapture(0, cudaStreamCaptureModeRelaxed);
     if (capture_status == cudaSuccess) {
       model.forward(d_dummy_input, d_pred);
       computeCategoricalCrossEntropyBackwardFromIds(d_target_ids, d_pred, d_loss_grad, num_tokens,
