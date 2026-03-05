@@ -40,7 +40,8 @@ public:
               float lr) override;
 
 private:
-  Status EnsureState(const std::vector<ParameterRef> &params);
+  Status EnsureState(RuntimeContext &ctx,
+                     const std::vector<ParameterRef> &params);
 
   float beta1_;
   float beta2_;

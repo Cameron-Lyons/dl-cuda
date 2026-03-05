@@ -10,13 +10,6 @@
 namespace dlcuda {
 namespace {
 
-Status FromCuda(cudaError_t err, const std::string &context) {
-  if (err == cudaSuccess) {
-    return Status::Ok();
-  }
-  return Status::RuntimeError(context + ": " + cudaGetErrorString(err));
-}
-
 Status ValidateFloat2D(const Tensor &tensor, const char *name) {
   if (!tensor.defined()) {
     return Status::InvalidArgument(std::string(name) + " is undefined");

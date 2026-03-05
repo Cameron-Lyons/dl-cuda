@@ -121,7 +121,8 @@ Status SGDOptimizer::Step(RuntimeContext &ctx,
   return Status::Ok();
 }
 
-Status AdamOptimizer::EnsureState(const std::vector<ParameterRef> &params) {
+Status AdamOptimizer::EnsureState(RuntimeContext &ctx,
+                                  const std::vector<ParameterRef> &params) {
   for (const auto &param : params) {
     if (param.value == nullptr || !param.value->defined() ||
         param.grad == nullptr || !param.grad->defined()) {
@@ -155,6 +156,8 @@ Status AdamOptimizer::EnsureState(const std::vector<ParameterRef> &params) {
       }
       m_state_[param.name] = m.value();
       v_state_[param.name] = v.value();
+      DLCUDA_RETURN_IF_ERROR(m_state_[param.name].FillZero(ctx.stream()));
+      DLCUDA_RETURN_IF_ERROR(v_state_[param.name].FillZero(ctx.stream()));
     }
   }
 
@@ -178,7 +181,7 @@ Status AdamOptimizer::Step(RuntimeContext &ctx,
   if (!(lr > 0.0f)) {
     return Status::InvalidArgument("Adam lr must be > 0");
   }
-  DLCUDA_RETURN_IF_ERROR(EnsureState(params));
+  DLCUDA_RETURN_IF_ERROR(EnsureState(ctx, params));
 
   ++step_;
   float inv_bias_correction1 =
