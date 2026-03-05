@@ -1,125 +1,68 @@
 # dl-cuda
 
-A GPU-accelerated deep learning framework written from scratch in CUDA C++.
+A GPU-accelerated deep learning framework in CUDA C++.
 
-## Features
+## v2 (Backward-Incompatible) Architecture
 
-**Layers**
-- Linear (fully connected)
-- Conv1D / Conv2D
-- LSTM
-- Elman RNN
-- Transformer (multi-head attention, layer norm, residual connections)
+This repository now uses a v2 API with breaking changes:
 
-**Activations** — ReLU, Sigmoid, Tanh
-
-**Loss Functions** — MSE, MAE, Binary Cross-Entropy, Categorical Cross-Entropy
-
-**Optimizers** — SGD, RMSprop, Adam, AdamW
-
-**Utilities** — Sequential model API
-
-**Examples API** — reusable `run_char_lm(...)` and `run_xor(...)` entry points
-via `include/dl_cuda/examples.hpp`
-
-**Runtime Perf** — CUDA Graph replay for Char-LM train step, pinned host buffers,
-async host↔device transfers, and cuBLAS-backed linear/Transformer GEMMs with
-optional TF32 tensor-core math
-
-## Requirements
-
-- CMake 3.18+
-- NVIDIA CUDA Toolkit
-- NVIDIA driver compatible with the CUDA runtime/toolkit version
-- C++17 compiler
+- `Tensor` + typed shapes/dtypes (`float32`, `int32`) instead of raw pointer I/O
+- `RuntimeContext` for cuBLAS/TF32/seed/stream control (no global runtime state)
+- `Module`/`Sequential` with explicit ownership (`std::unique_ptr`)
+- Explicit `Status`/`Result<T>` error propagation (no `exit(...)` fast-fail path)
+- Named state-dict checkpoints with metadata + strict validation
+- Public SDK exposed under `include/dl_cuda/*`
+- Unified CLI with subcommands (`train-xor`, `train-char`, `sample-char`)
 
 ## Build
 
 ```sh
-cmake -B build
-cmake --build build
-ctest --test-dir build --output-on-failure
+cmake -S . -B build
+cmake --build build -j
 ```
 
 If your GPU architecture is not detected by default, set it explicitly:
 
 ```sh
-cmake -B build -DCMAKE_CUDA_ARCHITECTURES=89
+cmake -S . -B build -DCMAKE_CUDA_ARCHITECTURES=89
 ```
 
-If nvcc emits deprecated-gpu-target warnings from your local toolchain defaults:
+## CLI
 
 ```sh
-cmake -B build -DDL_CUDA_SUPPRESS_DEPRECATED_GPU_TARGETS_WARNING=ON
+./build/dl-cuda train-xor --epochs 3000 --lr 0.1
+./build/dl-cuda train-char --epochs 800 --print-every 50
+./build/dl-cuda sample-char --checkpoint char_v2.ckpt --gen-len 200
 ```
 
-If CUDA Graph capture reports stream-capture restrictions in your runtime,
-reconfigure with per-thread default stream (enabled by default):
+Use config files (key=value) with any subcommand:
 
 ```sh
-cmake -B build -DDL_CUDA_PER_THREAD_DEFAULT_STREAM=ON
+./build/dl-cuda train-char --config configs/char_train.cfg
 ```
 
-## Lint And Warnings
-
-```sh
-./scripts/lint.sh
-./scripts/format.sh
-./scripts/check_no_warnings_build.sh build
-```
-
-## Usage
-
-### Character LM
-
-```sh
-./build/dl-cuda-char-lm --epochs 800 --print-every 50
-# Reuse existing checkpoint and skip saving:
-./build/dl-cuda-char-lm --epochs 0 --load-weights --weights model.bin --no-save
-# Disable CUDA Graph capture/replay if needed:
-./build/dl-cuda-char-lm --no-cuda-graph
-# Force custom kernels instead of cuBLAS and disable TF32:
-./build/dl-cuda-char-lm --no-cublas-linear --no-tf32
-```
-
-```
-Char-level LM | vocab=..., seq_len=64, d_model=64, d_ff=256, heads=4, layers=3
-Optimizer: AdamW (wd=0.01) | Grad clip: 1.0 | Sampling: temp=0.8, top_p=0.9
-Training on ... chars of Shakespeare for 800 epochs
-...
-Weights saved to model.bin
-Generating text (temp=0.8, top_p=0.9, 200 chars):
-  "To be, or not to be, ..."
-```
-
-### XOR
-
-```sh
-./build/dl-cuda-xor --epochs 3000 --lr 0.1
-# Optional backend controls:
-./build/dl-cuda-xor --no-cublas-linear --no-tf32
-```
-
-### Programmatic API
+## Programmatic API
 
 ```cpp
-#include "dl_cuda/examples.hpp"
+#include "dl_cuda.hpp"
 
 int main() {
-  dlcuda::CharLMConfig cfg;
-  cfg.epochs = 100;
-  return dlcuda::run_char_lm(cfg);
+  dlcuda::TrainXorConfig cfg;
+  cfg.epochs = 1000;
+  dlcuda::Status status = dlcuda::TrainXor(cfg);
+  return status.ok() ? 0 : 1;
 }
 ```
 
-### Profiling
+## Checkpoints
 
-See `docs/PROFILING.md` and run:
+v2 checkpoints store:
 
-```sh
-./scripts/profile_char_lm.sh
-./scripts/bench_char_lm.sh 200 64
-```
+- format/version metadata
+- model name
+- named tensors (name, dtype, shape, raw bytes)
+
+`LoadCheckpoint(...)` validates model name + tensor schema before loading.
 
 ## License
 

@@ -61,33 +61,21 @@ function(dl_cuda_enable_warnings target_name)
   endif()
 endfunction()
 
-add_library(dl-cuda-core STATIC src/examples_api.cu)
-target_include_directories(dl-cuda-core PUBLIC include src)
-target_link_libraries(dl-cuda-core PUBLIC CUDA::curand CUDA::cublas)
-if(TARGET CUDA::nvtx3)
-  target_link_libraries(dl-cuda-core PUBLIC CUDA::nvtx3)
-elseif(TARGET CUDA::nvToolsExt)
-  target_link_libraries(dl-cuda-core PUBLIC CUDA::nvToolsExt)
-endif()
+add_library(dl-cuda-core STATIC
+  src/v2/nn.cu
+  src/v2/optim.cu
+  src/v2/loss.cu
+  src/v2/checkpoint.cu
+  src/v2/examples_api.cu
+)
+target_include_directories(dl-cuda-core PUBLIC include)
+target_link_libraries(dl-cuda-core PUBLIC CUDA::cudart CUDA::cublas)
 set_target_properties(dl-cuda-core PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 dl_cuda_enable_warnings(dl-cuda-core)
 
-add_executable(dl-cuda-char-lm examples/char_lm.cu)
-target_include_directories(dl-cuda-char-lm PRIVATE include src)
-target_link_libraries(dl-cuda-char-lm PRIVATE dl-cuda-core CUDA::curand)
-set_target_properties(dl-cuda-char-lm PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-dl_cuda_enable_warnings(dl-cuda-char-lm)
-
-add_executable(dl-cuda-xor examples/xor.cu)
-target_include_directories(dl-cuda-xor PRIVATE include src)
-target_link_libraries(dl-cuda-xor PRIVATE dl-cuda-core CUDA::curand)
-set_target_properties(dl-cuda-xor PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-dl_cuda_enable_warnings(dl-cuda-xor)
-
-# Backward-compatible binary name.
-add_executable(dl-cuda examples/char_lm.cu)
-target_include_directories(dl-cuda PRIVATE include src)
-target_link_libraries(dl-cuda PRIVATE dl-cuda-core CUDA::curand)
+add_executable(dl-cuda examples/cli.cu)
+target_include_directories(dl-cuda PRIVATE include)
+target_link_libraries(dl-cuda PRIVATE dl-cuda-core)
 set_target_properties(dl-cuda PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 dl_cuda_enable_warnings(dl-cuda)
 
@@ -97,12 +85,6 @@ target_include_directories(dl-cuda-host-tests PRIVATE src)
 target_link_libraries(dl-cuda-host-tests PRIVATE CUDA::cudart CUDA::cublas)
 dl_cuda_enable_warnings(dl-cuda-host-tests)
 add_test(NAME host_tests COMMAND dl-cuda-host-tests)
-
-add_executable(dl-cuda-gpu-tests tests/gpu_correctness_tests.cu)
-target_include_directories(dl-cuda-gpu-tests PRIVATE src include)
-target_link_libraries(dl-cuda-gpu-tests PRIVATE CUDA::cudart CUDA::curand CUDA::cublas)
-dl_cuda_enable_warnings(dl-cuda-gpu-tests)
-add_test(NAME gpu_correctness_tests COMMAND dl-cuda-gpu-tests)
 
 add_custom_target(lint
   COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/scripts/lint.sh
