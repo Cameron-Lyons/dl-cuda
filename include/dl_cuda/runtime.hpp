@@ -1,6 +1,7 @@
 #pragma once
 
 #include "dl_cuda/status.hpp"
+#include "dl_cuda/tensor.hpp"
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
@@ -8,6 +9,8 @@
 #include <cstdint>
 #include <random>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 namespace dlcuda {
 
@@ -88,6 +91,15 @@ public:
     return Status::Ok();
   }
 
+  Status Synchronize() {
+    cudaError_t status = cudaStreamSynchronize(options_.stream);
+    if (status != cudaSuccess) {
+      return Status::RuntimeError(std::string("cudaStreamSynchronize failed: ") +
+                                  cudaGetErrorString(status));
+    }
+    return Status::Ok();
+  }
+
   cublasHandle_t cublas_handle() const { return cublas_handle_; }
 
   uint64_t seed() const { return options_.seed; }
@@ -95,6 +107,21 @@ public:
   uint64_t NextInitSeed() {
     ++seed_counter_;
     return options_.seed + 9973ULL * seed_counter_;
+  }
+
+  Result<Tensor> ScratchTensor(const std::string &key,
+                               const std::vector<int64_t> &shape, DType dtype,
+                               DeviceType device = DeviceType::kCuda) {
+    auto it = scratch_tensors_.find(key);
+    if (it == scratch_tensors_.end() || it->second.shape() != shape ||
+        it->second.dtype() != dtype || it->second.device() != device) {
+      auto tensor = Tensor::Allocate(shape, dtype, device);
+      if (!tensor.ok()) {
+        return tensor.status();
+      }
+      it = scratch_tensors_.insert_or_assign(key, tensor.value()).first;
+    }
+    return it->second;
   }
 
   std::mt19937 &host_rng() { return host_rng_; }
@@ -120,6 +147,7 @@ private:
   cublasHandle_t cublas_handle_ = nullptr;
   uint64_t seed_counter_ = 0ULL;
   std::mt19937 host_rng_;
+  std::unordered_map<std::string, Tensor> scratch_tensors_;
 };
 
 } // namespace dlcuda

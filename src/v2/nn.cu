@@ -257,6 +257,13 @@ Status EnsureSameShapeAndType(const Tensor &a, const Tensor &b,
   return Status::Ok();
 }
 
+std::string JoinParameterName(const std::string &prefix, const char *name) {
+  if (prefix.empty()) {
+    return std::string(name);
+  }
+  return prefix + "." + name;
+}
+
 } // namespace
 
 Status Sequential::Add(std::unique_ptr<Module> module) {
@@ -264,6 +271,7 @@ Status Sequential::Add(std::unique_ptr<Module> module) {
     return Status::InvalidArgument("Sequential::Add received null module");
   }
   modules_.push_back(std::move(module));
+  RebuildParameterCache();
   return Status::Ok();
 }
 
@@ -321,16 +329,21 @@ Status Sequential::Backward(RuntimeContext &ctx, const Tensor &grad_output,
   return Status::Ok();
 }
 
-std::vector<ParameterRef> Sequential::Parameters() {
-  std::vector<ParameterRef> out;
-  for (size_t i = 0; i < modules_.size(); ++i) {
-    std::vector<ParameterRef> local = modules_[i]->Parameters();
-    for (auto &param : local) {
-      param.name = "layers." + std::to_string(i) + "." + param.name;
-      out.push_back(param);
-    }
+void Sequential::AppendParameters(const std::string &prefix,
+                                  std::vector<ParameterRef> *out) {
+  if (out == nullptr) {
+    return;
   }
-  return out;
+  for (size_t i = 0; i < modules_.size(); ++i) {
+    std::string child_name = "layers." + std::to_string(i);
+    std::string child_prefix = prefix.empty() ? child_name : prefix + "." + child_name;
+    modules_[i]->AppendParameters(child_prefix, out);
+  }
+}
+
+void Sequential::RebuildParameterCache() {
+  parameter_cache_.clear();
+  AppendParameters("", &parameter_cache_);
 }
 
 Linear::Linear(int64_t in_features, int64_t out_features, RuntimeContext &ctx)
@@ -410,18 +423,10 @@ Status Linear::Forward(RuntimeContext &ctx, const Tensor &input, Tensor *output)
     return Status::InvalidArgument(oss.str());
   }
 
-  auto out = Tensor::Allocate({batch, out_features_}, DType::kFloat32);
-  if (!out.ok()) {
-    return out.status();
-  }
-
-  if (!cached_input_.defined() || cached_input_.shape() != input.shape()) {
-    auto cached = Tensor::Allocate(input.shape(), DType::kFloat32);
-    if (!cached.ok()) {
-      return cached.status();
-    }
-    cached_input_ = cached.value();
-  }
+  DLCUDA_RETURN_IF_ERROR(
+      EnsureTensor(&forward_output_, {batch, out_features_}, DType::kFloat32));
+  DLCUDA_RETURN_IF_ERROR(
+      EnsureTensor(&cached_input_, input.shape(), DType::kFloat32));
   last_batch_ = batch;
 
   DLCUDA_RETURN_IF_ERROR(CopyTensor(input, &cached_input_, ctx.stream()));
@@ -440,14 +445,15 @@ Status Linear::Forward(RuntimeContext &ctx, const Tensor &input, Tensor *output)
                     static_cast<int>(in_features_), &alpha,
                     weight_.data_as<float>(), static_cast<int>(out_features_),
                     input.data_as<float>(), static_cast<int>(in_features_), &beta,
-                    out.value().data_as<float>(), static_cast<int>(out_features_)),
+                    forward_output_.data_as<float>(),
+                    static_cast<int>(out_features_)),
         "Linear forward cublasSgemm"));
 
     int64_t total = batch * out_features_;
     int blocks = static_cast<int>((total + 255) / 256);
-    AddBiasKernel<<<blocks, 256, 0, ctx.stream()>>>(out.value().data_as<float>(),
-                                                     bias_.data_as<float>(), batch,
-                                                     out_features_);
+    AddBiasKernel<<<blocks, 256, 0, ctx.stream()>>>(
+        forward_output_.data_as<float>(), bias_.data_as<float>(), batch,
+        out_features_);
     DLCUDA_RETURN_IF_ERROR(FromCuda(cudaGetLastError(), "Linear add-bias kernel"));
   } else {
     dim3 threads(16, 16);
@@ -455,11 +461,11 @@ Status Linear::Forward(RuntimeContext &ctx, const Tensor &input, Tensor *output)
                 static_cast<unsigned int>((batch + threads.y - 1) / threads.y));
     LinearForwardKernel<<<blocks, threads, 0, ctx.stream()>>>(
         input.data_as<float>(), weight_.data_as<float>(), bias_.data_as<float>(),
-        out.value().data_as<float>(), batch, in_features_, out_features_);
+        forward_output_.data_as<float>(), batch, in_features_, out_features_);
     DLCUDA_RETURN_IF_ERROR(FromCuda(cudaGetLastError(), "Linear forward kernel"));
   }
 
-  *output = out.value();
+  *output = forward_output_;
   return Status::Ok();
 }
 
@@ -481,10 +487,8 @@ Status Linear::Backward(RuntimeContext &ctx, const Tensor &grad_output,
     return Status::RuntimeError("Linear backward called before forward");
   }
 
-  auto grad_input_tensor = Tensor::Allocate({last_batch_, in_features_}, DType::kFloat32);
-  if (!grad_input_tensor.ok()) {
-    return grad_input_tensor.status();
-  }
+  DLCUDA_RETURN_IF_ERROR(
+      EnsureTensor(&backward_output_, {last_batch_, in_features_}, DType::kFloat32));
 
   if (ctx.use_cublas()) {
     DLCUDA_RETURN_IF_ERROR(ctx.EnsureCublas());
@@ -501,7 +505,7 @@ Status Linear::Backward(RuntimeContext &ctx, const Tensor &grad_output,
                     static_cast<int>(out_features_), &alpha,
                     weight_.data_as<float>(), static_cast<int>(out_features_),
                     grad_output.data_as<float>(), static_cast<int>(out_features_),
-                    &beta, grad_input_tensor.value().data_as<float>(),
+                    &beta, backward_output_.data_as<float>(),
                     static_cast<int>(in_features_)),
         "Linear backward-input cublasSgemm"));
 
@@ -527,7 +531,7 @@ Status Linear::Backward(RuntimeContext &ctx, const Tensor &grad_output,
         static_cast<unsigned int>((last_batch_ + threads.y - 1) / threads.y));
     LinearBackwardInputKernel<<<blocks_input, threads, 0, ctx.stream()>>>(
         grad_output.data_as<float>(), weight_.data_as<float>(),
-        grad_input_tensor.value().data_as<float>(), last_batch_, in_features_,
+        backward_output_.data_as<float>(), last_batch_, in_features_,
         out_features_);
     DLCUDA_RETURN_IF_ERROR(FromCuda(cudaGetLastError(), "Linear backward-input kernel"));
 
@@ -547,15 +551,19 @@ Status Linear::Backward(RuntimeContext &ctx, const Tensor &grad_output,
     DLCUDA_RETURN_IF_ERROR(FromCuda(cudaGetLastError(), "Linear backward-bias kernel"));
   }
 
-  *grad_input = grad_input_tensor.value();
+  *grad_input = backward_output_;
   return Status::Ok();
 }
 
-std::vector<ParameterRef> Linear::Parameters() {
-  return {
-      ParameterRef{"weight", &weight_, &grad_weight_},
-      ParameterRef{"bias", &bias_, &grad_bias_},
-  };
+void Linear::AppendParameters(const std::string &prefix,
+                              std::vector<ParameterRef> *out) {
+  if (out == nullptr) {
+    return;
+  }
+  out->push_back(ParameterRef{JoinParameterName(prefix, "weight"), &weight_,
+                              &grad_weight_});
+  out->push_back(
+      ParameterRef{JoinParameterName(prefix, "bias"), &bias_, &grad_bias_});
 }
 
 Status ReLU::Forward(RuntimeContext &ctx, const Tensor &input, Tensor *output) {
@@ -564,26 +572,19 @@ Status ReLU::Forward(RuntimeContext &ctx, const Tensor &input, Tensor *output) {
   }
   DLCUDA_RETURN_IF_ERROR(ValidateFloatTensor(input, "ReLU input"));
 
-  auto out = Tensor::Allocate(input.shape(), DType::kFloat32);
-  if (!out.ok()) {
-    return out.status();
-  }
-  if (!cached_input_.defined() || cached_input_.shape() != input.shape()) {
-    auto cached = Tensor::Allocate(input.shape(), DType::kFloat32);
-    if (!cached.ok()) {
-      return cached.status();
-    }
-    cached_input_ = cached.value();
-  }
+  DLCUDA_RETURN_IF_ERROR(
+      EnsureTensor(&forward_output_, input.shape(), DType::kFloat32));
+  DLCUDA_RETURN_IF_ERROR(
+      EnsureTensor(&cached_input_, input.shape(), DType::kFloat32));
 
   DLCUDA_RETURN_IF_ERROR(CopyTensor(input, &cached_input_, ctx.stream()));
 
   int blocks = static_cast<int>((input.numel() + 255) / 256);
   ReLUForwardKernel<<<blocks, 256, 0, ctx.stream()>>>(
-      input.data_as<float>(), out.value().data_as<float>(), input.numel());
+      input.data_as<float>(), forward_output_.data_as<float>(), input.numel());
   DLCUDA_RETURN_IF_ERROR(FromCuda(cudaGetLastError(), "ReLU forward kernel"));
 
-  *output = out.value();
+  *output = forward_output_;
   return Status::Ok();
 }
 
@@ -599,18 +600,22 @@ Status ReLU::Backward(RuntimeContext &ctx, const Tensor &grad_output,
   DLCUDA_RETURN_IF_ERROR(
       EnsureSameShapeAndType(grad_output, cached_input_, "grad_output", "cached_input"));
 
-  auto out = Tensor::Allocate(grad_output.shape(), DType::kFloat32);
-  if (!out.ok()) {
-    return out.status();
-  }
+  DLCUDA_RETURN_IF_ERROR(
+      EnsureTensor(&backward_output_, grad_output.shape(), DType::kFloat32));
   int blocks = static_cast<int>((grad_output.numel() + 255) / 256);
   ReLUBackwardKernel<<<blocks, 256, 0, ctx.stream()>>>(
       grad_output.data_as<float>(), cached_input_.data_as<float>(),
-      out.value().data_as<float>(), grad_output.numel());
+      backward_output_.data_as<float>(), grad_output.numel());
   DLCUDA_RETURN_IF_ERROR(FromCuda(cudaGetLastError(), "ReLU backward kernel"));
 
-  *grad_input = out.value();
+  *grad_input = backward_output_;
   return Status::Ok();
+}
+
+void ReLU::AppendParameters(const std::string &prefix,
+                            std::vector<ParameterRef> *out) {
+  (void)prefix;
+  (void)out;
 }
 
 Status Sigmoid::Forward(RuntimeContext &ctx, const Tensor &input,
@@ -620,26 +625,15 @@ Status Sigmoid::Forward(RuntimeContext &ctx, const Tensor &input,
   }
   DLCUDA_RETURN_IF_ERROR(ValidateFloatTensor(input, "Sigmoid input"));
 
-  auto out = Tensor::Allocate(input.shape(), DType::kFloat32);
-  if (!out.ok()) {
-    return out.status();
-  }
-  if (!cached_output_.defined() || cached_output_.shape() != input.shape()) {
-    auto cached = Tensor::Allocate(input.shape(), DType::kFloat32);
-    if (!cached.ok()) {
-      return cached.status();
-    }
-    cached_output_ = cached.value();
-  }
+  DLCUDA_RETURN_IF_ERROR(
+      EnsureTensor(&cached_output_, input.shape(), DType::kFloat32));
 
   int blocks = static_cast<int>((input.numel() + 255) / 256);
   SigmoidForwardKernel<<<blocks, 256, 0, ctx.stream()>>>(
-      input.data_as<float>(), out.value().data_as<float>(), input.numel());
+      input.data_as<float>(), cached_output_.data_as<float>(), input.numel());
   DLCUDA_RETURN_IF_ERROR(FromCuda(cudaGetLastError(), "Sigmoid forward kernel"));
 
-  DLCUDA_RETURN_IF_ERROR(CopyTensor(out.value(), &cached_output_, ctx.stream()));
-
-  *output = out.value();
+  *output = cached_output_;
   return Status::Ok();
 }
 
@@ -655,18 +649,22 @@ Status Sigmoid::Backward(RuntimeContext &ctx, const Tensor &grad_output,
   DLCUDA_RETURN_IF_ERROR(EnsureSameShapeAndType(grad_output, cached_output_,
                                                 "grad_output", "cached_output"));
 
-  auto out = Tensor::Allocate(grad_output.shape(), DType::kFloat32);
-  if (!out.ok()) {
-    return out.status();
-  }
+  DLCUDA_RETURN_IF_ERROR(
+      EnsureTensor(&backward_output_, grad_output.shape(), DType::kFloat32));
   int blocks = static_cast<int>((grad_output.numel() + 255) / 256);
   SigmoidBackwardKernel<<<blocks, 256, 0, ctx.stream()>>>(
       grad_output.data_as<float>(), cached_output_.data_as<float>(),
-      out.value().data_as<float>(), grad_output.numel());
+      backward_output_.data_as<float>(), grad_output.numel());
   DLCUDA_RETURN_IF_ERROR(FromCuda(cudaGetLastError(), "Sigmoid backward kernel"));
 
-  *grad_input = out.value();
+  *grad_input = backward_output_;
   return Status::Ok();
+}
+
+void Sigmoid::AppendParameters(const std::string &prefix,
+                               std::vector<ParameterRef> *out) {
+  (void)prefix;
+  (void)out;
 }
 
 Status Softmax::Forward(RuntimeContext &ctx, const Tensor &input,
@@ -680,26 +678,16 @@ Status Softmax::Forward(RuntimeContext &ctx, const Tensor &input,
   num_rows_ = input.dim(0);
   row_width_ = input.dim(1);
 
-  auto out = Tensor::Allocate(input.shape(), DType::kFloat32);
-  if (!out.ok()) {
-    return out.status();
-  }
-
-  if (!cached_output_.defined() || cached_output_.shape() != input.shape()) {
-    auto cached = Tensor::Allocate(input.shape(), DType::kFloat32);
-    if (!cached.ok()) {
-      return cached.status();
-    }
-    cached_output_ = cached.value();
-  }
+  DLCUDA_RETURN_IF_ERROR(
+      EnsureTensor(&cached_output_, input.shape(), DType::kFloat32));
 
   int blocks = static_cast<int>((num_rows_ + 255) / 256);
   SoftmaxForwardKernel<<<blocks, 256, 0, ctx.stream()>>>(
-      input.data_as<float>(), out.value().data_as<float>(), num_rows_, row_width_);
+      input.data_as<float>(), cached_output_.data_as<float>(), num_rows_,
+      row_width_);
   DLCUDA_RETURN_IF_ERROR(FromCuda(cudaGetLastError(), "Softmax forward kernel"));
 
-  DLCUDA_RETURN_IF_ERROR(CopyTensor(out.value(), &cached_output_, ctx.stream()));
-  *output = out.value();
+  *output = cached_output_;
   return Status::Ok();
 }
 
@@ -715,19 +703,23 @@ Status Softmax::Backward(RuntimeContext &ctx, const Tensor &grad_output,
   DLCUDA_RETURN_IF_ERROR(EnsureSameShapeAndType(grad_output, cached_output_,
                                                 "grad_output", "cached_output"));
 
-  auto out = Tensor::Allocate(grad_output.shape(), DType::kFloat32);
-  if (!out.ok()) {
-    return out.status();
-  }
+  DLCUDA_RETURN_IF_ERROR(
+      EnsureTensor(&backward_output_, grad_output.shape(), DType::kFloat32));
 
   int blocks = static_cast<int>((num_rows_ + 255) / 256);
   SoftmaxBackwardKernel<<<blocks, 256, 0, ctx.stream()>>>(
       grad_output.data_as<float>(), cached_output_.data_as<float>(),
-      out.value().data_as<float>(), num_rows_, row_width_);
+      backward_output_.data_as<float>(), num_rows_, row_width_);
   DLCUDA_RETURN_IF_ERROR(FromCuda(cudaGetLastError(), "Softmax backward kernel"));
 
-  *grad_input = out.value();
+  *grad_input = backward_output_;
   return Status::Ok();
+}
+
+void Softmax::AppendParameters(const std::string &prefix,
+                               std::vector<ParameterRef> *out) {
+  (void)prefix;
+  (void)out;
 }
 
 Embedding::Embedding(int64_t vocab_size, int64_t embedding_dim,
@@ -780,28 +772,22 @@ Status Embedding::Forward(RuntimeContext &ctx, const Tensor &input,
 
   last_num_tokens_ = input.dim(0);
 
-  if (!cached_token_ids_.defined() || cached_token_ids_.shape() != input.shape()) {
-    auto cached = Tensor::Allocate(input.shape(), DType::kInt32);
-    if (!cached.ok()) {
-      return cached.status();
-    }
-    cached_token_ids_ = cached.value();
-  }
+  DLCUDA_RETURN_IF_ERROR(
+      EnsureTensor(&cached_token_ids_, input.shape(), DType::kInt32));
   DLCUDA_RETURN_IF_ERROR(CopyTensor(input, &cached_token_ids_, ctx.stream()));
 
-  auto out = Tensor::Allocate({last_num_tokens_, embedding_dim_}, DType::kFloat32);
-  if (!out.ok()) {
-    return out.status();
-  }
+  DLCUDA_RETURN_IF_ERROR(EnsureTensor(&forward_output_,
+                                      {last_num_tokens_, embedding_dim_},
+                                      DType::kFloat32));
 
   int64_t total = last_num_tokens_ * embedding_dim_;
   int blocks = static_cast<int>((total + 255) / 256);
   EmbeddingForwardKernel<<<blocks, 256, 0, ctx.stream()>>>(
       table_.data_as<float>(), cached_token_ids_.data_as<int32_t>(),
-      out.value().data_as<float>(), last_num_tokens_, embedding_dim_);
+      forward_output_.data_as<float>(), last_num_tokens_, embedding_dim_);
   DLCUDA_RETURN_IF_ERROR(FromCuda(cudaGetLastError(), "Embedding forward kernel"));
 
-  *output = out.value();
+  *output = forward_output_;
   return Status::Ok();
 }
 
@@ -837,8 +823,13 @@ Status Embedding::Backward(RuntimeContext &ctx, const Tensor &grad_output,
   return Status::Ok();
 }
 
-std::vector<ParameterRef> Embedding::Parameters() {
-  return {ParameterRef{"table", &table_, &grad_table_}};
+void Embedding::AppendParameters(const std::string &prefix,
+                                 std::vector<ParameterRef> *out) {
+  if (out == nullptr) {
+    return;
+  }
+  out->push_back(
+      ParameterRef{JoinParameterName(prefix, "table"), &table_, &grad_table_});
 }
 
 } // namespace dlcuda

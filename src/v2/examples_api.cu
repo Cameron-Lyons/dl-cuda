@@ -226,13 +226,13 @@ Result<std::string> GenerateText(RuntimeContext &ctx, Sequential &model,
   }
 
   std::mt19937 rng(static_cast<uint32_t>(sample_seed));
+  std::vector<float> host_probs(static_cast<size_t>(vocab.size()));
 
   for (int step = 0; step < gen_len; ++step) {
     Tensor probs;
     DLCUDA_RETURN_IF_ERROR(model.Forward(ctx, input_ids, &probs));
 
     int vocab_size = static_cast<int>(probs.dim(1));
-    std::vector<float> host_probs(static_cast<size_t>(vocab_size));
     size_t offset = static_cast<size_t>(seq_len - 1) * static_cast<size_t>(vocab_size);
     cudaError_t copy_status = cudaMemcpyAsync(host_probs.data(),
                                               probs.data_as<float>() + offset,
@@ -244,11 +244,7 @@ Result<std::string> GenerateText(RuntimeContext &ctx, Sequential &model,
       return Status::RuntimeError(std::string("cudaMemcpyAsync failed in generation: ") +
                                   cudaGetErrorString(copy_status));
     }
-    cudaError_t sync_status = cudaStreamSynchronize(ctx.stream());
-    if (sync_status != cudaSuccess) {
-      return Status::RuntimeError(std::string("cudaStreamSynchronize failed in generation: ") +
-                                  cudaGetErrorString(sync_status));
-    }
+    DLCUDA_RETURN_IF_ERROR(ctx.Synchronize());
 
     int next_id = SampleToken(host_probs, temperature, top_p, rng);
     generated.push_back(vocab.Decode(next_id));
@@ -279,6 +275,7 @@ Status TrainXor(const TrainXorConfig &cfg) {
   DLCUDA_RETURN_IF_ERROR(model.Add(std::make_unique<ReLU>()));
   DLCUDA_RETURN_IF_ERROR(model.Add(std::make_unique<Linear>(cfg.hidden_size, 1, ctx)));
   DLCUDA_RETURN_IF_ERROR(model.Add(std::make_unique<Sigmoid>()));
+  const auto &params = model.parameters();
 
   AdamOptimizer optimizer;
 
@@ -308,7 +305,7 @@ Status TrainXor(const TrainXorConfig &cfg) {
 
   if (cfg.resume) {
     Status load_status =
-        LoadCheckpoint(ctx, cfg.checkpoint_path, "xor-mlp-v2", model.Parameters());
+        LoadCheckpoint(ctx, cfg.checkpoint_path, "xor-mlp-v2", params);
     if (!load_status.ok()) {
       return Status::RuntimeError("Failed to resume XOR checkpoint: " +
                                   load_status.message());
@@ -321,32 +318,34 @@ Status TrainXor(const TrainXorConfig &cfg) {
               cfg.use_cublas ? "cuBLAS" : "kernels",
               cfg.tf32 ? "on" : "off");
 
+  Tensor predictions;
+  Tensor loss_grad;
+  Tensor input_grad;
   for (int epoch = 0; epoch < cfg.epochs; ++epoch) {
-    auto params = model.Parameters();
     DLCUDA_RETURN_IF_ERROR(optimizer.ZeroGrad(ctx, params));
 
-    Tensor predictions;
     DLCUDA_RETURN_IF_ERROR(model.Forward(ctx, x, &predictions));
-
-    Tensor loss_grad;
-    auto loss = BinaryCrossEntropy(ctx, y, predictions, &loss_grad);
-    if (!loss.ok()) {
-      return loss.status();
+    bool should_log = (epoch % cfg.print_every) == 0;
+    float loss_value = 0.0f;
+    if (should_log) {
+      auto loss = BinaryCrossEntropyLoss(ctx, y, predictions);
+      if (!loss.ok()) {
+        return loss.status();
+      }
+      loss_value = loss.value();
     }
 
-    Tensor input_grad;
+    DLCUDA_RETURN_IF_ERROR(BinaryCrossEntropyBackward(ctx, y, predictions, &loss_grad));
     DLCUDA_RETURN_IF_ERROR(model.Backward(ctx, loss_grad, &input_grad));
 
-    auto grad_norm = ClipGradNorm(ctx, params, cfg.grad_clip);
-    if (!grad_norm.ok()) {
-      return grad_norm.status();
-    }
-
+    float grad_norm = 0.0f;
+    DLCUDA_RETURN_IF_ERROR(
+        ClipGradNorm(ctx, params, cfg.grad_clip, should_log ? &grad_norm : nullptr));
     DLCUDA_RETURN_IF_ERROR(optimizer.Step(ctx, params, cfg.lr));
 
-    if (epoch % cfg.print_every == 0) {
+    if (should_log) {
       std::printf("Epoch %4d | BCE: %.6f | GradNorm: %.4f\n", epoch,
-                  loss.value(), grad_norm.value());
+                  loss_value, grad_norm);
     }
   }
 
@@ -357,11 +356,7 @@ Status TrainXor(const TrainXorConfig &cfg) {
   DLCUDA_RETURN_IF_ERROR(
       final_predictions.CopyToHost(host_pred.data(), host_pred.size() * sizeof(float),
                                    ctx.stream()));
-  cudaError_t sync_status = cudaStreamSynchronize(ctx.stream());
-  if (sync_status != cudaSuccess) {
-    return Status::RuntimeError(std::string("cudaStreamSynchronize failed: ") +
-                                cudaGetErrorString(sync_status));
-  }
+  DLCUDA_RETURN_IF_ERROR(ctx.Synchronize());
 
   std::printf("Final predictions:\n");
   std::printf("  [0, 0] -> %.4f (expected 0)\n", host_pred[0]);
@@ -373,8 +368,7 @@ Status TrainXor(const TrainXorConfig &cfg) {
     CheckpointMetadata metadata;
     metadata.model_name = "xor-mlp-v2";
     metadata.format_version = 2;
-    DLCUDA_RETURN_IF_ERROR(
-        SaveCheckpoint(ctx, cfg.checkpoint_path, metadata, model.Parameters()));
+    DLCUDA_RETURN_IF_ERROR(SaveCheckpoint(ctx, cfg.checkpoint_path, metadata, params));
     std::printf("Saved checkpoint: %s\n", cfg.checkpoint_path.c_str());
   }
 
@@ -400,6 +394,7 @@ Status TrainChar(const TrainCharConfig &cfg) {
 
   Sequential model;
   DLCUDA_RETURN_IF_ERROR(BuildCharModel(&model, ctx, vocab.size(), cfg.d_model));
+  const auto &params = model.parameters();
 
   AdamOptimizer optimizer;
 
@@ -416,8 +411,8 @@ Status TrainChar(const TrainCharConfig &cfg) {
   Tensor target_ids = target_ids_result.value();
 
   if (cfg.resume) {
-    Status load_status = LoadCheckpoint(ctx, cfg.checkpoint_path,
-                                        "char-embed-softmax-v2", model.Parameters());
+    Status load_status =
+        LoadCheckpoint(ctx, cfg.checkpoint_path, "char-embed-softmax-v2", params);
     if (!load_status.ok()) {
       return Status::RuntimeError("Failed to resume char checkpoint: " +
                                   load_status.message());
@@ -437,6 +432,9 @@ Status TrainChar(const TrainCharConfig &cfg) {
   std::vector<int32_t> host_target(static_cast<size_t>(cfg.seq_len));
 
   int max_offset = static_cast<int>(corpus.size()) - cfg.seq_len - 1;
+  Tensor probs;
+  Tensor loss_grad;
+  Tensor input_grad;
 
   for (int epoch = 0; epoch < cfg.epochs; ++epoch) {
     int offset = static_cast<int>(offset_rng() % static_cast<uint32_t>(max_offset + 1));
@@ -455,42 +453,39 @@ Status TrainChar(const TrainCharConfig &cfg) {
                                 host_target.size() * sizeof(int32_t),
                                 ctx.stream()));
 
-    auto params = model.Parameters();
     DLCUDA_RETURN_IF_ERROR(optimizer.ZeroGrad(ctx, params));
 
-    Tensor probs;
     DLCUDA_RETURN_IF_ERROR(model.Forward(ctx, input_ids, &probs));
-
-    Tensor loss_grad;
-    auto metrics = CategoricalCrossEntropyFromIds(ctx, target_ids, probs, &loss_grad);
-    if (!metrics.ok()) {
-      return metrics.status();
+    bool should_log = (epoch % cfg.print_every) == 0;
+    ClassificationMetrics metrics;
+    if (should_log) {
+      auto metrics_result =
+          CategoricalCrossEntropyMetricsFromIds(ctx, target_ids, probs);
+      if (!metrics_result.ok()) {
+        return metrics_result.status();
+      }
+      metrics = metrics_result.value();
     }
 
-    Tensor input_grad;
+    DLCUDA_RETURN_IF_ERROR(
+        CategoricalCrossEntropyBackwardFromIds(ctx, target_ids, probs, &loss_grad));
     DLCUDA_RETURN_IF_ERROR(model.Backward(ctx, loss_grad, &input_grad));
 
-    auto grad_norm = ClipGradNorm(ctx, params, cfg.grad_clip);
-    if (!grad_norm.ok()) {
-      return grad_norm.status();
-    }
-
+    float grad_norm = 0.0f;
+    DLCUDA_RETURN_IF_ERROR(
+        ClipGradNorm(ctx, params, cfg.grad_clip, should_log ? &grad_norm : nullptr));
     DLCUDA_RETURN_IF_ERROR(optimizer.Step(ctx, params, cfg.lr));
 
-    if (epoch % cfg.print_every == 0) {
-      float ppl = std::exp(metrics.value().loss);
-      float acc = metrics.value().accuracy * 100.0f;
+    if (should_log) {
+      float ppl = std::exp(metrics.loss);
+      float acc = metrics.accuracy * 100.0f;
       std::printf("Epoch %4d | Loss: %.4f | PPL: %7.2f | Acc: %5.1f%% | "
                   "GradNorm: %.4f\n",
-                  epoch, metrics.value().loss, ppl, acc, grad_norm.value());
+                  epoch, metrics.loss, ppl, acc, grad_norm);
     }
   }
 
-  cudaError_t sync_status = cudaStreamSynchronize(ctx.stream());
-  if (sync_status != cudaSuccess) {
-    return Status::RuntimeError(std::string("cudaStreamSynchronize failed: ") +
-                                cudaGetErrorString(sync_status));
-  }
+  DLCUDA_RETURN_IF_ERROR(ctx.Synchronize());
 
   auto train_end = std::chrono::steady_clock::now();
   if (cfg.epochs > 0) {
@@ -507,8 +502,7 @@ Status TrainChar(const TrainCharConfig &cfg) {
     CheckpointMetadata metadata;
     metadata.model_name = "char-embed-softmax-v2";
     metadata.format_version = 2;
-    DLCUDA_RETURN_IF_ERROR(
-        SaveCheckpoint(ctx, cfg.checkpoint_path, metadata, model.Parameters()));
+    DLCUDA_RETURN_IF_ERROR(SaveCheckpoint(ctx, cfg.checkpoint_path, metadata, params));
     std::printf("Saved checkpoint: %s\n", cfg.checkpoint_path.c_str());
   }
 
@@ -538,7 +532,8 @@ Result<std::string> SampleChar(const SampleCharConfig &cfg) {
   Sequential model;
   DLCUDA_RETURN_IF_ERROR(BuildCharModel(&model, ctx, vocab.size(), cfg.d_model));
   DLCUDA_RETURN_IF_ERROR(LoadCheckpoint(ctx, cfg.checkpoint_path,
-                                        "char-embed-softmax-v2", model.Parameters()));
+                                        "char-embed-softmax-v2",
+                                        model.parameters()));
 
   return GenerateText(ctx, model, vocab, cfg.seq_len, cfg.gen_len,
                       cfg.temperature, cfg.top_p, cfg.sample_seed);

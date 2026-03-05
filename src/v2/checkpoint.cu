@@ -64,12 +64,7 @@ Status CopyDeviceToHost(RuntimeContext &ctx, const Tensor &src,
     return Status::RuntimeError(std::string("cudaMemcpyAsync D2H failed: ") +
                                 cudaGetErrorString(err));
   }
-  err = cudaStreamSynchronize(ctx.stream());
-  if (err != cudaSuccess) {
-    return Status::RuntimeError(std::string("cudaStreamSynchronize failed: ") +
-                                cudaGetErrorString(err));
-  }
-  return Status::Ok();
+  return ctx.Synchronize();
 }
 
 Status CopyHostToDevice(RuntimeContext &ctx, const std::vector<char> &src,
@@ -86,12 +81,7 @@ Status CopyHostToDevice(RuntimeContext &ctx, const std::vector<char> &src,
     return Status::RuntimeError(std::string("cudaMemcpyAsync H2D failed: ") +
                                 cudaGetErrorString(err));
   }
-  err = cudaStreamSynchronize(ctx.stream());
-  if (err != cudaSuccess) {
-    return Status::RuntimeError(std::string("cudaStreamSynchronize failed: ") +
-                                cudaGetErrorString(err));
-  }
-  return Status::Ok();
+  return ctx.Synchronize();
 }
 
 } // namespace

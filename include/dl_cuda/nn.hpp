@@ -26,7 +26,8 @@ public:
                          Tensor *output) = 0;
   virtual Status Backward(RuntimeContext &ctx, const Tensor &grad_output,
                           Tensor *grad_input) = 0;
-  virtual std::vector<ParameterRef> Parameters() = 0;
+  virtual void AppendParameters(const std::string &prefix,
+                                std::vector<ParameterRef> *out) = 0;
   virtual std::string Name() const = 0;
 };
 
@@ -41,13 +42,18 @@ public:
   Status Backward(RuntimeContext &ctx, const Tensor &grad_output,
                   Tensor *grad_input) override;
 
-  std::vector<ParameterRef> Parameters() override;
+  void AppendParameters(const std::string &prefix,
+                        std::vector<ParameterRef> *out) override;
   std::string Name() const override { return "Sequential"; }
 
   size_t size() const { return modules_.size(); }
+  const std::vector<ParameterRef> &parameters() const { return parameter_cache_; }
 
 private:
+  void RebuildParameterCache();
+
   std::vector<std::unique_ptr<Module>> modules_;
+  std::vector<ParameterRef> parameter_cache_;
 };
 
 class Linear : public Module {
@@ -59,7 +65,8 @@ public:
   Status Backward(RuntimeContext &ctx, const Tensor &grad_output,
                   Tensor *grad_input) override;
 
-  std::vector<ParameterRef> Parameters() override;
+  void AppendParameters(const std::string &prefix,
+                        std::vector<ParameterRef> *out) override;
   std::string Name() const override { return "Linear"; }
 
 private:
@@ -72,6 +79,8 @@ private:
   Tensor grad_weight_;
   Tensor grad_bias_;
   Tensor cached_input_;
+  Tensor forward_output_;
+  Tensor backward_output_;
 };
 
 class ReLU : public Module {
@@ -83,11 +92,14 @@ public:
   Status Backward(RuntimeContext &ctx, const Tensor &grad_output,
                   Tensor *grad_input) override;
 
-  std::vector<ParameterRef> Parameters() override { return {}; }
+  void AppendParameters(const std::string &prefix,
+                        std::vector<ParameterRef> *out) override;
   std::string Name() const override { return "ReLU"; }
 
 private:
   Tensor cached_input_;
+  Tensor forward_output_;
+  Tensor backward_output_;
 };
 
 class Sigmoid : public Module {
@@ -99,11 +111,13 @@ public:
   Status Backward(RuntimeContext &ctx, const Tensor &grad_output,
                   Tensor *grad_input) override;
 
-  std::vector<ParameterRef> Parameters() override { return {}; }
+  void AppendParameters(const std::string &prefix,
+                        std::vector<ParameterRef> *out) override;
   std::string Name() const override { return "Sigmoid"; }
 
 private:
   Tensor cached_output_;
+  Tensor backward_output_;
 };
 
 class Softmax : public Module {
@@ -115,13 +129,15 @@ public:
   Status Backward(RuntimeContext &ctx, const Tensor &grad_output,
                   Tensor *grad_input) override;
 
-  std::vector<ParameterRef> Parameters() override { return {}; }
+  void AppendParameters(const std::string &prefix,
+                        std::vector<ParameterRef> *out) override;
   std::string Name() const override { return "Softmax"; }
 
 private:
   int64_t num_rows_ = 0;
   int64_t row_width_ = 0;
   Tensor cached_output_;
+  Tensor backward_output_;
 };
 
 class Embedding : public Module {
@@ -133,7 +149,8 @@ public:
   Status Backward(RuntimeContext &ctx, const Tensor &grad_output,
                   Tensor *grad_input) override;
 
-  std::vector<ParameterRef> Parameters() override;
+  void AppendParameters(const std::string &prefix,
+                        std::vector<ParameterRef> *out) override;
   std::string Name() const override { return "Embedding"; }
 
 private:
@@ -144,6 +161,7 @@ private:
   Tensor table_;
   Tensor grad_table_;
   Tensor cached_token_ids_;
+  Tensor forward_output_;
 };
 
 } // namespace dlcuda

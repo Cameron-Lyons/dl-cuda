@@ -217,6 +217,24 @@ inline Result<Tensor> CloneLike(const Tensor &src) {
   return out;
 }
 
+inline Status EnsureTensor(Tensor *tensor, const std::vector<int64_t> &shape,
+                           DType dtype,
+                           DeviceType device = DeviceType::kCuda) {
+  if (tensor == nullptr) {
+    return Status::InvalidArgument("EnsureTensor received null tensor");
+  }
+  if (tensor->defined() && tensor->shape() == shape && tensor->dtype() == dtype &&
+      tensor->device() == device) {
+    return Status::Ok();
+  }
+  auto allocated = Tensor::Allocate(shape, dtype, device);
+  if (!allocated.ok()) {
+    return allocated.status();
+  }
+  *tensor = allocated.value();
+  return Status::Ok();
+}
+
 inline std::string ShapeString(const Tensor &tensor) {
   std::string out = "[";
   for (size_t i = 0; i < tensor.shape().size(); ++i) {

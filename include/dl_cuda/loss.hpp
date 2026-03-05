@@ -11,13 +11,20 @@ struct ClassificationMetrics {
   float accuracy = 0.0f;
 };
 
-Result<float> BinaryCrossEntropy(RuntimeContext &ctx, const Tensor &targets,
-                                 const Tensor &predictions,
-                                 Tensor *prediction_grads);
+Status BinaryCrossEntropyBackward(RuntimeContext &ctx, const Tensor &targets,
+                                  const Tensor &predictions,
+                                  Tensor *prediction_grads);
+
+Result<float> BinaryCrossEntropyLoss(RuntimeContext &ctx, const Tensor &targets,
+                                     const Tensor &predictions);
+
+Status CategoricalCrossEntropyBackwardFromIds(RuntimeContext &ctx,
+                                              const Tensor &target_ids,
+                                              const Tensor &probabilities,
+                                              Tensor *probability_grads);
 
 Result<ClassificationMetrics>
-CategoricalCrossEntropyFromIds(RuntimeContext &ctx, const Tensor &target_ids,
-                               const Tensor &probabilities,
-                               Tensor *probability_grads);
+CategoricalCrossEntropyMetricsFromIds(RuntimeContext &ctx, const Tensor &target_ids,
+                                      const Tensor &probabilities);
 
 } // namespace dlcuda

@@ -72,9 +72,13 @@ __global__ void AccumulateNormSqKernel(const float *grads, int64_t n,
   }
 }
 
-__global__ void ScaleKernel(float *data, float scale, int64_t n) {
+__global__ void ScaleByGlobalNormKernel(float *data, const float *total_norm_sq,
+                                        float max_norm, int64_t n) {
   int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (idx < n) {
+    float total_norm = sqrtf(total_norm_sq[0]);
+    float scale =
+        total_norm > max_norm ? max_norm / (total_norm + 1e-6f) : 1.0f;
     data[idx] *= scale;
   }
 }
@@ -204,35 +208,27 @@ Status AdamOptimizer::Step(RuntimeContext &ctx,
   return Status::Ok();
 }
 
-Result<float> ClipGradNorm(RuntimeContext &ctx,
-                           const std::vector<ParameterRef> &params,
-                           float max_norm) {
+Status ClipGradNorm(RuntimeContext &ctx, const std::vector<ParameterRef> &params,
+                    float max_norm, float *total_norm) {
   if (!(max_norm > 0.0f)) {
     return Status::InvalidArgument("max_norm must be > 0");
   }
 
-  float *d_total_norm_sq = nullptr;
-  cudaError_t alloc_status = cudaMalloc(&d_total_norm_sq, sizeof(float));
-  if (alloc_status != cudaSuccess) {
-    return Status::RuntimeError(std::string("cudaMalloc failed in ClipGradNorm: ") +
-                                cudaGetErrorString(alloc_status));
+  auto total_norm_sq_tensor =
+      ctx.ScratchTensor("optim.clip_grad_norm.total_norm_sq", {1},
+                        DType::kFloat32);
+  if (!total_norm_sq_tensor.ok()) {
+    return total_norm_sq_tensor.status();
   }
-  cudaError_t memset_status =
-      cudaMemsetAsync(d_total_norm_sq, 0, sizeof(float), ctx.stream());
-  if (memset_status != cudaSuccess) {
-    cudaFree(d_total_norm_sq);
-    return Status::RuntimeError(std::string("cudaMemsetAsync failed in ClipGradNorm: ") +
-                                cudaGetErrorString(memset_status));
-  }
+  Tensor total_norm_sq_buffer = total_norm_sq_tensor.value();
+  DLCUDA_RETURN_IF_ERROR(total_norm_sq_buffer.FillZero(ctx.stream()));
 
   for (const auto &param : params) {
     if (param.grad == nullptr || !param.grad->defined()) {
-      cudaFree(d_total_norm_sq);
       return Status::InvalidArgument("ClipGradNorm: undefined grad tensor for " +
                                      param.name);
     }
     if (param.grad->dtype() != DType::kFloat32) {
-      cudaFree(d_total_norm_sq);
       return Status::InvalidArgument("ClipGradNorm only supports float32 grads");
     }
     int64_t n = param.grad->numel();
@@ -241,50 +237,38 @@ Result<float> ClipGradNorm(RuntimeContext &ctx,
       continue;
     }
     AccumulateNormSqKernel<<<blocks, 256, 0, ctx.stream()>>>(
-        param.grad->data_as<float>(), n, d_total_norm_sq);
+        param.grad->data_as<float>(), n, total_norm_sq_buffer.data_as<float>());
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
-      cudaFree(d_total_norm_sq);
       return Status::RuntimeError(std::string("AccumulateNormSqKernel failed: ") +
                                   cudaGetErrorString(err));
     }
   }
 
-  float total_norm_sq = 0.0f;
-  cudaError_t copy_status = cudaMemcpyAsync(&total_norm_sq, d_total_norm_sq,
-                                            sizeof(float), cudaMemcpyDeviceToHost,
-                                            ctx.stream());
-  if (copy_status != cudaSuccess) {
-    cudaFree(d_total_norm_sq);
-    return Status::RuntimeError(std::string("cudaMemcpyAsync failed in ClipGradNorm: ") +
-                                cudaGetErrorString(copy_status));
-  }
-  cudaError_t sync_status = cudaStreamSynchronize(ctx.stream());
-  if (sync_status != cudaSuccess) {
-    cudaFree(d_total_norm_sq);
-    return Status::RuntimeError(std::string("cudaStreamSynchronize failed: ") +
-                                cudaGetErrorString(sync_status));
-  }
-
-  cudaFree(d_total_norm_sq);
-
-  float total_norm = std::sqrt(total_norm_sq);
-  if (total_norm > max_norm) {
-    float scale = max_norm / (total_norm + 1e-6f);
-    for (const auto &param : params) {
-      int blocks = static_cast<int>((param.grad->numel() + 255) / 256);
-      ScaleKernel<<<blocks, 256, 0, ctx.stream()>>>(param.grad->data_as<float>(),
-                                                     scale,
-                                                     param.grad->numel());
-      cudaError_t err = cudaGetLastError();
-      if (err != cudaSuccess) {
-        return Status::RuntimeError(std::string("ScaleKernel failed: ") +
-                                    cudaGetErrorString(err));
-      }
+  for (const auto &param : params) {
+    int blocks = static_cast<int>((param.grad->numel() + 255) / 256);
+    if (blocks <= 0) {
+      continue;
+    }
+    ScaleByGlobalNormKernel<<<blocks, 256, 0, ctx.stream()>>>(
+        param.grad->data_as<float>(), total_norm_sq_buffer.data_as<float>(),
+        max_norm, param.grad->numel());
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+      return Status::RuntimeError(std::string("ScaleByGlobalNormKernel failed: ") +
+                                  cudaGetErrorString(err));
     }
   }
 
-  return total_norm;
+  if (total_norm != nullptr) {
+    float total_norm_sq = 0.0f;
+    DLCUDA_RETURN_IF_ERROR(total_norm_sq_buffer.CopyToHost(
+        &total_norm_sq, sizeof(total_norm_sq), ctx.stream()));
+    DLCUDA_RETURN_IF_ERROR(ctx.Synchronize());
+    *total_norm = std::sqrt(total_norm_sq);
+  }
+
+  return Status::Ok();
 }
 
 } // namespace dlcuda

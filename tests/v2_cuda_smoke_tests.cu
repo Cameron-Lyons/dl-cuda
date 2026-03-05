@@ -1,0 +1,115 @@
+#include "dl_cuda.hpp"
+
+#include <cuda_runtime.h>
+
+#include <cstdio>
+#include <vector>
+
+namespace {
+
+bool HasCudaDevice() {
+  int count = 0;
+  cudaError_t status = cudaGetDeviceCount(&count);
+  return status == cudaSuccess && count > 0;
+}
+
+} // namespace
+
+int main() {
+  if (!HasCudaDevice()) {
+    std::printf("v2_cuda_smoke_tests: SKIP (no CUDA device)\n");
+    return 0;
+  }
+
+  dlcuda::RuntimeContext ctx;
+  dlcuda::Status init = ctx.Initialize();
+  if (!init.ok()) {
+    std::fprintf(stderr, "Runtime initialization failed: %s\n",
+                 init.message().c_str());
+    return 1;
+  }
+
+  dlcuda::Sequential model;
+  if (!model.Add(std::make_unique<dlcuda::Linear>(2, 4, ctx)).ok() ||
+      !model.Add(std::make_unique<dlcuda::ReLU>()).ok() ||
+      !model.Add(std::make_unique<dlcuda::Linear>(4, 1, ctx)).ok() ||
+      !model.Add(std::make_unique<dlcuda::Sigmoid>()).ok()) {
+    std::fprintf(stderr, "Failed to build smoke-test model\n");
+    return 1;
+  }
+
+  const auto &params = model.parameters();
+  if (params.size() != 4 || params[0].name != "layers.0.weight" ||
+      params[3].name != "layers.2.bias") {
+    std::fprintf(stderr, "Unexpected parameter cache contents\n");
+    return 1;
+  }
+
+  auto x_result = dlcuda::Tensor::Allocate({4, 2}, dlcuda::DType::kFloat32);
+  auto y_result = dlcuda::Tensor::Allocate({4, 1}, dlcuda::DType::kFloat32);
+  if (!x_result.ok() || !y_result.ok()) {
+    std::fprintf(stderr, "Tensor allocation failed\n");
+    return 1;
+  }
+
+  dlcuda::Tensor x = x_result.value();
+  dlcuda::Tensor y = y_result.value();
+  std::vector<float> host_x = {
+      0.0f, 0.0f,
+      0.0f, 1.0f,
+      1.0f, 0.0f,
+      1.0f, 1.0f,
+  };
+  std::vector<float> host_y = {0.0f, 1.0f, 1.0f, 0.0f};
+  if (!x.CopyFromHost(host_x.data(), host_x.size() * sizeof(float), ctx.stream()).ok() ||
+      !y.CopyFromHost(host_y.data(), host_y.size() * sizeof(float), ctx.stream()).ok()) {
+    std::fprintf(stderr, "Host-to-device copy failed\n");
+    return 1;
+  }
+
+  dlcuda::Tensor predictions;
+  dlcuda::Status forward = model.Forward(ctx, x, &predictions);
+  if (!forward.ok()) {
+    std::fprintf(stderr, "Forward failed: %s\n", forward.message().c_str());
+    return 1;
+  }
+
+  auto loss = dlcuda::BinaryCrossEntropyLoss(ctx, y, predictions);
+  if (!loss.ok()) {
+    std::fprintf(stderr, "Loss failed: %s\n", loss.status().message().c_str());
+    return 1;
+  }
+
+  dlcuda::Tensor loss_grad;
+  dlcuda::Status loss_backward =
+      dlcuda::BinaryCrossEntropyBackward(ctx, y, predictions, &loss_grad);
+  if (!loss_backward.ok()) {
+    std::fprintf(stderr, "Loss backward failed: %s\n",
+                 loss_backward.message().c_str());
+    return 1;
+  }
+
+  dlcuda::Tensor input_grad;
+  dlcuda::Status backward = model.Backward(ctx, loss_grad, &input_grad);
+  if (!backward.ok()) {
+    std::fprintf(stderr, "Backward failed: %s\n", backward.message().c_str());
+    return 1;
+  }
+
+  float grad_norm = 0.0f;
+  dlcuda::Status clip_status =
+      dlcuda::ClipGradNorm(ctx, params, 1.0f, &grad_norm);
+  if (!clip_status.ok() || !(grad_norm >= 0.0f)) {
+    std::fprintf(stderr, "ClipGradNorm failed\n");
+    return 1;
+  }
+
+  if (predictions.rank() != 2 || predictions.dim(0) != 4 || predictions.dim(1) != 1 ||
+      input_grad.rank() != 2 || input_grad.dim(0) != 4 || input_grad.dim(1) != 2) {
+    std::fprintf(stderr, "Unexpected tensor shapes from forward/backward\n");
+    return 1;
+  }
+
+  std::printf("v2_cuda_smoke_tests: PASS\n");
+  return 0;
+}
