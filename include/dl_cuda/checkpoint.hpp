@@ -15,8 +15,7 @@ struct CheckpointMetadata {
 };
 
 Status SaveCheckpoint(RuntimeContext &ctx, const std::string &path,
-                      const CheckpointMetadata &metadata,
-                      const std::vector<ParameterRef> &params);
+                      const CheckpointMetadata &metadata, const std::vector<ParameterRef> &params);
 
 Status LoadCheckpoint(RuntimeContext &ctx, const std::string &path,
                       const std::string &expected_model_name,

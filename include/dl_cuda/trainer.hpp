@@ -14,7 +14,7 @@ struct TrainStepStats {
   float learning_rate = 0.0f;
 };
 
-Status ClipGradNorm(RuntimeContext &ctx, const std::vector<ParameterRef> &params,
-                    float max_norm, float *total_norm = nullptr);
+Status ClipGradNorm(RuntimeContext &ctx, const std::vector<ParameterRef> &params, float max_norm,
+                    float *total_norm = nullptr);
 
 } // namespace dlcuda

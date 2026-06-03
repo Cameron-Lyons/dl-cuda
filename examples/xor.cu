@@ -1,58 +1,27 @@
-#include "../include/dl_cuda/examples.hpp"
-#include "cli_parse_utils.hpp"
+#include "example_cli_options.hpp"
+
 #include <cstdio>
-#include <cstdlib>
-#include <string>
+
+namespace {
+
+void PrintUsage() {
+  example_cli::PrintCommandUsage("dl-cuda-xor", example_cli::TrainXorOptions());
+}
+
+} // namespace
 
 int main(int argc, char **argv) {
-  dlcuda::XorConfig cfg;
-
-  auto print_usage = []() {
-    std::puts("Usage: dl-cuda-xor [options]");
-    std::puts("  --epochs N");
-    std::puts("  --print-every N");
-    std::puts("  --lr F");
-    std::puts("  --seed N");
-    std::puts("  --no-cublas-linear");
-    std::puts("  --no-tf32");
-    std::puts("  --help");
-  };
-
-  for (int i = 1; i < argc; i++) {
-    std::string arg = argv[i];
-    if (arg == "--epochs") {
-      if (i + 1 >= argc)
-        return cli_parse::invalid_value("--epochs", nullptr, print_usage);
-      if (!cli_parse::parse_int(argv[++i], &cfg.epochs) || cfg.epochs < 0)
-        return cli_parse::invalid_value("--epochs", argv[i], print_usage);
-    } else if (arg == "--print-every") {
-      if (i + 1 >= argc)
-        return cli_parse::invalid_value("--print-every", nullptr, print_usage);
-      if (!cli_parse::parse_int(argv[++i], &cfg.print_every) || cfg.print_every <= 0)
-        return cli_parse::invalid_value("--print-every", argv[i], print_usage);
-    } else if (arg == "--lr") {
-      if (i + 1 >= argc)
-        return cli_parse::invalid_value("--lr", nullptr, print_usage);
-      if (!cli_parse::parse_float(argv[++i], &cfg.lr) || cfg.lr <= 0.0f)
-        return cli_parse::invalid_value("--lr", argv[i], print_usage);
-    } else if (arg == "--seed") {
-      if (i + 1 >= argc)
-        return cli_parse::invalid_value("--seed", nullptr, print_usage);
-      if (!cli_parse::parse_u64(argv[++i], &cfg.init_seed))
-        return cli_parse::invalid_value("--seed", argv[i], print_usage);
-    } else if (arg == "--no-cublas-linear") {
-      cfg.enable_cublas_linear = false;
-    } else if (arg == "--no-tf32") {
-      cfg.enable_tf32 = false;
-    } else if (arg == "--help") {
-      print_usage();
-      return 0;
-    } else {
-      std::fprintf(stderr, "Unknown option: %s\n", arg.c_str());
-      print_usage();
-      return 1;
-    }
+  dlcuda::TrainXorConfig cfg;
+  int setup_status =
+      cli_parse::configure_command(argc, argv, 1, example_cli::TrainXorOptions(), &cfg, PrintUsage);
+  if (setup_status >= 0) {
+    return setup_status;
   }
 
-  return dlcuda::run_xor(cfg);
+  dlcuda::Status status = dlcuda::TrainXor(cfg);
+  if (!status.ok()) {
+    std::fprintf(stderr, "train-xor failed: %s\n", status.ToString().c_str());
+    return 1;
+  }
+  return 0;
 }
