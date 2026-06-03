@@ -1,13 +1,14 @@
 #pragma once
 
+#include "dl_cuda/detail/cuda_utils.hpp"
 #include "dl_cuda/status.hpp"
 
 #include <cuda_runtime.h>
 
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory>
-#include <numeric>
 #include <string>
 #include <vector>
 
@@ -22,7 +23,7 @@ enum class DeviceType {
   kCuda = 0,
 };
 
-inline size_t DTypeSize(DType dtype) {
+[[nodiscard]] inline size_t DTypeSize(DType dtype) {
   switch (dtype) {
   case DType::kFloat32:
     return sizeof(float);
@@ -32,7 +33,7 @@ inline size_t DTypeSize(DType dtype) {
   return 0;
 }
 
-inline const char *DTypeName(DType dtype) {
+[[nodiscard]] inline const char *DTypeName(DType dtype) {
   switch (dtype) {
   case DType::kFloat32:
     return "float32";
@@ -42,79 +43,101 @@ inline const char *DTypeName(DType dtype) {
   return "unknown";
 }
 
+[[nodiscard]] inline Result<int64_t> ShapeNumel(const std::vector<int64_t> &shape) {
+  int64_t numel = 1;
+  for (int64_t dim : shape) {
+    if (dim < 0) {
+      return Status::InvalidArgument("Tensor shape must be non-negative");
+    }
+    if (dim != 0 && numel > std::numeric_limits<int64_t>::max() / dim) {
+      return Status::InvalidArgument("Tensor shape element count overflow");
+    }
+    numel *= dim;
+  }
+  return numel;
+}
+
 class Tensor {
 public:
   Tensor() = default;
 
-  static Result<Tensor> Allocate(const std::vector<int64_t> &shape,
-                                 DType dtype,
+  static Result<Tensor> Allocate(const std::vector<int64_t> &shape, DType dtype,
                                  DeviceType device = DeviceType::kCuda) {
     if (device != DeviceType::kCuda) {
       return Status::Unsupported("Only CUDA tensors are supported");
     }
-    for (int64_t dim : shape) {
-      if (dim < 0) {
-        return Status::InvalidArgument("Tensor shape must be non-negative");
-      }
+    size_t dtype_size = DTypeSize(dtype);
+    if (dtype_size == 0) {
+      return Status::InvalidArgument("Unsupported tensor dtype");
     }
 
-    int64_t numel = 1;
-    for (int64_t dim : shape) {
-      numel *= dim;
+    auto numel_result = ShapeNumel(shape);
+    if (!numel_result.ok()) {
+      return numel_result.status();
     }
-    size_t bytes = static_cast<size_t>(numel) * DTypeSize(dtype);
+    int64_t numel = numel_result.value();
+    if (static_cast<uint64_t>(numel) > std::numeric_limits<size_t>::max() / dtype_size) {
+      return Status::InvalidArgument("Tensor byte size overflow");
+    }
+    size_t bytes = static_cast<size_t>(numel) * dtype_size;
 
     void *ptr = nullptr;
     if (bytes > 0) {
       cudaError_t err = cudaMalloc(&ptr, bytes);
-      if (err != cudaSuccess) {
-        return Status::RuntimeError(std::string("cudaMalloc failed: ") +
-                                    cudaGetErrorString(err));
-      }
+      DLCUDA_RETURN_IF_ERROR(detail::CudaStatus(err, "cudaMalloc"));
     }
 
     Tensor out;
     out.storage_ = std::make_shared<Storage>(ptr, bytes, device);
     out.shape_ = shape;
+    out.numel_ = numel;
     out.dtype_ = dtype;
     return out;
   }
 
-  bool defined() const { return storage_ != nullptr; }
+  [[nodiscard]] bool defined() const {
+    return storage_ != nullptr;
+  }
 
-  void *data() const { return storage_ ? storage_->ptr : nullptr; }
+  [[nodiscard]] void *data() const {
+    return storage_ ? storage_->ptr : nullptr;
+  }
 
-  template <typename T> T *data_as() const {
+  template <typename T> [[nodiscard]] T *data_as() const {
     return reinterpret_cast<T *>(data());
   }
 
-  const std::vector<int64_t> &shape() const { return shape_; }
-
-  int64_t rank() const { return static_cast<int64_t>(shape_.size()); }
-
-  int64_t dim(int index) const { return shape_.at(static_cast<size_t>(index)); }
-
-  int64_t numel() const {
-    if (shape_.empty()) {
-      return 1;
-    }
-    int64_t out = 1;
-    for (int64_t dim : shape_) {
-      out *= dim;
-    }
-    return out;
+  [[nodiscard]] const std::vector<int64_t> &shape() const {
+    return shape_;
   }
 
-  size_t bytes() const {
+  [[nodiscard]] int64_t rank() const {
+    return static_cast<int64_t>(shape_.size());
+  }
+
+  [[nodiscard]] int64_t dim(int index) const {
+    return shape_.at(static_cast<size_t>(index));
+  }
+
+  [[nodiscard]] int64_t numel() const {
+    if (!defined()) {
+      return 0;
+    }
+    return numel_;
+  }
+
+  [[nodiscard]] size_t bytes() const {
     if (!defined()) {
       return 0;
     }
     return storage_->bytes;
   }
 
-  DType dtype() const { return dtype_; }
+  [[nodiscard]] DType dtype() const {
+    return dtype_;
+  }
 
-  DeviceType device() const {
+  [[nodiscard]] DeviceType device() const {
     return storage_ ? storage_->device : DeviceType::kCuda;
   }
 
@@ -126,16 +149,15 @@ public:
       return Status::Ok();
     }
     cudaError_t err = cudaMemsetAsync(data(), 0, bytes(), stream);
-    if (err != cudaSuccess) {
-      return Status::RuntimeError(std::string("cudaMemsetAsync failed: ") +
-                                  cudaGetErrorString(err));
-    }
-    return Status::Ok();
+    return detail::CudaStatus(err, "cudaMemsetAsync");
   }
 
   Status CopyFromHost(const void *src, size_t bytes, cudaStream_t stream = 0) {
     if (!defined()) {
       return Status::InvalidArgument("Tensor is undefined");
+    }
+    if (src == nullptr && bytes > 0) {
+      return Status::InvalidArgument("Host copy source is null");
     }
     if (bytes > this->bytes()) {
       return Status::InvalidArgument("Host copy exceeds tensor size");
@@ -144,16 +166,15 @@ public:
       return Status::Ok();
     }
     cudaError_t err = cudaMemcpyAsync(data(), src, bytes, cudaMemcpyHostToDevice, stream);
-    if (err != cudaSuccess) {
-      return Status::RuntimeError(std::string("cudaMemcpyAsync(H2D) failed: ") +
-                                  cudaGetErrorString(err));
-    }
-    return Status::Ok();
+    return detail::CudaStatus(err, "cudaMemcpyAsync(H2D)");
   }
 
   Status CopyToHost(void *dst, size_t bytes, cudaStream_t stream = 0) const {
     if (!defined()) {
       return Status::InvalidArgument("Tensor is undefined");
+    }
+    if (dst == nullptr && bytes > 0) {
+      return Status::InvalidArgument("Host copy destination is null");
     }
     if (bytes > this->bytes()) {
       return Status::InvalidArgument("Host copy exceeds tensor size");
@@ -162,11 +183,26 @@ public:
       return Status::Ok();
     }
     cudaError_t err = cudaMemcpyAsync(dst, data(), bytes, cudaMemcpyDeviceToHost, stream);
-    if (err != cudaSuccess) {
-      return Status::RuntimeError(std::string("cudaMemcpyAsync(D2H) failed: ") +
-                                  cudaGetErrorString(err));
+    return detail::CudaStatus(err, "cudaMemcpyAsync(D2H)");
+  }
+
+  Status CopyRangeToHost(void *dst, size_t offset_bytes, size_t bytes,
+                         cudaStream_t stream = 0) const {
+    if (!defined()) {
+      return Status::InvalidArgument("Tensor is undefined");
     }
-    return Status::Ok();
+    if (dst == nullptr && bytes > 0) {
+      return Status::InvalidArgument("Host copy destination is null");
+    }
+    if (offset_bytes > this->bytes() || bytes > this->bytes() - offset_bytes) {
+      return Status::InvalidArgument("Host range copy exceeds tensor size");
+    }
+    if (bytes == 0) {
+      return Status::Ok();
+    }
+    const char *src = static_cast<const char *>(data()) + offset_bytes;
+    cudaError_t err = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToHost, stream);
+    return detail::CudaStatus(err, "cudaMemcpyAsync(D2H range)");
   }
 
 private:
@@ -187,6 +223,7 @@ private:
 
   std::shared_ptr<Storage> storage_;
   std::vector<int64_t> shape_;
+  int64_t numel_ = 1;
   DType dtype_ = DType::kFloat32;
 };
 
@@ -200,16 +237,15 @@ inline Status CopyTensor(const Tensor &src, Tensor *dst, cudaStream_t stream = 0
   if (src.bytes() == 0) {
     return Status::Ok();
   }
-  cudaError_t err = cudaMemcpyAsync(dst->data(), src.data(), src.bytes(), cudaMemcpyDeviceToDevice,
-                                    stream);
-  if (err != cudaSuccess) {
-    return Status::RuntimeError(std::string("cudaMemcpyAsync(D2D) failed: ") +
-                                cudaGetErrorString(err));
-  }
-  return Status::Ok();
+  cudaError_t err =
+      cudaMemcpyAsync(dst->data(), src.data(), src.bytes(), cudaMemcpyDeviceToDevice, stream);
+  return detail::CudaStatus(err, "cudaMemcpyAsync(D2D)");
 }
 
 inline Result<Tensor> CloneLike(const Tensor &src) {
+  if (!src.defined()) {
+    return Status::InvalidArgument("CloneLike requires a defined source tensor");
+  }
   auto out = Tensor::Allocate(src.shape(), src.dtype(), src.device());
   if (!out.ok()) {
     return out;
@@ -217,8 +253,7 @@ inline Result<Tensor> CloneLike(const Tensor &src) {
   return out;
 }
 
-inline Status EnsureTensor(Tensor *tensor, const std::vector<int64_t> &shape,
-                           DType dtype,
+inline Status EnsureTensor(Tensor *tensor, const std::vector<int64_t> &shape, DType dtype,
                            DeviceType device = DeviceType::kCuda) {
   if (tensor == nullptr) {
     return Status::InvalidArgument("EnsureTensor received null tensor");
@@ -235,7 +270,7 @@ inline Status EnsureTensor(Tensor *tensor, const std::vector<int64_t> &shape,
   return Status::Ok();
 }
 
-inline std::string ShapeString(const Tensor &tensor) {
+[[nodiscard]] inline std::string ShapeString(const Tensor &tensor) {
   std::string out = "[";
   for (size_t i = 0; i < tensor.shape().size(); ++i) {
     if (i > 0) {

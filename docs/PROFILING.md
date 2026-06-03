@@ -1,6 +1,6 @@
 # Profiling
 
-This project includes a lightweight profiling script for the Char-LM example.
+This project includes a lightweight profiling script for the v2 Char-LM example.
 
 ## Prerequisites
 
@@ -19,17 +19,16 @@ The script writes an `.nsys-rep` report under `profiles/` and prints a CLI summa
 
 ## Current hotspot improvements already applied
 
-- Removed per-epoch one-hot target materialization in Char-LM training.
-- Replaced one-hot CE loss/backward with target-id CE kernels.
-- Reused `Sequential` forward/backward workspaces to avoid per-step allocations.
-- Reduced global `cudaDeviceSynchronize()` calls in the hot training path.
-- Added CUDA Graph replay for Char-LM forward+backward train step.
-- Switched hot-path host/device copies to async transfers with pinned host buffers.
-- Replaced major linear/Transformer GEMMs with cuBLAS calls (TF32 tensor-core
-  math enabled by default where available).
+- Trains categorical cross-entropy directly from logits, avoiding training-time softmax.
+- Uses block-per-row softmax/logits CE kernels for row reductions.
+- Pre-encodes the corpus once and fills training windows on device.
+- Updates generation context on device instead of copying the full context each step.
+- Reuses tensors and runtime scratch buffers across training steps.
+- Skips first-layer input-gradient work when callers only need parameter gradients.
+- Uses cuBLAS for linear layers with TF32 enabled by default where available.
 
 ## What to inspect first in Nsight
 
-- Kernel launch counts for CE/loss path.
-- Time in transformer attention and feed-forward kernels.
-- Memcpy activity between host and device in training loop.
+- Kernel launch counts for logits CE, optimizer, and linear layers.
+- cuBLAS GEMM time versus custom-kernel fallback time when `--no-cublas` is used.
+- Memcpy activity during generation and metric logging.

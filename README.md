@@ -44,6 +44,15 @@ ctest --test-dir build-host --output-on-failure
 ./build/dl-cuda sample-char --checkpoint char_v2.ckpt --gen-len 200
 ```
 
+Options may be passed as `--name value` or `--name=value`.
+
+Standalone wrappers are also built with CUDA enabled:
+
+```sh
+./build/dl-cuda-xor --epochs 3000 --lr 0.1
+./build/dl-cuda-char-lm --epochs 800 --print-every 50
+```
+
 Use config files (key=value) with any subcommand:
 
 ```sh
@@ -56,6 +65,7 @@ Config keys now match CLI option names without the leading `--`. Example:
 seq-len=64
 print-every=50
 use-cublas=false
+tf32=false
 save=false
 ```
 
@@ -101,6 +111,12 @@ v2 checkpoints store:
 - `v2_cli_tests`: host-only checks for the shared CLI/config parser
 - `v2_cuda_smoke_tests`: CUDA smoke test for the v2 forward/backward path
 - legacy v1 tests are opt-in with `-DDL_CUDA_BUILD_LEGACY_TESTS=ON`
+
+For a warnings-as-errors build on machines without `nvcc`, use:
+
+```sh
+./scripts/check_no_warnings_build.sh build-warnings host
+```
 
 ## License
 

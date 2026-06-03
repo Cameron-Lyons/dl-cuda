@@ -1,5 +1,6 @@
 #pragma once
 
+#include "dl_cuda/detail/cuda_utils.hpp"
 #include "dl_cuda/status.hpp"
 #include "dl_cuda/tensor.hpp"
 
@@ -48,44 +49,74 @@ public:
       return Status::Ok();
     }
     cublasStatus_t create_status = cublasCreate(&cublas_handle_);
-    if (create_status != CUBLAS_STATUS_SUCCESS) {
-      return Status::RuntimeError("cublasCreate failed");
-    }
+    DLCUDA_RETURN_IF_ERROR(detail::CublasStatus(create_status, "cublasCreate"));
     cublasStatus_t stream_status = cublasSetStream(cublas_handle_, options_.stream);
-    if (stream_status != CUBLAS_STATUS_SUCCESS) {
-      return Status::RuntimeError("cublasSetStream failed");
+    Status stream_result = detail::CublasStatus(stream_status, "cublasSetStream");
+    if (!stream_result.ok()) {
+      (void)ReleaseCublas();
+      return stream_result;
     }
-    return ApplyMathMode();
-  }
-
-  bool use_cublas() const { return options_.use_cublas; }
-
-  Status SetUseCuBLAS(bool enabled) {
-    options_.use_cublas = enabled;
-    if (enabled) {
-      return EnsureCublas();
+    Status math_result = ApplyMathMode();
+    if (!math_result.ok()) {
+      (void)ReleaseCublas();
+      return math_result;
     }
     return Status::Ok();
   }
 
-  bool tf32_enabled() const { return options_.tf32; }
+  [[nodiscard]] bool use_cublas() const {
+    return options_.use_cublas;
+  }
+
+  Status SetUseCuBLAS(bool enabled) {
+    bool previous = options_.use_cublas;
+    options_.use_cublas = enabled;
+    if (enabled) {
+      Status status = EnsureCublas();
+      if (!status.ok()) {
+        options_.use_cublas = previous;
+      }
+      return status;
+    }
+    Status status = ReleaseCublas();
+    if (!status.ok()) {
+      options_.use_cublas = previous;
+    }
+    return status;
+  }
+
+  [[nodiscard]] bool tf32_enabled() const {
+    return options_.tf32;
+  }
 
   Status SetTF32(bool enabled) {
+    bool previous = options_.tf32;
     options_.tf32 = enabled;
     if (!options_.use_cublas || cublas_handle_ == nullptr) {
       return Status::Ok();
     }
-    return ApplyMathMode();
+    Status status = ApplyMathMode();
+    if (!status.ok()) {
+      options_.tf32 = previous;
+      (void)ApplyMathMode();
+    }
+    return status;
   }
 
-  cudaStream_t stream() const { return options_.stream; }
+  [[nodiscard]] cudaStream_t stream() const {
+    return options_.stream;
+  }
 
   Status SetStream(cudaStream_t stream) {
+    cudaStream_t previous = options_.stream;
     options_.stream = stream;
     if (cublas_handle_ != nullptr) {
       cublasStatus_t stream_status = cublasSetStream(cublas_handle_, options_.stream);
-      if (stream_status != CUBLAS_STATUS_SUCCESS) {
-        return Status::RuntimeError("cublasSetStream failed");
+      Status status = detail::CublasStatus(stream_status, "cublasSetStream");
+      if (!status.ok()) {
+        options_.stream = previous;
+        (void)cublasSetStream(cublas_handle_, previous);
+        return status;
       }
     }
     return Status::Ok();
@@ -93,25 +124,24 @@ public:
 
   Status Synchronize() {
     cudaError_t status = cudaStreamSynchronize(options_.stream);
-    if (status != cudaSuccess) {
-      return Status::RuntimeError(std::string("cudaStreamSynchronize failed: ") +
-                                  cudaGetErrorString(status));
-    }
-    return Status::Ok();
+    return detail::CudaStatus(status, "cudaStreamSynchronize");
   }
 
-  cublasHandle_t cublas_handle() const { return cublas_handle_; }
+  [[nodiscard]] cublasHandle_t cublas_handle() const {
+    return cublas_handle_;
+  }
 
-  uint64_t seed() const { return options_.seed; }
+  [[nodiscard]] uint64_t seed() const {
+    return options_.seed;
+  }
 
-  uint64_t NextInitSeed() {
+  [[nodiscard]] uint64_t NextInitSeed() {
     ++seed_counter_;
     return options_.seed + 9973ULL * seed_counter_;
   }
 
-  Result<Tensor> ScratchTensor(const std::string &key,
-                               const std::vector<int64_t> &shape, DType dtype,
-                               DeviceType device = DeviceType::kCuda) {
+  Result<Tensor> ScratchTensor(const std::string &key, const std::vector<int64_t> &shape,
+                               DType dtype, DeviceType device = DeviceType::kCuda) {
     auto it = scratch_tensors_.find(key);
     if (it == scratch_tensors_.end() || it->second.shape() != shape ||
         it->second.dtype() != dtype || it->second.device() != device) {
@@ -124,9 +154,21 @@ public:
     return it->second;
   }
 
-  std::mt19937 &host_rng() { return host_rng_; }
+  [[nodiscard]] std::mt19937 &host_rng() {
+    return host_rng_;
+  }
 
 private:
+  Status ReleaseCublas() {
+    if (cublas_handle_ == nullptr) {
+      return Status::Ok();
+    }
+    cublasHandle_t handle = cublas_handle_;
+    cublas_handle_ = nullptr;
+    cublasStatus_t status = cublasDestroy(handle);
+    return detail::CublasStatus(status, "cublasDestroy");
+  }
+
   Status ApplyMathMode() {
     if (cublas_handle_ == nullptr) {
       return Status::RuntimeError("ApplyMathMode called before cublasCreate");
@@ -137,10 +179,7 @@ private:
     cublasMath_t mode = CUBLAS_DEFAULT_MATH;
 #endif
     cublasStatus_t status = cublasSetMathMode(cublas_handle_, mode);
-    if (status != CUBLAS_STATUS_SUCCESS) {
-      return Status::RuntimeError("cublasSetMathMode failed");
-    }
-    return Status::Ok();
+    return detail::CublasStatus(status, "cublasSetMathMode");
   }
 
   RuntimeOptions options_;

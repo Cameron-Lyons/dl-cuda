@@ -8,6 +8,8 @@
 #include "dl_cuda/runtime.hpp"
 #include "dl_cuda/trainer.hpp"
 
+#include "dl_cuda/detail/cuda_utils.hpp"
+
 #include <cuda_runtime.h>
 
 #include <algorithm>
@@ -16,6 +18,7 @@
 #include <cstdint>
 #include <memory>
 #include <cstdio>
+#include <limits>
 #include <random>
 #include <string>
 #include <vector>
@@ -23,21 +26,22 @@
 namespace dlcuda {
 namespace {
 
-static const char *kCharCorpus =
-    "To be, or not to be, that is the question. "
-    "Whether tis nobler in the mind to suffer "
-    "the slings and arrows of outrageous fortune, "
-    "or to take arms against a sea of troubles, "
-    "and by opposing end them. To die, to sleep, "
-    "no more, and by a sleep to say we end "
-    "the heartache and the thousand natural shocks "
-    "that flesh is heir to. Tis a consummation "
-    "devoutly to be wished. To die, to sleep. "
-    "To sleep, perchance to dream. Ay, there's the rub, "
-    "for in that sleep of death what dreams may come "
-    "when we have shuffled off this mortal coil, "
-    "must give us pause. There's the respect "
-    "that makes calamity of so long life. ";
+static const char *kCharCorpus = "To be, or not to be, that is the question. "
+                                 "Whether tis nobler in the mind to suffer "
+                                 "the slings and arrows of outrageous fortune, "
+                                 "or to take arms against a sea of troubles, "
+                                 "and by opposing end them. To die, to sleep, "
+                                 "no more, and by a sleep to say we end "
+                                 "the heartache and the thousand natural shocks "
+                                 "that flesh is heir to. Tis a consummation "
+                                 "devoutly to be wished. To die, to sleep. "
+                                 "To sleep, perchance to dream. Ay, there's the rub, "
+                                 "for in that sleep of death what dreams may come "
+                                 "when we have shuffled off this mortal coil, "
+                                 "must give us pause. There's the respect "
+                                 "that makes calamity of so long life. ";
+
+constexpr int kExampleThreads = 256;
 
 RuntimeOptions OptionsFromXorConfig(const TrainXorConfig &cfg) {
   RuntimeOptions opts;
@@ -57,6 +61,20 @@ RuntimeOptions OptionsFromCharConfig(bool use_cublas, bool tf32, uint64_t seed) 
   return opts;
 }
 
+Status ValidatePositiveFinite(float value, const char *name) {
+  if (!std::isfinite(value) || !(value > 0.0f)) {
+    return Status::InvalidArgument(std::string(name) + " must be finite and > 0");
+  }
+  return Status::Ok();
+}
+
+Status ValidateTopP(float value) {
+  if (!std::isfinite(value) || !(value > 0.0f && value <= 1.0f)) {
+    return Status::InvalidArgument("top_p must be finite and in (0, 1]");
+  }
+  return Status::Ok();
+}
+
 Status ValidateXorConfig(const TrainXorConfig &cfg) {
   if (cfg.epochs < 0) {
     return Status::InvalidArgument("epochs must be >= 0");
@@ -67,12 +85,8 @@ Status ValidateXorConfig(const TrainXorConfig &cfg) {
   if (cfg.hidden_size <= 0) {
     return Status::InvalidArgument("hidden_size must be > 0");
   }
-  if (!(cfg.lr > 0.0f)) {
-    return Status::InvalidArgument("lr must be > 0");
-  }
-  if (!(cfg.grad_clip > 0.0f)) {
-    return Status::InvalidArgument("grad_clip must be > 0");
-  }
+  DLCUDA_RETURN_IF_ERROR(ValidatePositiveFinite(cfg.lr, "lr"));
+  DLCUDA_RETURN_IF_ERROR(ValidatePositiveFinite(cfg.grad_clip, "grad_clip"));
   return Status::Ok();
 }
 
@@ -89,18 +103,10 @@ Status ValidateCharConfig(const TrainCharConfig &cfg) {
   if (cfg.print_every <= 0) {
     return Status::InvalidArgument("print_every must be > 0");
   }
-  if (!(cfg.lr > 0.0f)) {
-    return Status::InvalidArgument("lr must be > 0");
-  }
-  if (!(cfg.grad_clip > 0.0f)) {
-    return Status::InvalidArgument("grad_clip must be > 0");
-  }
-  if (!(cfg.temperature > 0.0f)) {
-    return Status::InvalidArgument("temperature must be > 0");
-  }
-  if (!(cfg.top_p > 0.0f && cfg.top_p <= 1.0f)) {
-    return Status::InvalidArgument("top_p must be in (0, 1]");
-  }
+  DLCUDA_RETURN_IF_ERROR(ValidatePositiveFinite(cfg.lr, "lr"));
+  DLCUDA_RETURN_IF_ERROR(ValidatePositiveFinite(cfg.grad_clip, "grad_clip"));
+  DLCUDA_RETURN_IF_ERROR(ValidatePositiveFinite(cfg.temperature, "temperature"));
+  DLCUDA_RETURN_IF_ERROR(ValidateTopP(cfg.top_p));
   if (cfg.gen_len < 0) {
     return Status::InvalidArgument("gen_len must be >= 0");
   }
@@ -117,11 +123,17 @@ Status ValidateSampleCharConfig(const SampleCharConfig &cfg) {
   if (cfg.gen_len < 0) {
     return Status::InvalidArgument("gen_len must be >= 0");
   }
-  if (!(cfg.temperature > 0.0f)) {
-    return Status::InvalidArgument("temperature must be > 0");
+  DLCUDA_RETURN_IF_ERROR(ValidatePositiveFinite(cfg.temperature, "temperature"));
+  DLCUDA_RETURN_IF_ERROR(ValidateTopP(cfg.top_p));
+  return Status::Ok();
+}
+
+Status ValidateCorpusWindow(size_t corpus_size, int seq_len, const char *context) {
+  if (seq_len <= 0) {
+    return Status::InvalidArgument(std::string(context) + " seq_len must be > 0");
   }
-  if (!(cfg.top_p > 0.0f && cfg.top_p <= 1.0f)) {
-    return Status::InvalidArgument("top_p must be in (0, 1]");
+  if (static_cast<size_t>(seq_len) + 1 > corpus_size) {
+    return Status::InvalidArgument(std::string(context) + " corpus is too short for seq_len");
   }
   return Status::Ok();
 }
@@ -133,11 +145,20 @@ void ApplyTopP(std::vector<float> &probs, float p) {
   }
   std::sort(idx.begin(), idx.end(), [&](int a, int b) { return probs[a] > probs[b]; });
 
+  float total = 0.0f;
+  for (float prob : probs) {
+    total += prob;
+  }
+  if (total <= 0.0f) {
+    return;
+  }
+  float target_mass = p * total;
+
   float cum = 0.0f;
   int cutoff = static_cast<int>(idx.size());
   for (int i = 0; i < static_cast<int>(idx.size()); ++i) {
     cum += probs[idx[i]];
-    if (cum >= p) {
+    if (cum >= target_mass) {
       cutoff = i + 1;
       break;
     }
@@ -148,21 +169,7 @@ void ApplyTopP(std::vector<float> &probs, float p) {
   }
 }
 
-int SampleToken(const std::vector<float> &raw_probs, float temperature, float top_p,
-                std::mt19937 &rng) {
-  std::vector<float> probs = raw_probs;
-
-  if (temperature != 1.0f) {
-    float inv_t = 1.0f / temperature;
-    for (float &p : probs) {
-      p = std::pow(std::max(1e-8f, p), inv_t);
-    }
-  }
-
-  if (top_p < 1.0f) {
-    ApplyTopP(probs, top_p);
-  }
-
+int SampleFromWeights(const std::vector<float> &probs, std::mt19937 &rng) {
   float sum = 0.0f;
   for (float p : probs) {
     sum += p;
@@ -183,27 +190,63 @@ int SampleToken(const std::vector<float> &raw_probs, float temperature, float to
   return static_cast<int>(probs.size()) - 1;
 }
 
-Status BuildCharModel(Sequential *model, RuntimeContext &ctx, int vocab_size,
-                      int d_model) {
+int SampleToken(const std::vector<float> &raw_probs, float temperature, float top_p,
+                std::mt19937 &rng) {
+  if (temperature == 1.0f && top_p >= 1.0f) {
+    return SampleFromWeights(raw_probs, rng);
+  }
+
+  std::vector<float> probs = raw_probs;
+
+  if (temperature != 1.0f) {
+    float inv_t = 1.0f / temperature;
+    for (float &p : probs) {
+      p = p > 0.0f ? std::pow(p, inv_t) : 0.0f;
+    }
+  }
+
+  if (top_p < 1.0f) {
+    ApplyTopP(probs, top_p);
+  }
+
+  return SampleFromWeights(probs, rng);
+}
+
+__global__ void ShiftAppendTokenKernel(int32_t *context, int64_t seq_len, int32_t next_id) {
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    for (int64_t i = 0; i + 1 < seq_len; ++i) {
+      context[i] = context[i + 1];
+    }
+    context[seq_len - 1] = next_id;
+  }
+}
+
+__global__ void FillTrainingWindowKernel(const int32_t *encoded_corpus, int32_t *input_ids,
+                                         int32_t *target_ids, int64_t seq_len, int64_t offset) {
+  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  if (idx < seq_len) {
+    input_ids[idx] = encoded_corpus[offset + idx];
+    target_ids[idx] = encoded_corpus[offset + idx + 1];
+  }
+}
+
+Status BuildCharModel(Sequential *model, RuntimeContext &ctx, int vocab_size, int d_model) {
   if (model == nullptr) {
     return Status::InvalidArgument("BuildCharModel requires a model pointer");
   }
-  DLCUDA_RETURN_IF_ERROR(
-      model->Add(std::make_unique<Embedding>(vocab_size, d_model, ctx)));
-  DLCUDA_RETURN_IF_ERROR(
-      model->Add(std::make_unique<Linear>(d_model, vocab_size, ctx)));
-  DLCUDA_RETURN_IF_ERROR(model->Add(std::make_unique<Softmax>()));
+  DLCUDA_RETURN_IF_ERROR(model->Add(std::make_unique<Embedding>(vocab_size, d_model, ctx)));
+  DLCUDA_RETURN_IF_ERROR(model->Add(std::make_unique<Linear>(d_model, vocab_size, ctx)));
   return Status::Ok();
 }
 
-Result<std::string> GenerateText(RuntimeContext &ctx, Sequential &model,
-                                 const CharVocab &vocab, int seq_len,
-                                 int gen_len, float temperature, float top_p,
+Result<std::string> GenerateText(RuntimeContext &ctx, Sequential &model, const CharVocab &vocab,
+                                 int seq_len, int gen_len, float temperature, float top_p,
                                  uint64_t sample_seed) {
-  std::string text(kCharCorpus);
-  if (static_cast<int>(text.size()) < seq_len + 1) {
-    return Status::InvalidArgument("Corpus is too short for generation window");
+  if (gen_len < 0) {
+    return Status::InvalidArgument("gen_len must be >= 0");
   }
+  std::string text(kCharCorpus);
+  DLCUDA_RETURN_IF_ERROR(ValidateCorpusWindow(text.size(), seq_len, "Generation"));
 
   std::vector<int32_t> context(static_cast<size_t>(seq_len));
   for (int i = 0; i < seq_len; ++i) {
@@ -216,47 +259,46 @@ Result<std::string> GenerateText(RuntimeContext &ctx, Sequential &model,
   }
   auto input_ids = context_tensor.value();
   DLCUDA_RETURN_IF_ERROR(
-      input_ids.CopyFromHost(context.data(), context.size() * sizeof(int32_t),
-                             ctx.stream()));
+      input_ids.CopyFromHost(context.data(), context.size() * sizeof(int32_t), ctx.stream()));
 
   std::string generated;
-  generated.reserve(static_cast<size_t>(seq_len + gen_len));
+  size_t reserve_size = static_cast<size_t>(seq_len);
+  size_t gen_len_size = static_cast<size_t>(gen_len);
+  if (gen_len_size > std::numeric_limits<size_t>::max() - reserve_size) {
+    return Status::InvalidArgument("generated text length is too large");
+  }
+  generated.reserve(reserve_size + gen_len_size);
   for (int i = 0; i < seq_len; ++i) {
     generated.push_back(vocab.Decode(context[static_cast<size_t>(i)]));
   }
 
   std::mt19937 rng(static_cast<uint32_t>(sample_seed));
   std::vector<float> host_probs(static_cast<size_t>(vocab.size()));
+  Softmax softmax;
 
   for (int step = 0; step < gen_len; ++step) {
+    Tensor logits;
     Tensor probs;
-    DLCUDA_RETURN_IF_ERROR(model.Forward(ctx, input_ids, &probs));
+    DLCUDA_RETURN_IF_ERROR(model.Forward(ctx, input_ids, &logits));
+    DLCUDA_RETURN_IF_ERROR(softmax.Forward(ctx, logits, &probs));
 
+    if (probs.rank() != 2 || probs.dim(0) != seq_len || probs.dim(1) != vocab.size()) {
+      return Status::RuntimeError("Generation probability tensor shape mismatch");
+    }
     int vocab_size = static_cast<int>(probs.dim(1));
     size_t offset = static_cast<size_t>(seq_len - 1) * static_cast<size_t>(vocab_size);
-    cudaError_t copy_status = cudaMemcpyAsync(host_probs.data(),
-                                              probs.data_as<float>() + offset,
-                                              static_cast<size_t>(vocab_size) *
-                                                  sizeof(float),
-                                              cudaMemcpyDeviceToHost,
-                                              ctx.stream());
-    if (copy_status != cudaSuccess) {
-      return Status::RuntimeError(std::string("cudaMemcpyAsync failed in generation: ") +
-                                  cudaGetErrorString(copy_status));
-    }
+    size_t offset_bytes = offset * sizeof(float);
+    size_t copy_bytes = static_cast<size_t>(vocab_size) * sizeof(float);
+    DLCUDA_RETURN_IF_ERROR(
+        probs.CopyRangeToHost(host_probs.data(), offset_bytes, copy_bytes, ctx.stream()));
     DLCUDA_RETURN_IF_ERROR(ctx.Synchronize());
 
     int next_id = SampleToken(host_probs, temperature, top_p, rng);
     generated.push_back(vocab.Decode(next_id));
 
-    for (int i = 0; i < seq_len - 1; ++i) {
-      context[static_cast<size_t>(i)] = context[static_cast<size_t>(i + 1)];
-    }
-    context[static_cast<size_t>(seq_len - 1)] = static_cast<int32_t>(next_id);
-
-    DLCUDA_RETURN_IF_ERROR(
-        input_ids.CopyFromHost(context.data(), context.size() * sizeof(int32_t),
-                               ctx.stream()));
+    ShiftAppendTokenKernel<<<1, 1, 0, ctx.stream()>>>(input_ids.data_as<int32_t>(), seq_len,
+                                                      static_cast<int32_t>(next_id));
+    DLCUDA_RETURN_IF_ERROR(detail::CheckKernelLaunch("ShiftAppendTokenKernel"));
   }
 
   return generated;
@@ -280,10 +322,7 @@ Status TrainXor(const TrainXorConfig &cfg) {
   AdamOptimizer optimizer;
 
   std::vector<float> host_x = {
-      0.0f, 0.0f,
-      0.0f, 1.0f,
-      1.0f, 0.0f,
-      1.0f, 1.0f,
+      0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f, 1.0f,
   };
   std::vector<float> host_y = {0.0f, 1.0f, 1.0f, 0.0f};
 
@@ -304,23 +343,18 @@ Status TrainXor(const TrainXorConfig &cfg) {
       y.CopyFromHost(host_y.data(), host_y.size() * sizeof(float), ctx.stream()));
 
   if (cfg.resume) {
-    Status load_status =
-        LoadCheckpoint(ctx, cfg.checkpoint_path, "xor-mlp-v2", params);
+    Status load_status = LoadCheckpoint(ctx, cfg.checkpoint_path, "xor-mlp-v2", params);
     if (!load_status.ok()) {
-      return Status::RuntimeError("Failed to resume XOR checkpoint: " +
-                                  load_status.message());
+      return Status::RuntimeError("Failed to resume XOR checkpoint: " + load_status.message());
     }
     std::printf("Loaded checkpoint: %s\n", cfg.checkpoint_path.c_str());
   }
 
-  std::printf("XOR v2 | epochs=%d lr=%.4f hidden=%d | backend=%s | TF32=%s\n",
-              cfg.epochs, cfg.lr, cfg.hidden_size,
-              cfg.use_cublas ? "cuBLAS" : "kernels",
-              cfg.tf32 ? "on" : "off");
+  std::printf("XOR v2 | epochs=%d lr=%.4f hidden=%d | backend=%s | TF32=%s\n", cfg.epochs, cfg.lr,
+              cfg.hidden_size, cfg.use_cublas ? "cuBLAS" : "kernels", cfg.tf32 ? "on" : "off");
 
   Tensor predictions;
   Tensor loss_grad;
-  Tensor input_grad;
   for (int epoch = 0; epoch < cfg.epochs; ++epoch) {
     DLCUDA_RETURN_IF_ERROR(optimizer.ZeroGrad(ctx, params));
 
@@ -336,7 +370,7 @@ Status TrainXor(const TrainXorConfig &cfg) {
     }
 
     DLCUDA_RETURN_IF_ERROR(BinaryCrossEntropyBackward(ctx, y, predictions, &loss_grad));
-    DLCUDA_RETURN_IF_ERROR(model.Backward(ctx, loss_grad, &input_grad));
+    DLCUDA_RETURN_IF_ERROR(model.Backward(ctx, loss_grad, nullptr));
 
     float grad_norm = 0.0f;
     DLCUDA_RETURN_IF_ERROR(
@@ -344,8 +378,7 @@ Status TrainXor(const TrainXorConfig &cfg) {
     DLCUDA_RETURN_IF_ERROR(optimizer.Step(ctx, params, cfg.lr));
 
     if (should_log) {
-      std::printf("Epoch %4d | BCE: %.6f | GradNorm: %.4f\n", epoch,
-                  loss_value, grad_norm);
+      std::printf("Epoch %4d | BCE: %.6f | GradNorm: %.4f\n", epoch, loss_value, grad_norm);
     }
   }
 
@@ -353,9 +386,8 @@ Status TrainXor(const TrainXorConfig &cfg) {
   DLCUDA_RETURN_IF_ERROR(model.Forward(ctx, x, &final_predictions));
 
   std::vector<float> host_pred(4);
-  DLCUDA_RETURN_IF_ERROR(
-      final_predictions.CopyToHost(host_pred.data(), host_pred.size() * sizeof(float),
-                                   ctx.stream()));
+  DLCUDA_RETURN_IF_ERROR(final_predictions.CopyToHost(
+      host_pred.data(), host_pred.size() * sizeof(float), ctx.stream()));
   DLCUDA_RETURN_IF_ERROR(ctx.Synchronize());
 
   std::printf("Final predictions:\n");
@@ -385,9 +417,7 @@ Status TrainChar(const TrainCharConfig &cfg) {
   }
   CharVocab vocab = vocab_result.value();
 
-  if (static_cast<int>(corpus.size()) <= cfg.seq_len + 1) {
-    return Status::InvalidArgument("Corpus must be longer than seq_len + 1");
-  }
+  DLCUDA_RETURN_IF_ERROR(ValidateCorpusWindow(corpus.size(), cfg.seq_len, "Training"));
 
   RuntimeContext ctx(OptionsFromCharConfig(cfg.use_cublas, cfg.tf32, cfg.seed));
   DLCUDA_RETURN_IF_ERROR(ctx.Initialize());
@@ -411,56 +441,58 @@ Status TrainChar(const TrainCharConfig &cfg) {
   Tensor target_ids = target_ids_result.value();
 
   if (cfg.resume) {
-    Status load_status =
-        LoadCheckpoint(ctx, cfg.checkpoint_path, "char-embed-softmax-v2", params);
+    Status load_status = LoadCheckpoint(ctx, cfg.checkpoint_path, "char-embed-softmax-v2", params);
     if (!load_status.ok()) {
-      return Status::RuntimeError("Failed to resume char checkpoint: " +
-                                  load_status.message());
+      return Status::RuntimeError("Failed to resume char checkpoint: " + load_status.message());
     }
     std::printf("Loaded checkpoint: %s\n", cfg.checkpoint_path.c_str());
   }
 
-  std::printf("Char v2 | vocab=%d seq_len=%d d_model=%d epochs=%d\n", vocab.size(),
-              cfg.seq_len, cfg.d_model, cfg.epochs);
-  std::printf("Optimizer: Adam | Grad clip: %.2f | temp=%.2f top_p=%.2f\n",
-              cfg.grad_clip, cfg.temperature, cfg.top_p);
+  std::printf("Char v2 | vocab=%d seq_len=%d d_model=%d epochs=%d\n", vocab.size(), cfg.seq_len,
+              cfg.d_model, cfg.epochs);
+  std::printf("Optimizer: Adam | Grad clip: %.2f | temp=%.2f top_p=%.2f\n", cfg.grad_clip,
+              cfg.temperature, cfg.top_p);
 
   std::mt19937 offset_rng(static_cast<uint32_t>(cfg.seed));
   auto train_start = std::chrono::steady_clock::now();
 
-  std::vector<int32_t> host_input(static_cast<size_t>(cfg.seq_len));
-  std::vector<int32_t> host_target(static_cast<size_t>(cfg.seq_len));
+  std::vector<int32_t> encoded_corpus(corpus.size());
+  for (size_t i = 0; i < corpus.size(); ++i) {
+    encoded_corpus[i] = vocab.Encode(corpus[i]);
+  }
+  auto encoded_corpus_tensor =
+      Tensor::Allocate({static_cast<int64_t>(encoded_corpus.size())}, DType::kInt32);
+  if (!encoded_corpus_tensor.ok()) {
+    return encoded_corpus_tensor.status();
+  }
+  Tensor encoded_corpus_device = encoded_corpus_tensor.value();
+  DLCUDA_RETURN_IF_ERROR(encoded_corpus_device.CopyFromHost(
+      encoded_corpus.data(), encoded_corpus.size() * sizeof(int32_t), ctx.stream()));
 
   int max_offset = static_cast<int>(corpus.size()) - cfg.seq_len - 1;
-  Tensor probs;
+  Tensor logits;
   Tensor loss_grad;
-  Tensor input_grad;
 
   for (int epoch = 0; epoch < cfg.epochs; ++epoch) {
     int offset = static_cast<int>(offset_rng() % static_cast<uint32_t>(max_offset + 1));
-    for (int i = 0; i < cfg.seq_len; ++i) {
-      host_input[static_cast<size_t>(i)] =
-          vocab.Encode(corpus[static_cast<size_t>(offset + i)]);
-      host_target[static_cast<size_t>(i)] =
-          vocab.Encode(corpus[static_cast<size_t>(offset + i + 1)]);
+    auto window_blocks = detail::BlocksForElements(cfg.seq_len, kExampleThreads);
+    if (!window_blocks.ok()) {
+      return window_blocks.status();
     }
-
-    DLCUDA_RETURN_IF_ERROR(
-        input_ids.CopyFromHost(host_input.data(), host_input.size() * sizeof(int32_t),
-                               ctx.stream()));
-    DLCUDA_RETURN_IF_ERROR(
-        target_ids.CopyFromHost(host_target.data(),
-                                host_target.size() * sizeof(int32_t),
-                                ctx.stream()));
+    if (window_blocks.value() > 0) {
+      FillTrainingWindowKernel<<<window_blocks.value(), kExampleThreads, 0, ctx.stream()>>>(
+          encoded_corpus_device.data_as<int32_t>(), input_ids.data_as<int32_t>(),
+          target_ids.data_as<int32_t>(), cfg.seq_len, offset);
+      DLCUDA_RETURN_IF_ERROR(detail::CheckKernelLaunch("FillTrainingWindowKernel"));
+    }
 
     DLCUDA_RETURN_IF_ERROR(optimizer.ZeroGrad(ctx, params));
 
-    DLCUDA_RETURN_IF_ERROR(model.Forward(ctx, input_ids, &probs));
+    DLCUDA_RETURN_IF_ERROR(model.Forward(ctx, input_ids, &logits));
     bool should_log = (epoch % cfg.print_every) == 0;
     ClassificationMetrics metrics;
     if (should_log) {
-      auto metrics_result =
-          CategoricalCrossEntropyMetricsFromIds(ctx, target_ids, probs);
+      auto metrics_result = CategoricalCrossEntropyMetricsFromLogits(ctx, target_ids, logits);
       if (!metrics_result.ok()) {
         return metrics_result.status();
       }
@@ -468,8 +500,8 @@ Status TrainChar(const TrainCharConfig &cfg) {
     }
 
     DLCUDA_RETURN_IF_ERROR(
-        CategoricalCrossEntropyBackwardFromIds(ctx, target_ids, probs, &loss_grad));
-    DLCUDA_RETURN_IF_ERROR(model.Backward(ctx, loss_grad, &input_grad));
+        CategoricalCrossEntropyBackwardFromLogits(ctx, target_ids, logits, &loss_grad));
+    DLCUDA_RETURN_IF_ERROR(model.Backward(ctx, loss_grad, nullptr));
 
     float grad_norm = 0.0f;
     DLCUDA_RETURN_IF_ERROR(
@@ -490,12 +522,10 @@ Status TrainChar(const TrainCharConfig &cfg) {
   auto train_end = std::chrono::steady_clock::now();
   if (cfg.epochs > 0) {
     double sec =
-        std::chrono::duration_cast<std::chrono::duration<double>>(train_end - train_start)
-            .count();
+        std::chrono::duration_cast<std::chrono::duration<double>>(train_end - train_start).count();
     double tokens = static_cast<double>(cfg.epochs) * cfg.seq_len;
     double tok_per_sec = sec > 0.0 ? tokens / sec : 0.0;
-    std::printf("Training throughput: %.2f tokens/s (%.3f s)\n", tok_per_sec,
-                sec);
+    std::printf("Training throughput: %.2f tokens/s (%.3f s)\n", tok_per_sec, sec);
   }
 
   if (cfg.save) {
@@ -506,8 +536,8 @@ Status TrainChar(const TrainCharConfig &cfg) {
     std::printf("Saved checkpoint: %s\n", cfg.checkpoint_path.c_str());
   }
 
-  auto generated = GenerateText(ctx, model, vocab, cfg.seq_len, cfg.gen_len,
-                                cfg.temperature, cfg.top_p, cfg.sample_seed);
+  auto generated = GenerateText(ctx, model, vocab, cfg.seq_len, cfg.gen_len, cfg.temperature,
+                                cfg.top_p, cfg.sample_seed);
   if (!generated.ok()) {
     return generated.status();
   }
@@ -525,18 +555,18 @@ Result<std::string> SampleChar(const SampleCharConfig &cfg) {
     return vocab_result.status();
   }
   CharVocab vocab = vocab_result.value();
+  DLCUDA_RETURN_IF_ERROR(ValidateCorpusWindow(corpus.size(), cfg.seq_len, "Sampling"));
 
   RuntimeContext ctx(OptionsFromCharConfig(cfg.use_cublas, cfg.tf32, cfg.seed));
   DLCUDA_RETURN_IF_ERROR(ctx.Initialize());
 
   Sequential model;
   DLCUDA_RETURN_IF_ERROR(BuildCharModel(&model, ctx, vocab.size(), cfg.d_model));
-  DLCUDA_RETURN_IF_ERROR(LoadCheckpoint(ctx, cfg.checkpoint_path,
-                                        "char-embed-softmax-v2",
-                                        model.parameters()));
+  DLCUDA_RETURN_IF_ERROR(
+      LoadCheckpoint(ctx, cfg.checkpoint_path, "char-embed-softmax-v2", model.parameters()));
 
-  return GenerateText(ctx, model, vocab, cfg.seq_len, cfg.gen_len,
-                      cfg.temperature, cfg.top_p, cfg.sample_seed);
+  return GenerateText(ctx, model, vocab, cfg.seq_len, cfg.gen_len, cfg.temperature, cfg.top_p,
+                      cfg.sample_seed);
 }
 
 } // namespace dlcuda

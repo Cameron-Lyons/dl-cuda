@@ -12,10 +12,13 @@ else
   exit 1
 fi
 
-mapfile -t FILES < <(rg --files \
-  examples include tests src/examples_api.cu \
+FILES=()
+while IFS= read -r -d '' file; do
+  FILES+=("$file")
+done < <(rg --files \
+  examples include tests src/v2 \
   -g '*.cu' -g '*.cuh' -g '*.h' -g '*.hpp' -g '*.cpp' -g '*.cc' \
-  -g '!build/**' -g '!profiles/**')
+  -g '!build/**' -g '!profiles/**' -0)
 
 if [ ${#FILES[@]} -eq 0 ]; then
   echo "No source files to format"

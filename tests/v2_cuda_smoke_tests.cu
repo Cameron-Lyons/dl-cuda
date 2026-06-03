@@ -24,8 +24,7 @@ int main() {
   dlcuda::RuntimeContext ctx;
   dlcuda::Status init = ctx.Initialize();
   if (!init.ok()) {
-    std::fprintf(stderr, "Runtime initialization failed: %s\n",
-                 init.message().c_str());
+    std::fprintf(stderr, "Runtime initialization failed: %s\n", init.ToString().c_str());
     return 1;
   }
 
@@ -55,10 +54,7 @@ int main() {
   dlcuda::Tensor x = x_result.value();
   dlcuda::Tensor y = y_result.value();
   std::vector<float> host_x = {
-      0.0f, 0.0f,
-      0.0f, 1.0f,
-      1.0f, 0.0f,
-      1.0f, 1.0f,
+      0.0f, 0.0f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f, 1.0f,
   };
   std::vector<float> host_y = {0.0f, 1.0f, 1.0f, 0.0f};
   if (!x.CopyFromHost(host_x.data(), host_x.size() * sizeof(float), ctx.stream()).ok() ||
@@ -70,13 +66,13 @@ int main() {
   dlcuda::Tensor predictions;
   dlcuda::Status forward = model.Forward(ctx, x, &predictions);
   if (!forward.ok()) {
-    std::fprintf(stderr, "Forward failed: %s\n", forward.message().c_str());
+    std::fprintf(stderr, "Forward failed: %s\n", forward.ToString().c_str());
     return 1;
   }
 
   auto loss = dlcuda::BinaryCrossEntropyLoss(ctx, y, predictions);
   if (!loss.ok()) {
-    std::fprintf(stderr, "Loss failed: %s\n", loss.status().message().c_str());
+    std::fprintf(stderr, "Loss failed: %s\n", loss.status().ToString().c_str());
     return 1;
   }
 
@@ -84,21 +80,25 @@ int main() {
   dlcuda::Status loss_backward =
       dlcuda::BinaryCrossEntropyBackward(ctx, y, predictions, &loss_grad);
   if (!loss_backward.ok()) {
-    std::fprintf(stderr, "Loss backward failed: %s\n",
-                 loss_backward.message().c_str());
+    std::fprintf(stderr, "Loss backward failed: %s\n", loss_backward.ToString().c_str());
     return 1;
   }
 
   dlcuda::Tensor input_grad;
   dlcuda::Status backward = model.Backward(ctx, loss_grad, &input_grad);
   if (!backward.ok()) {
-    std::fprintf(stderr, "Backward failed: %s\n", backward.message().c_str());
+    std::fprintf(stderr, "Backward failed: %s\n", backward.ToString().c_str());
+    return 1;
+  }
+  dlcuda::Status backward_without_input_grad = model.Backward(ctx, loss_grad, nullptr);
+  if (!backward_without_input_grad.ok()) {
+    std::fprintf(stderr, "Backward without input grad failed: %s\n",
+                 backward_without_input_grad.ToString().c_str());
     return 1;
   }
 
   float grad_norm = 0.0f;
-  dlcuda::Status clip_status =
-      dlcuda::ClipGradNorm(ctx, params, 1.0f, &grad_norm);
+  dlcuda::Status clip_status = dlcuda::ClipGradNorm(ctx, params, 1.0f, &grad_norm);
   if (!clip_status.ok() || !(grad_norm >= 0.0f)) {
     std::fprintf(stderr, "ClipGradNorm failed\n");
     return 1;

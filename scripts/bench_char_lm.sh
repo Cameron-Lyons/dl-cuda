@@ -1,12 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-EPOCHS="${1:-200}"
-SEQ_LEN="${2:-64}"
+BIN="${DL_CUDA_CHAR_BIN:-./build/dl-cuda-char-lm}"
+EPOCHS="${1:-${EPOCHS:-200}}"
+SEQ_LEN="${2:-${SEQ_LEN:-64}}"
+PRINT_EVERY="${PRINT_EVERY:-$EPOCHS}"
 
-./build/dl-cuda-char-lm \
+if [[ "$PRINT_EVERY" =~ ^[0-9]+$ ]] && [ "$PRINT_EVERY" -lt 1 ]; then
+  PRINT_EVERY=1
+fi
+
+if [ ! -x "$BIN" ]; then
+  echo "Missing executable: $BIN" >&2
+  echo "Build with CUDA enabled first: cmake -S . -B build && cmake --build build -j" >&2
+  exit 1
+fi
+
+"$BIN" \
   --epochs "$EPOCHS" \
   --seq-len "$SEQ_LEN" \
-  --print-every "$EPOCHS" \
+  --print-every "$PRINT_EVERY" \
   --gen-len 0 \
   --no-save

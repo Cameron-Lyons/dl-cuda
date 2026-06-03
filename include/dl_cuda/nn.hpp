@@ -22,13 +22,11 @@ class Module {
 public:
   virtual ~Module() = default;
 
-  virtual Status Forward(RuntimeContext &ctx, const Tensor &input,
-                         Tensor *output) = 0;
-  virtual Status Backward(RuntimeContext &ctx, const Tensor &grad_output,
-                          Tensor *grad_input) = 0;
-  virtual void AppendParameters(const std::string &prefix,
-                                std::vector<ParameterRef> *out) = 0;
-  virtual std::string Name() const = 0;
+  virtual Status Forward(RuntimeContext &ctx, const Tensor &input, Tensor *output) = 0;
+  // grad_input may be null when the caller does not need gradients with respect to module input.
+  virtual Status Backward(RuntimeContext &ctx, const Tensor &grad_output, Tensor *grad_input) = 0;
+  virtual void AppendParameters(const std::string &prefix, std::vector<ParameterRef> *out) = 0;
+  [[nodiscard]] virtual std::string Name() const = 0;
 };
 
 class Sequential : public Module {
@@ -37,17 +35,20 @@ public:
 
   Status Add(std::unique_ptr<Module> module);
 
-  Status Forward(RuntimeContext &ctx, const Tensor &input,
-                 Tensor *output) override;
-  Status Backward(RuntimeContext &ctx, const Tensor &grad_output,
-                  Tensor *grad_input) override;
+  Status Forward(RuntimeContext &ctx, const Tensor &input, Tensor *output) override;
+  Status Backward(RuntimeContext &ctx, const Tensor &grad_output, Tensor *grad_input) override;
 
-  void AppendParameters(const std::string &prefix,
-                        std::vector<ParameterRef> *out) override;
-  std::string Name() const override { return "Sequential"; }
+  void AppendParameters(const std::string &prefix, std::vector<ParameterRef> *out) override;
+  [[nodiscard]] std::string Name() const override {
+    return "Sequential";
+  }
 
-  size_t size() const { return modules_.size(); }
-  const std::vector<ParameterRef> &parameters() const { return parameter_cache_; }
+  [[nodiscard]] size_t size() const {
+    return modules_.size();
+  }
+  [[nodiscard]] const std::vector<ParameterRef> &parameters() const {
+    return parameter_cache_;
+  }
 
 private:
   void RebuildParameterCache();
@@ -60,14 +61,13 @@ class Linear : public Module {
 public:
   Linear(int64_t in_features, int64_t out_features, RuntimeContext &ctx);
 
-  Status Forward(RuntimeContext &ctx, const Tensor &input,
-                 Tensor *output) override;
-  Status Backward(RuntimeContext &ctx, const Tensor &grad_output,
-                  Tensor *grad_input) override;
+  Status Forward(RuntimeContext &ctx, const Tensor &input, Tensor *output) override;
+  Status Backward(RuntimeContext &ctx, const Tensor &grad_output, Tensor *grad_input) override;
 
-  void AppendParameters(const std::string &prefix,
-                        std::vector<ParameterRef> *out) override;
-  std::string Name() const override { return "Linear"; }
+  void AppendParameters(const std::string &prefix, std::vector<ParameterRef> *out) override;
+  [[nodiscard]] std::string Name() const override {
+    return "Linear";
+  }
 
 private:
   Status init_status_;
@@ -87,14 +87,13 @@ class ReLU : public Module {
 public:
   ReLU() = default;
 
-  Status Forward(RuntimeContext &ctx, const Tensor &input,
-                 Tensor *output) override;
-  Status Backward(RuntimeContext &ctx, const Tensor &grad_output,
-                  Tensor *grad_input) override;
+  Status Forward(RuntimeContext &ctx, const Tensor &input, Tensor *output) override;
+  Status Backward(RuntimeContext &ctx, const Tensor &grad_output, Tensor *grad_input) override;
 
-  void AppendParameters(const std::string &prefix,
-                        std::vector<ParameterRef> *out) override;
-  std::string Name() const override { return "ReLU"; }
+  void AppendParameters(const std::string &prefix, std::vector<ParameterRef> *out) override;
+  [[nodiscard]] std::string Name() const override {
+    return "ReLU";
+  }
 
 private:
   Tensor cached_input_;
@@ -106,14 +105,13 @@ class Sigmoid : public Module {
 public:
   Sigmoid() = default;
 
-  Status Forward(RuntimeContext &ctx, const Tensor &input,
-                 Tensor *output) override;
-  Status Backward(RuntimeContext &ctx, const Tensor &grad_output,
-                  Tensor *grad_input) override;
+  Status Forward(RuntimeContext &ctx, const Tensor &input, Tensor *output) override;
+  Status Backward(RuntimeContext &ctx, const Tensor &grad_output, Tensor *grad_input) override;
 
-  void AppendParameters(const std::string &prefix,
-                        std::vector<ParameterRef> *out) override;
-  std::string Name() const override { return "Sigmoid"; }
+  void AppendParameters(const std::string &prefix, std::vector<ParameterRef> *out) override;
+  [[nodiscard]] std::string Name() const override {
+    return "Sigmoid";
+  }
 
 private:
   Tensor cached_output_;
@@ -124,14 +122,13 @@ class Softmax : public Module {
 public:
   Softmax() = default;
 
-  Status Forward(RuntimeContext &ctx, const Tensor &input,
-                 Tensor *output) override;
-  Status Backward(RuntimeContext &ctx, const Tensor &grad_output,
-                  Tensor *grad_input) override;
+  Status Forward(RuntimeContext &ctx, const Tensor &input, Tensor *output) override;
+  Status Backward(RuntimeContext &ctx, const Tensor &grad_output, Tensor *grad_input) override;
 
-  void AppendParameters(const std::string &prefix,
-                        std::vector<ParameterRef> *out) override;
-  std::string Name() const override { return "Softmax"; }
+  void AppendParameters(const std::string &prefix, std::vector<ParameterRef> *out) override;
+  [[nodiscard]] std::string Name() const override {
+    return "Softmax";
+  }
 
 private:
   int64_t num_rows_ = 0;
@@ -144,14 +141,13 @@ class Embedding : public Module {
 public:
   Embedding(int64_t vocab_size, int64_t embedding_dim, RuntimeContext &ctx);
 
-  Status Forward(RuntimeContext &ctx, const Tensor &input,
-                 Tensor *output) override;
-  Status Backward(RuntimeContext &ctx, const Tensor &grad_output,
-                  Tensor *grad_input) override;
+  Status Forward(RuntimeContext &ctx, const Tensor &input, Tensor *output) override;
+  Status Backward(RuntimeContext &ctx, const Tensor &grad_output, Tensor *grad_input) override;
 
-  void AppendParameters(const std::string &prefix,
-                        std::vector<ParameterRef> *out) override;
-  std::string Name() const override { return "Embedding"; }
+  void AppendParameters(const std::string &prefix, std::vector<ParameterRef> *out) override;
+  [[nodiscard]] std::string Name() const override {
+    return "Embedding";
+  }
 
 private:
   Status init_status_;
