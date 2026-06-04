@@ -24,7 +24,7 @@ while IFS= read -r line; do
   [ -n "$line" ] && ALL_FILES+=("$line")
 done < <(rg --files examples include tests src \
   -g '*.cu' -g '*.cuh' -g '*.h' -g '*.hpp' -g '*.cpp' -g '*.cc' \
-  -g '!src/examples_api.cu' -g '!build/**' -g '!profiles/**' 2>/dev/null || true)
+  -g '!build/**' -g '!profiles/**' 2>/dev/null || true)
 
 if [ ${#ALL_FILES[@]} -eq 0 ]; then
   echo "No source files to lint"

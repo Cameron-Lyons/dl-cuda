@@ -1,3 +1,4 @@
+#include "dl_cuda.hpp"
 #include "dl_cuda/data.hpp"
 #include "dl_cuda/dtype.hpp"
 #include "dl_cuda/status.hpp"
