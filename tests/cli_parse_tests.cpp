@@ -191,8 +191,52 @@ int main() {
           nullptr ||
       cli_parse::find_option_by_config_key(example_cli::TrainCharOptions(), "tf32") == nullptr ||
       cli_parse::find_option_by_flag(example_cli::TrainCharOptions(), "--top-p") == nullptr ||
-      cli_parse::find_option_by_flag(example_cli::SampleCharOptions(), "--checkpoint") == nullptr) {
+      cli_parse::find_option_by_flag(example_cli::TrainCharOptions(), "--data") == nullptr ||
+      cli_parse::find_option_by_flag(example_cli::TrainCharOptions(), "--val-fraction") ==
+          nullptr ||
+      cli_parse::find_option_by_flag(example_cli::TrainCharOptions(), "--best-checkpoint") ==
+          nullptr ||
+      cli_parse::find_option_by_flag(example_cli::TrainCharOptions(), "--prompt") == nullptr ||
+      cli_parse::find_option_by_flag(example_cli::SampleCharOptions(), "--checkpoint") == nullptr ||
+      cli_parse::find_option_by_config_key(example_cli::SampleCharOptions(), "data") == nullptr ||
+      cli_parse::find_option_by_flag(example_cli::SampleCharOptions(), "--prompt") == nullptr) {
     std::fprintf(stderr, "Shared example option tables are missing expected options\n");
+    return 1;
+  }
+
+  char train_char_arg0[] = "dl-cuda";
+  char train_char_arg1[] = "train-char";
+  char train_char_arg2[] = "--data";
+  char train_char_arg3[] = "corpus.txt";
+  char train_char_arg4[] = "--val-fraction";
+  char train_char_arg5[] = "0.2";
+  char train_char_arg6[] = "--early-stop-patience";
+  char train_char_arg7[] = "3";
+  char train_char_arg8[] = "--best-checkpoint";
+  char train_char_arg9[] = "best.ckpt";
+  char train_char_arg10[] = "--prompt";
+  char train_char_arg11[] = "To be";
+  char *train_char_argv[] = {train_char_arg0, train_char_arg1, train_char_arg2,  train_char_arg3,
+                             train_char_arg4, train_char_arg5, train_char_arg6,  train_char_arg7,
+                             train_char_arg8, train_char_arg9, train_char_arg10, train_char_arg11};
+  dlcuda::TrainCharConfig train_char_cfg;
+  parse_result = cli_parse::apply_command_line(
+      static_cast<int>(sizeof(train_char_argv) / sizeof(train_char_argv[0])), train_char_argv, 2,
+      example_cli::TrainCharOptions(), &train_char_cfg, &error);
+  if (parse_result != cli_parse::ParseResult::kOk || train_char_cfg.data_path != "corpus.txt" ||
+      train_char_cfg.val_fraction != 0.2f || train_char_cfg.early_stop_patience != 3 ||
+      train_char_cfg.best_checkpoint_path != "best.ckpt" || train_char_cfg.prompt != "To be") {
+    std::fprintf(stderr, "Train char --data parsing failed: %s\n", error.c_str());
+    return 1;
+  }
+
+  dlcuda::SampleCharConfig sample_char_cfg;
+  std::unordered_map<std::string, std::string> sample_char_config = {{"data", "sample.txt"},
+                                                                     {"prompt", "hello"}};
+  if (!cli_parse::apply_config_map(sample_char_config, example_cli::SampleCharOptions(),
+                                   &sample_char_cfg, &error) ||
+      sample_char_cfg.data_path != "sample.txt" || sample_char_cfg.prompt != "hello") {
+    std::fprintf(stderr, "Sample char data config parsing failed: %s\n", error.c_str());
     return 1;
   }
 
