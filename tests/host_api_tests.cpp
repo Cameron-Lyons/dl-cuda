@@ -1,4 +1,5 @@
 #include "dl_cuda/data.hpp"
+#include "dl_cuda/dtype.hpp"
 #include "dl_cuda/status.hpp"
 
 #include <cstdio>
@@ -25,6 +26,22 @@ int main() {
       bad.ToString() != "InvalidArgument: bad input" ||
       std::string(dlcuda::StatusCodeName(dlcuda::StatusCode::kOk)) != "Ok") {
     std::fprintf(stderr, "Status code names mismatch\n");
+    return 1;
+  }
+
+  if (dlcuda::DTypeSize(dlcuda::DType::kFloat32) != 4 ||
+      dlcuda::DTypeSize(dlcuda::DType::kInt32) != 4 ||
+      dlcuda::DTypeSize(dlcuda::DType::kFloat16) != 2 ||
+      dlcuda::DTypeSize(dlcuda::DType::kBFloat16) != 2) {
+    std::fprintf(stderr, "DType sizes mismatch\n");
+    return 1;
+  }
+  if (std::string(dlcuda::DTypeName(dlcuda::DType::kFloat16)) != "float16" ||
+      std::string(dlcuda::DTypeName(dlcuda::DType::kBFloat16)) != "bfloat16" ||
+      !dlcuda::IsFloatingPointDType(dlcuda::DType::kFloat16) ||
+      !dlcuda::IsFloatingPointDType(dlcuda::DType::kBFloat16) ||
+      dlcuda::IsFloatingPointDType(dlcuda::DType::kInt32)) {
+    std::fprintf(stderr, "DType metadata mismatch\n");
     return 1;
   }
 
@@ -78,6 +95,6 @@ int main() {
     return 1;
   }
 
-  std::printf("v2_host_tests: PASS\n");
+  std::printf("host_tests: PASS\n");
   return 0;
 }

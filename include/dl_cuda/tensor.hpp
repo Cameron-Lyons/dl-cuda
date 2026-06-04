@@ -1,6 +1,7 @@
 #pragma once
 
 #include "dl_cuda/detail/cuda_utils.hpp"
+#include "dl_cuda/dtype.hpp"
 #include "dl_cuda/status.hpp"
 
 #include <cuda_runtime.h>
@@ -13,24 +14,9 @@
 
 namespace dlcuda {
 
-enum class DType {
-  kFloat32 = 0,
-  kInt32 = 1,
-};
-
 enum class DeviceType {
   kCuda = 0,
 };
-
-[[nodiscard]] inline size_t DTypeSize(DType dtype) {
-  switch (dtype) {
-  case DType::kFloat32:
-    return sizeof(float);
-  case DType::kInt32:
-    return sizeof(int32_t);
-  }
-  return 0;
-}
 
 [[nodiscard]] inline Result<int64_t> ShapeNumel(const std::vector<int64_t> &shape) {
   int64_t numel = 1;
@@ -52,6 +38,18 @@ public:
 
   static Result<Tensor> Allocate(const std::vector<int64_t> &shape, DType dtype,
                                  DeviceType device = DeviceType::kCuda) {
+    return AllocateImpl(shape, dtype, device, 0, false);
+  }
+
+  static Result<Tensor> AllocateAsync(const std::vector<int64_t> &shape, DType dtype,
+                                      cudaStream_t stream = 0,
+                                      DeviceType device = DeviceType::kCuda) {
+    return AllocateImpl(shape, dtype, device, stream, true);
+  }
+
+private:
+  static Result<Tensor> AllocateImpl(const std::vector<int64_t> &shape, DType dtype,
+                                     DeviceType device, cudaStream_t stream, bool stream_ordered) {
     if (device != DeviceType::kCuda) {
       return Status::Unsupported("Only CUDA tensors are supported");
     }
@@ -71,19 +69,41 @@ public:
     size_t bytes = static_cast<size_t>(numel) * dtype_size;
 
     void *ptr = nullptr;
+    bool async_free = false;
     if (bytes > 0) {
-      cudaError_t err = cudaMalloc(&ptr, bytes);
-      DLCUDA_RETURN_IF_ERROR(detail::CudaStatus(err, "cudaMalloc"));
+      cudaError_t err = cudaSuccess;
+      const char *alloc_context = "cudaMalloc";
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 11020
+      if (stream_ordered) {
+        alloc_context = "cudaMallocAsync";
+        err = cudaMallocAsync(&ptr, bytes, stream);
+        if (err == cudaSuccess) {
+          async_free = true;
+        } else if (err == cudaErrorNotSupported || err == cudaErrorInsufficientDriver) {
+          (void)cudaGetLastError();
+          alloc_context = "cudaMalloc";
+          err = cudaMalloc(&ptr, bytes);
+        }
+      } else
+#else
+      (void)stream;
+      (void)stream_ordered;
+#endif
+      {
+        err = cudaMalloc(&ptr, bytes);
+      }
+      DLCUDA_RETURN_IF_ERROR(detail::CudaStatus(err, alloc_context));
     }
 
     Tensor out;
-    out.storage_ = std::make_shared<Storage>(ptr, bytes, device);
+    out.storage_ = std::make_shared<Storage>(ptr, bytes, device, stream, async_free);
     out.shape_ = shape;
     out.numel_ = numel;
     out.dtype_ = dtype;
     return out;
   }
 
+public:
   [[nodiscard]] bool defined() const {
     return storage_ != nullptr;
   }
@@ -196,11 +216,22 @@ public:
 
 private:
   struct Storage {
-    Storage(void *ptr_in, size_t bytes_in, DeviceType device_in)
-        : ptr(ptr_in), bytes(bytes_in), device(device_in) {}
+    Storage(void *ptr_in, size_t bytes_in, DeviceType device_in, cudaStream_t stream_in,
+            bool async_free_in)
+        : ptr(ptr_in), bytes(bytes_in), device(device_in), stream(stream_in),
+          async_free(async_free_in) {}
 
     ~Storage() {
       if (ptr != nullptr) {
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 11020
+        if (async_free) {
+          cudaError_t err = cudaFreeAsync(ptr, stream);
+          if (err == cudaSuccess) {
+            return;
+          }
+          (void)cudaGetLastError();
+        }
+#endif
         cudaFree(ptr);
       }
     }
@@ -208,6 +239,8 @@ private:
     void *ptr = nullptr;
     size_t bytes = 0;
     DeviceType device = DeviceType::kCuda;
+    cudaStream_t stream = 0;
+    bool async_free = false;
   };
 
   std::shared_ptr<Storage> storage_;
@@ -226,6 +259,23 @@ inline Status EnsureTensor(Tensor *tensor, const std::vector<int64_t> &shape, DT
     return Status::Ok();
   }
   auto allocated = Tensor::Allocate(shape, dtype, device);
+  if (!allocated.ok()) {
+    return allocated.status();
+  }
+  *tensor = allocated.value();
+  return Status::Ok();
+}
+
+inline Status EnsureTensorAsync(Tensor *tensor, const std::vector<int64_t> &shape, DType dtype,
+                                cudaStream_t stream = 0, DeviceType device = DeviceType::kCuda) {
+  if (tensor == nullptr) {
+    return Status::InvalidArgument("EnsureTensorAsync received null tensor");
+  }
+  if (tensor->defined() && tensor->shape() == shape && tensor->dtype() == dtype &&
+      tensor->device() == device) {
+    return Status::Ok();
+  }
+  auto allocated = Tensor::AllocateAsync(shape, dtype, stream, device);
   if (!allocated.ok()) {
     return allocated.status();
   }

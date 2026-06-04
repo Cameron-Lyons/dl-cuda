@@ -4,6 +4,7 @@
 #include "dl_cuda/detail/cuda_utils.hpp"
 
 #include <cuda_runtime.h>
+#include <cub/block/block_reduce.cuh>
 
 #include <cmath>
 #include <cstdint>
@@ -15,6 +16,8 @@ namespace {
 
 constexpr int kOptimizerThreads = 256;
 constexpr int kNormReductionMaxBlocks = 4096;
+
+using OptimizerBlockReduce = cub::BlockReduce<float, kOptimizerThreads>;
 
 Status ValidatePositiveFinite(float value, const char *name) {
   if (!std::isfinite(value) || !(value > 0.0f)) {
@@ -87,7 +90,7 @@ __global__ void AdamUpdateKernel(float *params, const float *grads, float *m, fl
 }
 
 __global__ void AccumulateNormSqKernel(const float *grads, int64_t n, float *total_norm_sq) {
-  __shared__ float shared[kOptimizerThreads];
+  __shared__ typename OptimizerBlockReduce::TempStorage reduce_storage;
   int tid = threadIdx.x;
   int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + tid;
 
@@ -96,19 +99,10 @@ __global__ void AccumulateNormSqKernel(const float *grads, int64_t n, float *tot
     float v = grads[i];
     local += v * v;
   }
-
-  shared[tid] = local;
-  __syncthreads();
-
-  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (tid < stride) {
-      shared[tid] += shared[tid + stride];
-    }
-    __syncthreads();
-  }
+  float block_sum = OptimizerBlockReduce(reduce_storage).Sum(local);
 
   if (tid == 0) {
-    atomicAdd(total_norm_sq, shared[0]);
+    atomicAdd(total_norm_sq, block_sum);
   }
 }
 
@@ -147,11 +141,11 @@ Status AdamOptimizer::EnsureState(RuntimeContext &ctx, const std::vector<Paramet
     }
 
     if (needs_init) {
-      auto m = Tensor::Allocate(param.value->shape(), DType::kFloat32);
+      auto m = Tensor::AllocateAsync(param.value->shape(), DType::kFloat32, ctx.stream());
       if (!m.ok()) {
         return m.status();
       }
-      auto v = Tensor::Allocate(param.value->shape(), DType::kFloat32);
+      auto v = Tensor::AllocateAsync(param.value->shape(), DType::kFloat32, ctx.stream());
       if (!v.ok()) {
         return v.status();
       }

@@ -3,6 +3,7 @@
 #include "dl_cuda/detail/cuda_utils.hpp"
 
 #include <cuda_runtime.h>
+#include <cub/block/block_reduce.cuh>
 
 #include <cfloat>
 #include <cmath>
@@ -15,6 +16,22 @@ namespace {
 
 constexpr int kLossThreads = 256;
 constexpr int kLossReductionMaxBlocks = 4096;
+
+using LossBlockReduce = cub::BlockReduce<float, kLossThreads>;
+
+struct BestClass {
+  float value;
+  int index;
+};
+
+struct BestClassReduce {
+  __device__ __forceinline__ BestClass operator()(const BestClass &a, const BestClass &b) const {
+    if (b.value > a.value || (b.value == a.value && b.index < a.index)) {
+      return b;
+    }
+    return a;
+  }
+};
 
 Status ValidateFloat2D(const Tensor &tensor, const char *name) {
   if (!tensor.defined()) {
@@ -80,7 +97,7 @@ __global__ void BinaryCrossEntropyKernel(const float *targets, const float *pred
 
 __global__ void BinaryCrossEntropyMetricKernel(const float *targets, const float *predictions,
                                                float *loss_sum, int64_t n, float epsilon) {
-  __shared__ float shared[kLossThreads];
+  __shared__ typename LossBlockReduce::TempStorage reduce_storage;
 
   int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   int64_t stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
@@ -92,25 +109,19 @@ __global__ void BinaryCrossEntropyMetricKernel(const float *targets, const float
     p = fmaxf(epsilon, fminf(1.0f - epsilon, p));
     local_loss += -(y * logf(p) + (1.0f - y) * logf(1.0f - p));
   }
-
-  shared[tid] = local_loss;
-  __syncthreads();
-
-  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (tid < stride) {
-      shared[tid] += shared[tid + stride];
-    }
-    __syncthreads();
-  }
+  float block_loss = LossBlockReduce(reduce_storage).Sum(local_loss);
 
   if (tid == 0) {
-    atomicAdd(loss_sum, shared[0]);
+    atomicAdd(loss_sum, block_loss);
   }
 }
 
 __global__ void CategoricalLogitsGradKernel(const int32_t *target_ids, const float *logits,
                                             float *grads, int64_t n, int64_t classes) {
-  __shared__ float shared[kLossThreads];
+  __shared__ typename LossBlockReduce::TempStorage max_storage;
+  __shared__ typename LossBlockReduce::TempStorage sum_storage;
+  __shared__ float row_max_shared;
+  __shared__ float row_sum_shared;
 
   int64_t row = static_cast<int64_t>(blockIdx.x);
   int tid = threadIdx.x;
@@ -133,16 +144,12 @@ __global__ void CategoricalLogitsGradKernel(const int32_t *target_ids, const flo
   for (int64_t c = tid; c < classes; c += blockDim.x) {
     local_max = fmaxf(local_max, row_logits[c]);
   }
-  shared[tid] = local_max;
-  __syncthreads();
-
-  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (tid < stride) {
-      shared[tid] = fmaxf(shared[tid], shared[tid + stride]);
-    }
-    __syncthreads();
+  float row_max = LossBlockReduce(max_storage).Reduce(local_max, cub::Max());
+  if (tid == 0) {
+    row_max_shared = row_max;
   }
-  float row_max = shared[0];
+  __syncthreads();
+  row_max = row_max_shared;
 
   float local_sum = 0.0f;
   for (int64_t c = tid; c < classes; c += blockDim.x) {
@@ -150,17 +157,14 @@ __global__ void CategoricalLogitsGradKernel(const int32_t *target_ids, const flo
     row_grads[c] = e;
     local_sum += e;
   }
-  shared[tid] = local_sum;
-  __syncthreads();
-
-  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (tid < stride) {
-      shared[tid] += shared[tid + stride];
-    }
-    __syncthreads();
+  float row_sum = LossBlockReduce(sum_storage).Sum(local_sum);
+  if (tid == 0) {
+    row_sum_shared = row_sum;
   }
+  __syncthreads();
+  row_sum = row_sum_shared;
 
-  float inv_sum = 1.0f / (shared[0] + 1e-20f);
+  float inv_sum = 1.0f / (row_sum + 1e-20f);
   float inv_n = 1.0f / static_cast<float>(n);
   for (int64_t c = tid; c < classes; c += blockDim.x) {
     float p = row_grads[c] * inv_sum;
@@ -171,8 +175,12 @@ __global__ void CategoricalLogitsGradKernel(const int32_t *target_ids, const flo
 __global__ void CategoricalLogitsMetricsKernel(const int32_t *target_ids, const float *logits,
                                                float *loss_sum, float *correct_sum, int64_t n,
                                                int64_t classes) {
-  __shared__ float shared_values[kLossThreads];
-  __shared__ int shared_indices[kLossThreads];
+  using BestClassBlockReduce = cub::BlockReduce<BestClass, kLossThreads>;
+
+  __shared__ typename BestClassBlockReduce::TempStorage best_storage;
+  __shared__ typename LossBlockReduce::TempStorage sum_storage;
+  __shared__ BestClass best_shared;
+  __shared__ float row_sum_shared;
 
   int64_t row = static_cast<int64_t>(blockIdx.x);
   int tid = threadIdx.x;
@@ -196,43 +204,30 @@ __global__ void CategoricalLogitsMetricsKernel(const int32_t *target_ids, const 
       local_best = static_cast<int>(c);
     }
   }
-  shared_values[tid] = local_max;
-  shared_indices[tid] = local_best;
-  __syncthreads();
-
-  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (tid < stride) {
-      float other_value = shared_values[tid + stride];
-      int other_index = shared_indices[tid + stride];
-      if (other_value > shared_values[tid] ||
-          (other_value == shared_values[tid] && other_index < shared_indices[tid])) {
-        shared_values[tid] = other_value;
-        shared_indices[tid] = other_index;
-      }
-    }
-    __syncthreads();
+  BestClass local = {local_max, local_best};
+  BestClass block_best = BestClassBlockReduce(best_storage).Reduce(local, BestClassReduce{});
+  if (tid == 0) {
+    best_shared = block_best;
   }
-  float row_max = shared_values[0];
-  int best = shared_indices[0];
+  __syncthreads();
+  block_best = best_shared;
+  float row_max = block_best.value;
+  int best = block_best.index;
 
   float local_sum = 0.0f;
   for (int64_t c = tid; c < classes; c += blockDim.x) {
     local_sum += expf(row_logits[c] - row_max);
   }
-  shared_values[tid] = local_sum;
-  __syncthreads();
-
-  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (tid < stride) {
-      shared_values[tid] += shared_values[tid + stride];
-    }
-    __syncthreads();
+  float row_sum = LossBlockReduce(sum_storage).Sum(local_sum);
+  if (tid == 0) {
+    row_sum_shared = row_sum;
   }
+  __syncthreads();
+  row_sum = row_sum_shared;
 
   if (tid == 0) {
     float target_logit = row_logits[target];
-    float sum = shared_values[0];
-    atomicAdd(loss_sum, logf(sum + 1e-20f) + row_max - target_logit);
+    atomicAdd(loss_sum, logf(row_sum + 1e-20f) + row_max - target_logit);
     if (best == static_cast<int>(target)) {
       atomicAdd(correct_sum, 1.0f);
     }
@@ -258,7 +253,8 @@ Status BinaryCrossEntropyBackward(RuntimeContext &ctx, const Tensor &targets,
   if (n <= 0) {
     return Status::InvalidArgument("BinaryCrossEntropyBackward requires non-empty tensors");
   }
-  DLCUDA_RETURN_IF_ERROR(EnsureTensor(prediction_grads, predictions.shape(), DType::kFloat32));
+  DLCUDA_RETURN_IF_ERROR(
+      EnsureTensorAsync(prediction_grads, predictions.shape(), DType::kFloat32, ctx.stream()));
 
   auto blocks = detail::BlocksForElements(n, kLossThreads);
   if (!blocks.ok()) {
@@ -323,7 +319,8 @@ Status CategoricalCrossEntropyBackwardFromLogits(RuntimeContext &ctx, const Tens
   int64_t n = categorical.rows;
   int64_t classes = categorical.classes;
 
-  DLCUDA_RETURN_IF_ERROR(EnsureTensor(logit_grads, logits.shape(), DType::kFloat32));
+  DLCUDA_RETURN_IF_ERROR(
+      EnsureTensorAsync(logit_grads, logits.shape(), DType::kFloat32, ctx.stream()));
 
   auto rows = detail::RowsForGrid(n, "categorical logits");
   if (!rows.ok()) {

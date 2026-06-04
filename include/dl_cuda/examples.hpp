@@ -16,7 +16,7 @@ struct TrainXorConfig {
   bool use_cublas = true;
   bool tf32 = true;
   uint64_t seed = 777ULL;
-  std::string checkpoint_path = "xor_v2.ckpt";
+  std::string checkpoint_path = "xor.ckpt";
   bool resume = false;
   bool save = true;
 };
@@ -35,7 +35,7 @@ struct TrainCharConfig {
   bool tf32 = true;
   uint64_t seed = 12345ULL;
   uint64_t sample_seed = 123ULL;
-  std::string checkpoint_path = "char_v2.ckpt";
+  std::string checkpoint_path = "char.ckpt";
   bool resume = false;
   bool save = true;
 };
@@ -50,7 +50,7 @@ struct SampleCharConfig {
   bool tf32 = true;
   uint64_t seed = 12345ULL;
   uint64_t sample_seed = 123ULL;
-  std::string checkpoint_path = "char_v2.ckpt";
+  std::string checkpoint_path = "char.ckpt";
 };
 
 Status TrainXor(const TrainXorConfig &cfg);

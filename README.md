@@ -2,11 +2,11 @@
 
 A GPU-accelerated deep learning framework in CUDA C++.
 
-## v2 (Backward-Incompatible) Architecture
+## Architecture
 
-This repository now uses a v2 API with breaking changes:
+This repository exposes a single API:
 
-- `Tensor` + typed shapes/dtypes (`float32`, `int32`) instead of raw pointer I/O
+- `Tensor` + typed shapes/dtypes (`float32`, `float16`, `bfloat16`, `int32`) instead of raw pointer I/O
 - `RuntimeContext` for cuBLAS/TF32/seed/stream control (no global runtime state)
 - `Module`/`Sequential` with explicit ownership (`std::unique_ptr`) and stable parameter caches
 - Explicit `Status`/`Result<T>` error propagation (no `exit(...)` fast-fail path)
@@ -41,7 +41,7 @@ ctest --test-dir build-host --output-on-failure
 ```sh
 ./build/dl-cuda train-xor --epochs 3000 --lr 0.1
 ./build/dl-cuda train-char --epochs 800 --print-every 50
-./build/dl-cuda sample-char --checkpoint char_v2.ckpt --gen-len 200
+./build/dl-cuda sample-char --checkpoint char.ckpt --gen-len 200
 ```
 
 Options may be passed as `--name value` or `--name=value`.
@@ -90,7 +90,7 @@ int main() {
 
 ## Checkpoints
 
-v2 checkpoints store:
+Checkpoints store:
 
 - format/version metadata
 - model name
@@ -100,9 +100,9 @@ v2 checkpoints store:
 
 ## Tests
 
-- `v2_host_tests`: host-only checks for `Status`, `Result`, and `CharVocab`
-- `v2_cli_tests`: host-only checks for the shared CLI/config parser
-- `v2_cuda_smoke_tests`: CUDA smoke test for the v2 forward/backward path
+- `host_tests`: host-only checks for `Status`, `Result`, and `CharVocab`
+- `cli_tests`: host-only checks for the shared CLI/config parser
+- `cuda_smoke_tests`: CUDA smoke test for the forward/backward path
 
 For a warnings-as-errors build on machines without `nvcc`, use:
 

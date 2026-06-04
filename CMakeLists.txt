@@ -78,6 +78,9 @@ if(DL_CUDA_ENABLE_CUDA)
     if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.0)
       list(APPEND _dl_cuda_default_archs 90)
     endif()
+    if(CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 12.8)
+      list(APPEND _dl_cuda_default_archs 100 120)
+    endif()
     set(CMAKE_CUDA_ARCHITECTURES ${_dl_cuda_default_archs})
     message(STATUS "Using default CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
     message(STATUS "Override with -DCMAKE_CUDA_ARCHITECTURES=<arch list> if needed.")
@@ -86,18 +89,22 @@ if(DL_CUDA_ENABLE_CUDA)
   find_package(CUDAToolkit REQUIRED)
 
   add_library(dl-cuda-core STATIC
-    src/v2/nn.cu
-    src/v2/optim.cu
-    src/v2/loss.cu
-    src/v2/checkpoint.cu
+    src/nn.cu
+    src/optim.cu
+    src/loss.cu
+    src/checkpoint.cu
   )
   target_include_directories(dl-cuda-core PUBLIC include)
   target_link_libraries(dl-cuda-core PUBLIC CUDA::cudart CUDA::cublas)
+  if(TARGET CUDA::cublasLt AND CUDAToolkit_VERSION VERSION_GREATER_EQUAL 11.0)
+    target_link_libraries(dl-cuda-core PUBLIC CUDA::cublasLt)
+    target_compile_definitions(dl-cuda-core PUBLIC DLCUDA_HAS_CUBLASLT=1)
+  endif()
   set_target_properties(dl-cuda-core PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
   dl_cuda_enable_warnings(dl-cuda-core)
 
   add_library(dl-cuda-examples STATIC
-    src/v2/examples_api.cu
+    src/examples_api.cu
   )
   target_include_directories(dl-cuda-examples PUBLIC include)
   target_link_libraries(dl-cuda-examples PUBLIC dl-cuda-core)
@@ -111,24 +118,24 @@ if(DL_CUDA_ENABLE_CUDA)
   dl_cuda_enable_warnings(dl-cuda)
 
   if(BUILD_TESTING)
-    add_executable(dl-cuda-v2-cuda-smoke-tests tests/v2_cuda_smoke_tests.cu)
-    target_include_directories(dl-cuda-v2-cuda-smoke-tests PRIVATE include)
-    target_link_libraries(dl-cuda-v2-cuda-smoke-tests PRIVATE dl-cuda-core)
-    dl_cuda_enable_warnings(dl-cuda-v2-cuda-smoke-tests)
-    add_test(NAME v2_cuda_smoke_tests COMMAND dl-cuda-v2-cuda-smoke-tests)
+    add_executable(dl-cuda-cuda-smoke-tests tests/cuda_smoke_tests.cu)
+    target_include_directories(dl-cuda-cuda-smoke-tests PRIVATE include)
+    target_link_libraries(dl-cuda-cuda-smoke-tests PRIVATE dl-cuda-core)
+    dl_cuda_enable_warnings(dl-cuda-cuda-smoke-tests)
+    add_test(NAME cuda_smoke_tests COMMAND dl-cuda-cuda-smoke-tests)
   endif()
 endif()
 
 if(BUILD_TESTING)
-  add_executable(dl-cuda-v2-host-tests tests/v2_host_api_tests.cpp)
-  target_include_directories(dl-cuda-v2-host-tests PRIVATE include)
-  dl_cuda_enable_warnings(dl-cuda-v2-host-tests)
-  add_test(NAME v2_host_tests COMMAND dl-cuda-v2-host-tests)
+  add_executable(dl-cuda-host-tests tests/host_api_tests.cpp)
+  target_include_directories(dl-cuda-host-tests PRIVATE include)
+  dl_cuda_enable_warnings(dl-cuda-host-tests)
+  add_test(NAME host_tests COMMAND dl-cuda-host-tests)
 
-  add_executable(dl-cuda-v2-cli-tests tests/v2_cli_parse_tests.cpp)
-  target_include_directories(dl-cuda-v2-cli-tests PRIVATE examples include)
-  dl_cuda_enable_warnings(dl-cuda-v2-cli-tests)
-  add_test(NAME v2_cli_tests COMMAND dl-cuda-v2-cli-tests)
+  add_executable(dl-cuda-cli-tests tests/cli_parse_tests.cpp)
+  target_include_directories(dl-cuda-cli-tests PRIVATE examples include)
+  dl_cuda_enable_warnings(dl-cuda-cli-tests)
+  add_test(NAME cli_tests COMMAND dl-cuda-cli-tests)
 endif()
 
 add_custom_target(lint

@@ -2,8 +2,12 @@
 
 #include "dl_cuda/detail/cuda_utils.hpp"
 
+#if defined(DLCUDA_HAS_CUBLASLT)
+#include <cublasLt.h>
+#endif
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
+#include <cub/block/block_reduce.cuh>
 
 #include <cfloat>
 #include <cmath>
@@ -18,6 +22,142 @@ namespace {
 
 constexpr int kCudaThreads = 256;
 constexpr int kLinearTile = 16;
+
+using CudaBlockReduce = cub::BlockReduce<float, kCudaThreads>;
+
+#if defined(DLCUDA_HAS_CUBLASLT)
+
+struct CublasLtMatmulDescOwner {
+  ~CublasLtMatmulDescOwner() {
+    if (desc != nullptr) {
+      cublasLtMatmulDescDestroy(desc);
+    }
+  }
+
+  cublasLtMatmulDesc_t desc = nullptr;
+};
+
+struct CublasLtMatrixLayoutOwner {
+  ~CublasLtMatrixLayoutOwner() {
+    if (layout != nullptr) {
+      cublasLtMatrixLayoutDestroy(layout);
+    }
+  }
+
+  cublasLtMatrixLayout_t layout = nullptr;
+};
+
+struct CublasLtPreferenceOwner {
+  ~CublasLtPreferenceOwner() {
+    if (preference != nullptr) {
+      cublasLtMatmulPreferenceDestroy(preference);
+    }
+  }
+
+  cublasLtMatmulPreference_t preference = nullptr;
+};
+
+bool IsCublasLtUnsupported(cublasStatus_t status) {
+  return status == CUBLAS_STATUS_NOT_SUPPORTED || status == CUBLAS_STATUS_ARCH_MISMATCH;
+}
+
+Status CublasLtStatus(cublasStatus_t status, const std::string &context) {
+  if (status == CUBLAS_STATUS_SUCCESS) {
+    return Status::Ok();
+  }
+  if (IsCublasLtUnsupported(status)) {
+    return Status::Unsupported(context + " is not supported by cuBLASLt");
+  }
+  return detail::CublasStatus(status, context);
+}
+
+cublasComputeType_t LinearForwardComputeType(const RuntimeContext &ctx) {
+#if defined(CUBLAS_VERSION) && CUBLAS_VERSION >= 11000
+  if (ctx.tf32()) {
+    return CUBLAS_COMPUTE_32F_FAST_TF32;
+  }
+#else
+  (void)ctx;
+#endif
+  return CUBLAS_COMPUTE_32F;
+}
+
+Status LinearForwardCublasLt(RuntimeContext &ctx, const Tensor &input, const Tensor &weight,
+                             const Tensor &bias, Tensor *forward_output, int out_features,
+                             int batch, int in_features) {
+  Status lt_status = ctx.EnsureCublasLt();
+  if (!lt_status.ok()) {
+    return Status::Unsupported("cuBLASLt unavailable: " + lt_status.message());
+  }
+
+  CublasLtMatmulDescOwner op_desc;
+  cublasStatus_t status =
+      cublasLtMatmulDescCreate(&op_desc.desc, LinearForwardComputeType(ctx), CUDA_R_32F);
+  DLCUDA_RETURN_IF_ERROR(CublasLtStatus(status, "Linear forward cublasLtMatmulDescCreate"));
+
+  cublasOperation_t trans = CUBLAS_OP_N;
+  status = cublasLtMatmulDescSetAttribute(op_desc.desc, CUBLASLT_MATMUL_DESC_TRANSA, &trans,
+                                          sizeof(trans));
+  DLCUDA_RETURN_IF_ERROR(CublasLtStatus(status, "Linear forward cuBLASLt transA"));
+  status = cublasLtMatmulDescSetAttribute(op_desc.desc, CUBLASLT_MATMUL_DESC_TRANSB, &trans,
+                                          sizeof(trans));
+  DLCUDA_RETURN_IF_ERROR(CublasLtStatus(status, "Linear forward cuBLASLt transB"));
+
+  cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_BIAS;
+  status = cublasLtMatmulDescSetAttribute(op_desc.desc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue,
+                                          sizeof(epilogue));
+  DLCUDA_RETURN_IF_ERROR(CublasLtStatus(status, "Linear forward cuBLASLt bias epilogue"));
+  const void *bias_ptr = bias.data();
+  status = cublasLtMatmulDescSetAttribute(op_desc.desc, CUBLASLT_MATMUL_DESC_BIAS_POINTER,
+                                          &bias_ptr, sizeof(bias_ptr));
+  DLCUDA_RETURN_IF_ERROR(CublasLtStatus(status, "Linear forward cuBLASLt bias pointer"));
+
+  CublasLtMatrixLayoutOwner weight_desc;
+  status = cublasLtMatrixLayoutCreate(&weight_desc.layout, CUDA_R_32F, out_features, in_features,
+                                      out_features);
+  DLCUDA_RETURN_IF_ERROR(CublasLtStatus(status, "Linear forward cuBLASLt weight layout"));
+
+  CublasLtMatrixLayoutOwner input_desc;
+  status =
+      cublasLtMatrixLayoutCreate(&input_desc.layout, CUDA_R_32F, in_features, batch, in_features);
+  DLCUDA_RETURN_IF_ERROR(CublasLtStatus(status, "Linear forward cuBLASLt input layout"));
+
+  CublasLtMatrixLayoutOwner output_desc;
+  status = cublasLtMatrixLayoutCreate(&output_desc.layout, CUDA_R_32F, out_features, batch,
+                                      out_features);
+  DLCUDA_RETURN_IF_ERROR(CublasLtStatus(status, "Linear forward cuBLASLt output layout"));
+
+  CublasLtPreferenceOwner preference;
+  status = cublasLtMatmulPreferenceCreate(&preference.preference);
+  DLCUDA_RETURN_IF_ERROR(CublasLtStatus(status, "Linear forward cublasLtMatmulPreferenceCreate"));
+
+  constexpr size_t kWorkspaceBytes = 0;
+  status = cublasLtMatmulPreferenceSetAttribute(preference.preference,
+                                                CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+                                                &kWorkspaceBytes, sizeof(kWorkspaceBytes));
+  DLCUDA_RETURN_IF_ERROR(CublasLtStatus(status, "Linear forward cuBLASLt workspace preference"));
+
+  cublasLtMatmulHeuristicResult_t heuristic = {};
+  int returned_results = 0;
+  status = cublasLtMatmulAlgoGetHeuristic(ctx.cublaslt_handle(), op_desc.desc, weight_desc.layout,
+                                          input_desc.layout, output_desc.layout, output_desc.layout,
+                                          preference.preference, 1, &heuristic, &returned_results);
+  DLCUDA_RETURN_IF_ERROR(CublasLtStatus(status, "Linear forward cublasLtMatmulAlgoGetHeuristic"));
+  if (returned_results == 0) {
+    return Status::Unsupported("Linear forward cuBLASLt found no supported matmul algorithm");
+  }
+
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  status = cublasLtMatmul(ctx.cublaslt_handle(), op_desc.desc, &alpha, weight.data_as<float>(),
+                          weight_desc.layout, input.data_as<float>(), input_desc.layout, &beta,
+                          forward_output->data_as<float>(), output_desc.layout,
+                          forward_output->data_as<float>(), output_desc.layout, &heuristic.algo,
+                          nullptr, kWorkspaceBytes, ctx.stream());
+  return CublasLtStatus(status, "Linear forward cublasLtMatmul");
+}
+
+#endif
 
 Status ValidateFloatTensor(const Tensor &tensor, const char *name) {
   if (!tensor.defined()) {
@@ -101,7 +241,7 @@ __global__ void LinearBackwardWeightKernel(const float *input, const float *grad
 
 __global__ void LinearBackwardBiasKernel(const float *grad_output, float *grad_bias, int64_t batch,
                                          int64_t out_features) {
-  __shared__ float shared[kCudaThreads];
+  __shared__ typename CudaBlockReduce::TempStorage reduce_storage;
 
   int64_t col = static_cast<int64_t>(blockIdx.x);
   int tid = threadIdx.x;
@@ -113,18 +253,10 @@ __global__ void LinearBackwardBiasKernel(const float *grad_output, float *grad_b
   for (int64_t n = tid; n < batch; n += blockDim.x) {
     sum += grad_output[n * out_features + col];
   }
-  shared[tid] = sum;
-  __syncthreads();
-
-  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (tid < stride) {
-      shared[tid] += shared[tid + stride];
-    }
-    __syncthreads();
-  }
+  float block_sum = CudaBlockReduce(reduce_storage).Sum(sum);
 
   if (tid == 0) {
-    grad_bias[col] = shared[0];
+    grad_bias[col] = block_sum;
   }
 }
 
@@ -163,7 +295,10 @@ __global__ void SigmoidBackwardKernel(const float *grad_output, const float *cac
 
 __global__ void SoftmaxForwardKernel(const float *input, float *output, int64_t num_rows,
                                      int64_t row_width) {
-  __shared__ float shared[kCudaThreads];
+  __shared__ typename CudaBlockReduce::TempStorage max_storage;
+  __shared__ typename CudaBlockReduce::TempStorage sum_storage;
+  __shared__ float row_max_shared;
+  __shared__ float row_sum_shared;
 
   int64_t row = static_cast<int64_t>(blockIdx.x);
   int tid = threadIdx.x;
@@ -178,16 +313,12 @@ __global__ void SoftmaxForwardKernel(const float *input, float *output, int64_t 
   for (int64_t c = tid; c < row_width; c += blockDim.x) {
     local_max = fmaxf(local_max, in_row[c]);
   }
-  shared[tid] = local_max;
-  __syncthreads();
-
-  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (tid < stride) {
-      shared[tid] = fmaxf(shared[tid], shared[tid + stride]);
-    }
-    __syncthreads();
+  float row_max = CudaBlockReduce(max_storage).Reduce(local_max, cub::Max());
+  if (tid == 0) {
+    row_max_shared = row_max;
   }
-  float row_max = shared[0];
+  __syncthreads();
+  row_max = row_max_shared;
 
   float local_sum = 0.0f;
   for (int64_t c = tid; c < row_width; c += blockDim.x) {
@@ -195,16 +326,13 @@ __global__ void SoftmaxForwardKernel(const float *input, float *output, int64_t 
     out_row[c] = e;
     local_sum += e;
   }
-  shared[tid] = local_sum;
-  __syncthreads();
-
-  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (tid < stride) {
-      shared[tid] += shared[tid + stride];
-    }
-    __syncthreads();
+  float row_sum = CudaBlockReduce(sum_storage).Sum(local_sum);
+  if (tid == 0) {
+    row_sum_shared = row_sum;
   }
-  float inv_sum = 1.0f / (shared[0] + 1e-20f);
+  __syncthreads();
+  row_sum = row_sum_shared;
+  float inv_sum = 1.0f / (row_sum + 1e-20f);
 
   for (int64_t c = tid; c < row_width; c += blockDim.x) {
     out_row[c] *= inv_sum;
@@ -213,7 +341,8 @@ __global__ void SoftmaxForwardKernel(const float *input, float *output, int64_t 
 
 __global__ void SoftmaxBackwardKernel(const float *grad_output, const float *softmax_output,
                                       float *grad_input, int64_t num_rows, int64_t row_width) {
-  __shared__ float shared[kCudaThreads];
+  __shared__ typename CudaBlockReduce::TempStorage reduce_storage;
+  __shared__ float dot_shared;
 
   int64_t row = static_cast<int64_t>(blockIdx.x);
   int tid = threadIdx.x;
@@ -229,16 +358,12 @@ __global__ void SoftmaxBackwardKernel(const float *grad_output, const float *sof
   for (int64_t c = tid; c < row_width; c += blockDim.x) {
     local_dot += dy[c] * s[c];
   }
-  shared[tid] = local_dot;
-  __syncthreads();
-
-  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (tid < stride) {
-      shared[tid] += shared[tid + stride];
-    }
-    __syncthreads();
+  float dot = CudaBlockReduce(reduce_storage).Sum(local_dot);
+  if (tid == 0) {
+    dot_shared = dot;
   }
-  float dot = shared[0];
+  __syncthreads();
+  dot = dot_shared;
 
   for (int64_t c = tid; c < row_width; c += blockDim.x) {
     dx[c] = s[c] * (dy[c] - dot);
@@ -382,22 +507,23 @@ Linear::Linear(int64_t in_features, int64_t out_features, RuntimeContext &ctx)
     return;
   }
 
-  auto weight = Tensor::Allocate({in_features_, out_features_}, DType::kFloat32);
+  auto weight = Tensor::AllocateAsync({in_features_, out_features_}, DType::kFloat32, ctx.stream());
   if (!weight.ok()) {
     init_status_ = weight.status();
     return;
   }
-  auto bias = Tensor::Allocate({out_features_}, DType::kFloat32);
+  auto bias = Tensor::AllocateAsync({out_features_}, DType::kFloat32, ctx.stream());
   if (!bias.ok()) {
     init_status_ = bias.status();
     return;
   }
-  auto grad_weight = Tensor::Allocate({in_features_, out_features_}, DType::kFloat32);
+  auto grad_weight =
+      Tensor::AllocateAsync({in_features_, out_features_}, DType::kFloat32, ctx.stream());
   if (!grad_weight.ok()) {
     init_status_ = grad_weight.status();
     return;
   }
-  auto grad_bias = Tensor::Allocate({out_features_}, DType::kFloat32);
+  auto grad_bias = Tensor::AllocateAsync({out_features_}, DType::kFloat32, ctx.stream());
   if (!grad_bias.ok()) {
     init_status_ = grad_bias.status();
     return;
@@ -451,7 +577,8 @@ Status Linear::Forward(RuntimeContext &ctx, const Tensor &input, Tensor *output)
     return Status::InvalidArgument(oss.str());
   }
 
-  DLCUDA_RETURN_IF_ERROR(EnsureTensor(&forward_output_, {batch, out_features_}, DType::kFloat32));
+  DLCUDA_RETURN_IF_ERROR(
+      EnsureTensorAsync(&forward_output_, {batch, out_features_}, DType::kFloat32, ctx.stream()));
   cached_input_ = input;
   last_batch_ = batch;
   if (batch == 0) {
@@ -478,21 +605,34 @@ Status Linear::Forward(RuntimeContext &ctx, const Tensor &input, Tensor *output)
 
     const float alpha = 1.0f;
     const float beta = 0.0f;
-    DLCUDA_RETURN_IF_ERROR(detail::CublasStatus(
-        cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, out_features_int.value(), batch_int.value(),
-                    in_features_int.value(), &alpha, weight_.data_as<float>(),
-                    out_features_int.value(), input.data_as<float>(), in_features_int.value(),
-                    &beta, forward_output_.data_as<float>(), out_features_int.value()),
-        "Linear forward cublasSgemm"));
-
-    int64_t total = batch * out_features_;
-    auto blocks = detail::BlocksForElements(total, kCudaThreads);
-    if (!blocks.ok()) {
-      return blocks.status();
+    bool used_cublaslt = false;
+#if defined(DLCUDA_HAS_CUBLASLT)
+    Status lt_status =
+        LinearForwardCublasLt(ctx, input, weight_, bias_, &forward_output_,
+                              out_features_int.value(), batch_int.value(), in_features_int.value());
+    if (lt_status.ok()) {
+      used_cublaslt = true;
+    } else if (lt_status.code() != StatusCode::kUnsupported) {
+      return lt_status;
     }
-    AddBiasKernel<<<blocks.value(), kCudaThreads, 0, ctx.stream()>>>(
-        forward_output_.data_as<float>(), bias_.data_as<float>(), batch, out_features_);
-    DLCUDA_RETURN_IF_ERROR(detail::CheckKernelLaunch("Linear add-bias kernel"));
+#endif
+    if (!used_cublaslt) {
+      DLCUDA_RETURN_IF_ERROR(detail::CublasStatus(
+          cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, out_features_int.value(), batch_int.value(),
+                      in_features_int.value(), &alpha, weight_.data_as<float>(),
+                      out_features_int.value(), input.data_as<float>(), in_features_int.value(),
+                      &beta, forward_output_.data_as<float>(), out_features_int.value()),
+          "Linear forward cublasSgemm"));
+
+      int64_t total = batch * out_features_;
+      auto blocks = detail::BlocksForElements(total, kCudaThreads);
+      if (!blocks.ok()) {
+        return blocks.status();
+      }
+      AddBiasKernel<<<blocks.value(), kCudaThreads, 0, ctx.stream()>>>(
+          forward_output_.data_as<float>(), bias_.data_as<float>(), batch, out_features_);
+      DLCUDA_RETURN_IF_ERROR(detail::CheckKernelLaunch("Linear add-bias kernel"));
+    }
   } else {
     auto x_blocks = detail::BlocksForElements(out_features_, kLinearTile);
     if (!x_blocks.ok()) {
@@ -531,8 +671,8 @@ Status Linear::Backward(RuntimeContext &ctx, const Tensor &grad_output, Tensor *
   }
 
   if (need_grad_input) {
-    DLCUDA_RETURN_IF_ERROR(
-        EnsureTensor(&backward_output_, {last_batch_, in_features_}, DType::kFloat32));
+    DLCUDA_RETURN_IF_ERROR(EnsureTensorAsync(&backward_output_, {last_batch_, in_features_},
+                                             DType::kFloat32, ctx.stream()));
   }
   if (last_batch_ == 0) {
     DLCUDA_RETURN_IF_ERROR(grad_weight_.FillZero(ctx.stream()));
@@ -651,7 +791,8 @@ Status ReLU::Forward(RuntimeContext &ctx, const Tensor &input, Tensor *output) {
   }
   DLCUDA_RETURN_IF_ERROR(ValidateFloatTensor(input, "ReLU input"));
 
-  DLCUDA_RETURN_IF_ERROR(EnsureTensor(&forward_output_, input.shape(), DType::kFloat32));
+  DLCUDA_RETURN_IF_ERROR(
+      EnsureTensorAsync(&forward_output_, input.shape(), DType::kFloat32, ctx.stream()));
   cached_input_ = input;
 
   auto blocks = detail::BlocksForElements(input.numel(), kCudaThreads);
@@ -679,7 +820,8 @@ Status ReLU::Backward(RuntimeContext &ctx, const Tensor &grad_output, Tensor *gr
     return Status::Ok();
   }
 
-  DLCUDA_RETURN_IF_ERROR(EnsureTensor(&backward_output_, grad_output.shape(), DType::kFloat32));
+  DLCUDA_RETURN_IF_ERROR(
+      EnsureTensorAsync(&backward_output_, grad_output.shape(), DType::kFloat32, ctx.stream()));
   auto blocks = detail::BlocksForElements(grad_output.numel(), kCudaThreads);
   if (!blocks.ok()) {
     return blocks.status();
@@ -706,7 +848,8 @@ Status Sigmoid::Forward(RuntimeContext &ctx, const Tensor &input, Tensor *output
   }
   DLCUDA_RETURN_IF_ERROR(ValidateFloatTensor(input, "Sigmoid input"));
 
-  DLCUDA_RETURN_IF_ERROR(EnsureTensor(&cached_output_, input.shape(), DType::kFloat32));
+  DLCUDA_RETURN_IF_ERROR(
+      EnsureTensorAsync(&cached_output_, input.shape(), DType::kFloat32, ctx.stream()));
 
   auto blocks = detail::BlocksForElements(input.numel(), kCudaThreads);
   if (!blocks.ok()) {
@@ -733,7 +876,8 @@ Status Sigmoid::Backward(RuntimeContext &ctx, const Tensor &grad_output, Tensor 
     return Status::Ok();
   }
 
-  DLCUDA_RETURN_IF_ERROR(EnsureTensor(&backward_output_, grad_output.shape(), DType::kFloat32));
+  DLCUDA_RETURN_IF_ERROR(
+      EnsureTensorAsync(&backward_output_, grad_output.shape(), DType::kFloat32, ctx.stream()));
   auto blocks = detail::BlocksForElements(grad_output.numel(), kCudaThreads);
   if (!blocks.ok()) {
     return blocks.status();
@@ -767,7 +911,8 @@ Status Softmax::Forward(RuntimeContext &ctx, const Tensor &input, Tensor *output
     return Status::InvalidArgument("Softmax row width must be positive");
   }
 
-  DLCUDA_RETURN_IF_ERROR(EnsureTensor(&cached_output_, input.shape(), DType::kFloat32));
+  DLCUDA_RETURN_IF_ERROR(
+      EnsureTensorAsync(&cached_output_, input.shape(), DType::kFloat32, ctx.stream()));
 
   auto rows = detail::RowsForGrid(num_rows_, "softmax");
   if (!rows.ok()) {
@@ -791,7 +936,8 @@ Status Softmax::Backward(RuntimeContext &ctx, const Tensor &grad_output, Tensor 
   DLCUDA_RETURN_IF_ERROR(
       EnsureSameShapeAndType(grad_output, cached_output_, "grad_output", "cached_output"));
 
-  DLCUDA_RETURN_IF_ERROR(EnsureTensor(&backward_output_, grad_output.shape(), DType::kFloat32));
+  DLCUDA_RETURN_IF_ERROR(
+      EnsureTensorAsync(&backward_output_, grad_output.shape(), DType::kFloat32, ctx.stream()));
   if (num_rows_ > 0 && row_width_ == 0) {
     return Status::InvalidArgument("Softmax row width must be positive");
   }
@@ -826,12 +972,13 @@ Embedding::Embedding(int64_t vocab_size, int64_t embedding_dim, RuntimeContext &
     return;
   }
 
-  auto table = Tensor::Allocate({vocab_size_, embedding_dim_}, DType::kFloat32);
+  auto table = Tensor::AllocateAsync({vocab_size_, embedding_dim_}, DType::kFloat32, ctx.stream());
   if (!table.ok()) {
     init_status_ = table.status();
     return;
   }
-  auto grad_table = Tensor::Allocate({vocab_size_, embedding_dim_}, DType::kFloat32);
+  auto grad_table =
+      Tensor::AllocateAsync({vocab_size_, embedding_dim_}, DType::kFloat32, ctx.stream());
   if (!grad_table.ok()) {
     init_status_ = grad_table.status();
     return;
@@ -869,8 +1016,8 @@ Status Embedding::Forward(RuntimeContext &ctx, const Tensor &input, Tensor *outp
 
   cached_token_ids_ = input;
 
-  DLCUDA_RETURN_IF_ERROR(
-      EnsureTensor(&forward_output_, {last_num_tokens_, embedding_dim_}, DType::kFloat32));
+  DLCUDA_RETURN_IF_ERROR(EnsureTensorAsync(&forward_output_, {last_num_tokens_, embedding_dim_},
+                                           DType::kFloat32, ctx.stream()));
 
   int64_t total = last_num_tokens_ * embedding_dim_;
   auto blocks = detail::BlocksForElements(total, kCudaThreads);
