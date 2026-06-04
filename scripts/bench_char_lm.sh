@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BIN="${DL_CUDA_CHAR_BIN:-./build/dl-cuda-char-lm}"
+BIN="${DL_CUDA_BIN:-./build/dl-cuda}"
 EPOCHS="${1:-${EPOCHS:-200}}"
 SEQ_LEN="${2:-${SEQ_LEN:-64}}"
 PRINT_EVERY="${PRINT_EVERY:-$EPOCHS}"
@@ -17,6 +17,7 @@ if [ ! -x "$BIN" ]; then
 fi
 
 "$BIN" \
+  train-char \
   --epochs "$EPOCHS" \
   --seq-len "$SEQ_LEN" \
   --print-every "$PRINT_EVERY" \

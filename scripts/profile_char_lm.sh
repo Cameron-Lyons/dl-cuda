@@ -3,7 +3,7 @@ set -euo pipefail
 
 mkdir -p profiles
 
-BIN="${DL_CUDA_CHAR_BIN:-./build/dl-cuda-char-lm}"
+BIN="${DL_CUDA_BIN:-./build/dl-cuda}"
 PROFILE_MODE="${PROFILE_MODE:-train}"   # train | e2e
 EPOCHS="${EPOCHS:-80}"
 PRINT_EVERY="${PRINT_EVERY:-20}"
@@ -20,7 +20,7 @@ if [ ! -x "$BIN" ]; then
   exit 1
 fi
 
-RUN_ARGS=(--epochs "${EPOCHS}")
+RUN_ARGS=(train-char --epochs "${EPOCHS}")
 
 case "${PROFILE_MODE}" in
   train)

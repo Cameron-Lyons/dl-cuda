@@ -68,13 +68,6 @@ Status ZeroGradients(RuntimeContext &ctx, const std::vector<ParameterRef> &param
   return Status::Ok();
 }
 
-__global__ void SgdUpdateKernel(float *params, const float *grads, float lr, int64_t n) {
-  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (idx < n) {
-    params[idx] -= lr * grads[idx];
-  }
-}
-
 __global__ void AdamUpdateKernel(float *params, const float *grads, float *m, float *v, float lr,
                                  float beta1, float beta2, float epsilon,
                                  float inv_bias_correction1, float inv_bias_correction2,
@@ -133,28 +126,6 @@ __global__ void ScaleByFactorKernel(float *data, const float *clip_scale, int64_
 }
 
 } // namespace
-
-Status SGDOptimizer::ZeroGrad(RuntimeContext &ctx, const std::vector<ParameterRef> &params) {
-  return ZeroGradients(ctx, params);
-}
-
-Status SGDOptimizer::Step(RuntimeContext &ctx, const std::vector<ParameterRef> &params, float lr) {
-  DLCUDA_RETURN_IF_ERROR(ValidatePositiveFinite(lr, "SGD lr"));
-  for (const auto &param : params) {
-    DLCUDA_RETURN_IF_ERROR(ValidateParameterAndGradient(param, "SGD"));
-
-    auto blocks = detail::BlocksForElements(param.value->numel(), kOptimizerThreads);
-    if (!blocks.ok()) {
-      return blocks.status();
-    }
-    if (blocks.value() > 0) {
-      SgdUpdateKernel<<<blocks.value(), kOptimizerThreads, 0, ctx.stream()>>>(
-          param.value->data_as<float>(), param.grad->data_as<float>(), lr, param.value->numel());
-      DLCUDA_RETURN_IF_ERROR(detail::CheckKernelLaunch("SGD update kernel"));
-    }
-  }
-  return Status::Ok();
-}
 
 Status AdamOptimizer::EnsureState(RuntimeContext &ctx, const std::vector<ParameterRef> &params) {
   std::unordered_set<const Tensor *> active_params;

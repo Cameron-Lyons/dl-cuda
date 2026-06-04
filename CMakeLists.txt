@@ -19,10 +19,6 @@ option(DL_CUDA_PER_THREAD_DEFAULT_STREAM
   "Compile CUDA code with --default-stream=per-thread"
   ON
 )
-option(DL_CUDA_BUILD_LEGACY_TESTS
-  "Build legacy v1 tests that exercise src/*.cuh directly"
-  OFF
-)
 
 function(dl_cuda_enable_warnings target_name)
   if(DL_CUDA_WARNINGS_AS_ERRORS)
@@ -108,17 +104,11 @@ if(DL_CUDA_ENABLE_CUDA)
   set_target_properties(dl-cuda-examples PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
   dl_cuda_enable_warnings(dl-cuda-examples)
 
-  function(dl_cuda_add_example_executable target_name source_file)
-    add_executable(${target_name} ${source_file})
-    target_include_directories(${target_name} PRIVATE include examples)
-    target_link_libraries(${target_name} PRIVATE dl-cuda-examples)
-    set_target_properties(${target_name} PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-    dl_cuda_enable_warnings(${target_name})
-  endfunction()
-
-  dl_cuda_add_example_executable(dl-cuda examples/cli.cu)
-  dl_cuda_add_example_executable(dl-cuda-xor examples/xor.cu)
-  dl_cuda_add_example_executable(dl-cuda-char-lm examples/char_lm.cu)
+  add_executable(dl-cuda examples/cli.cu)
+  target_include_directories(dl-cuda PRIVATE include examples)
+  target_link_libraries(dl-cuda PRIVATE dl-cuda-examples)
+  set_target_properties(dl-cuda PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
+  dl_cuda_enable_warnings(dl-cuda)
 
   if(BUILD_TESTING)
     add_executable(dl-cuda-v2-cuda-smoke-tests tests/v2_cuda_smoke_tests.cu)
@@ -126,20 +116,6 @@ if(DL_CUDA_ENABLE_CUDA)
     target_link_libraries(dl-cuda-v2-cuda-smoke-tests PRIVATE dl-cuda-core)
     dl_cuda_enable_warnings(dl-cuda-v2-cuda-smoke-tests)
     add_test(NAME v2_cuda_smoke_tests COMMAND dl-cuda-v2-cuda-smoke-tests)
-
-    if(DL_CUDA_BUILD_LEGACY_TESTS)
-      add_executable(dl-cuda-legacy-host-tests tests/host_tests.cu)
-      target_include_directories(dl-cuda-legacy-host-tests PRIVATE src)
-      target_link_libraries(dl-cuda-legacy-host-tests PRIVATE CUDA::cudart CUDA::cublas)
-      dl_cuda_enable_warnings(dl-cuda-legacy-host-tests)
-      add_test(NAME legacy_host_tests COMMAND dl-cuda-legacy-host-tests)
-
-      add_executable(dl-cuda-legacy-gpu-tests tests/gpu_correctness_tests.cu)
-      target_include_directories(dl-cuda-legacy-gpu-tests PRIVATE src)
-      target_link_libraries(dl-cuda-legacy-gpu-tests PRIVATE CUDA::cudart CUDA::cublas)
-      dl_cuda_enable_warnings(dl-cuda-legacy-gpu-tests)
-      add_test(NAME legacy_gpu_tests COMMAND dl-cuda-legacy-gpu-tests)
-    endif()
   endif()
 endif()
 

@@ -17,14 +17,6 @@ Status BinaryCrossEntropyBackward(RuntimeContext &ctx, const Tensor &targets,
 Result<float> BinaryCrossEntropyLoss(RuntimeContext &ctx, const Tensor &targets,
                                      const Tensor &predictions);
 
-Status CategoricalCrossEntropyBackwardFromIds(RuntimeContext &ctx, const Tensor &target_ids,
-                                              const Tensor &probabilities,
-                                              Tensor *probability_grads);
-
-Result<ClassificationMetrics> CategoricalCrossEntropyMetricsFromIds(RuntimeContext &ctx,
-                                                                    const Tensor &target_ids,
-                                                                    const Tensor &probabilities);
-
 Status CategoricalCrossEntropyBackwardFromLogits(RuntimeContext &ctx, const Tensor &target_ids,
                                                  const Tensor &logits, Tensor *logit_grads);
 
