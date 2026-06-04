@@ -89,7 +89,9 @@ if(DL_CUDA_ENABLE_CUDA)
   find_package(CUDAToolkit REQUIRED)
 
   add_library(dl-cuda-core STATIC
+    src/autograd.cu
     src/nn.cu
+    src/tensor_ops.cu
     src/optim.cu
     src/loss.cu
     src/checkpoint.cu
@@ -118,11 +120,18 @@ if(DL_CUDA_ENABLE_CUDA)
   dl_cuda_enable_warnings(dl-cuda)
 
   if(BUILD_TESTING)
-    add_executable(dl-cuda-cuda-smoke-tests tests/cuda_smoke_tests.cu)
-    target_include_directories(dl-cuda-cuda-smoke-tests PRIVATE include)
-    target_link_libraries(dl-cuda-cuda-smoke-tests PRIVATE dl-cuda-core)
-    dl_cuda_enable_warnings(dl-cuda-cuda-smoke-tests)
-    add_test(NAME cuda_smoke_tests COMMAND dl-cuda-cuda-smoke-tests)
+    add_executable(dl-cuda-gpu-correctness-tests tests/gpu_correctness_tests.cu)
+    target_include_directories(dl-cuda-gpu-correctness-tests PRIVATE include)
+    target_link_libraries(dl-cuda-gpu-correctness-tests PRIVATE dl-cuda-core)
+    dl_cuda_enable_warnings(dl-cuda-gpu-correctness-tests)
+    add_test(NAME gpu_correctness_tests COMMAND dl-cuda-gpu-correctness-tests)
+    set_tests_properties(gpu_correctness_tests PROPERTIES LABELS gpu)
+
+    add_test(NAME char_lm_smoke
+      COMMAND dl-cuda train-char --seq-len 8 --d-model 8 --epochs 2 --print-every 1
+              --val-every 1 --val-windows 1 --test-windows 1 --gen-len 16 --no-save
+    )
+    set_tests_properties(char_lm_smoke PROPERTIES LABELS gpu)
   endif()
 endif()
 

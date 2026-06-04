@@ -150,6 +150,26 @@ public:
     return storage_ ? storage_->device : DeviceType::kCuda;
   }
 
+  [[nodiscard]] Result<Tensor> Reshape(const std::vector<int64_t> &shape) const {
+    if (!defined()) {
+      return Status::InvalidArgument("Cannot reshape an undefined tensor");
+    }
+    auto numel_result = ShapeNumel(shape);
+    if (!numel_result.ok()) {
+      return numel_result.status();
+    }
+    if (numel_result.value() != numel_) {
+      return Status::InvalidArgument("Reshape element count must match tensor element count");
+    }
+
+    Tensor out;
+    out.storage_ = storage_;
+    out.shape_ = shape;
+    out.numel_ = numel_result.value();
+    out.dtype_ = dtype_;
+    return out;
+  }
+
   Status FillZero(cudaStream_t stream = 0) {
     if (!defined()) {
       return Status::InvalidArgument("Tensor is undefined");
