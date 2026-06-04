@@ -11,3 +11,4 @@
 #include "dl_cuda/status.hpp"
 #include "dl_cuda/tensor.hpp"
 #include "dl_cuda/tensor_ops.hpp"
+#include "dl_cuda/trainer.hpp"

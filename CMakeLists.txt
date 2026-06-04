@@ -88,13 +88,41 @@ if(DL_CUDA_ENABLE_CUDA)
 
   find_package(CUDAToolkit REQUIRED)
 
-  add_library(dl-cuda-core STATIC
+  set(DL_CUDA_CORE_SOURCES
     src/autograd.cu
-    src/nn.cu
-    src/tensor_ops.cu
-    src/optim.cu
-    src/loss.cu
     src/checkpoint.cu
+    src/loss.cu
+    src/nn/activations.cu
+    src/nn/conv2d.cu
+    src/nn/dropout.cu
+    src/nn/embedding.cu
+    src/nn/linear.cu
+    src/nn/module.cu
+    src/nn/normalization.cu
+    src/nn/pooling.cu
+    src/optim/adam.cu
+    src/optim/clip_grad.cu
+    src/optim/detail/common.cu
+    src/optim/optimizer.cu
+    src/optim/rmsprop.cu
+    src/optim/schedulers.cu
+    src/optim/sgd.cu
+    src/runtime.cu
+    src/tensor.cu
+    src/tensor_ops.cu
+    src/trainer.cu
+  )
+
+  set(DL_CUDA_EXAMPLE_SOURCES
+    src/examples/char_sample.cu
+    src/examples/char_train.cu
+    src/examples/detail/char_metadata.cu
+    src/examples/detail/common.cu
+    src/examples/xor.cu
+  )
+
+  add_library(dl-cuda-core STATIC
+    ${DL_CUDA_CORE_SOURCES}
   )
   target_include_directories(dl-cuda-core PUBLIC include)
   target_link_libraries(dl-cuda-core PUBLIC CUDA::cudart CUDA::cublas)
@@ -106,7 +134,7 @@ if(DL_CUDA_ENABLE_CUDA)
   dl_cuda_enable_warnings(dl-cuda-core)
 
   add_library(dl-cuda-examples STATIC
-    src/examples_api.cu
+    ${DL_CUDA_EXAMPLE_SOURCES}
   )
   target_include_directories(dl-cuda-examples PUBLIC include)
   target_link_libraries(dl-cuda-examples PUBLIC dl-cuda-core)
@@ -120,7 +148,13 @@ if(DL_CUDA_ENABLE_CUDA)
   dl_cuda_enable_warnings(dl-cuda)
 
   if(BUILD_TESTING)
-    add_executable(dl-cuda-gpu-correctness-tests tests/gpu_correctness_tests.cu)
+    add_executable(dl-cuda-gpu-correctness-tests
+      tests/gpu_correctness_tests.cu
+      tests/gpu/autograd_tests.cu
+      tests/gpu/layer_tests.cu
+      tests/gpu/mixed_precision_tests.cu
+      tests/gpu/optimizer_tests.cu
+    )
     target_include_directories(dl-cuda-gpu-correctness-tests PRIVATE include)
     target_link_libraries(dl-cuda-gpu-correctness-tests PRIVATE dl-cuda-core)
     dl_cuda_enable_warnings(dl-cuda-gpu-correctness-tests)

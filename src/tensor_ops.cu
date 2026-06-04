@@ -2,6 +2,7 @@
 
 #include "dl_cuda/detail/cuda_dtype.cuh"
 #include "dl_cuda/detail/cuda_utils.hpp"
+#include "dl_cuda/detail/shape_utils.hpp"
 #include "dl_cuda/detail/tensor_validation.hpp"
 
 #include <cuda_runtime.h>
@@ -42,16 +43,6 @@ bool IsSupportedElementwiseDType(DType dtype, TensorBinaryOp op) {
   return dtype == DType::kInt32;
 }
 
-std::vector<int64_t> ContiguousStrides(const std::vector<int64_t> &shape) {
-  std::vector<int64_t> strides(shape.size(), 1);
-  int64_t stride = 1;
-  for (size_t i = shape.size(); i > 0; --i) {
-    strides[i - 1] = stride;
-    stride *= shape[i - 1];
-  }
-  return strides;
-}
-
 Result<std::vector<int64_t>> BroadcastShape(const Tensor &lhs, const Tensor &rhs,
                                             const char *op_name) {
   size_t out_rank = std::max(lhs.shape().size(), rhs.shape().size());
@@ -90,9 +81,9 @@ BroadcastDescriptor BuildBroadcastDescriptor(const Tensor &lhs, const Tensor &rh
   BroadcastDescriptor desc;
   desc.rank = static_cast<int>(out_shape.size());
 
-  std::vector<int64_t> lhs_strides = ContiguousStrides(lhs.shape());
-  std::vector<int64_t> rhs_strides = ContiguousStrides(rhs.shape());
-  std::vector<int64_t> out_strides = ContiguousStrides(out_shape);
+  std::vector<int64_t> lhs_strides = detail::ContiguousStrides(lhs.shape());
+  std::vector<int64_t> rhs_strides = detail::ContiguousStrides(rhs.shape());
+  std::vector<int64_t> out_strides = detail::ContiguousStrides(out_shape);
 
   for (size_t out_axis = 0; out_axis < out_shape.size(); ++out_axis) {
     int lhs_axis =

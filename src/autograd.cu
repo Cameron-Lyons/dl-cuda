@@ -1,6 +1,7 @@
 #include "dl_cuda/autograd.hpp"
 
 #include "dl_cuda/detail/cuda_utils.hpp"
+#include "dl_cuda/detail/shape_utils.hpp"
 #include "dl_cuda/nn.hpp"
 #include "dl_cuda/tensor_ops.hpp"
 
@@ -38,16 +39,6 @@ Status ValidateFloat32Tensor(const Tensor &tensor, const char *name) {
   return Status::Ok();
 }
 
-std::vector<int64_t> ContiguousStrides(const std::vector<int64_t> &shape) {
-  std::vector<int64_t> strides(shape.size(), 1);
-  int64_t stride = 1;
-  for (size_t i = shape.size(); i > 0; --i) {
-    strides[i - 1] = stride;
-    stride *= shape[i - 1];
-  }
-  return strides;
-}
-
 Result<BroadcastGradientDescriptor>
 BuildBroadcastGradientDescriptor(const std::vector<int64_t> &input_shape,
                                  const std::vector<int64_t> &output_shape, const char *op_name) {
@@ -63,8 +54,8 @@ BuildBroadcastGradientDescriptor(const std::vector<int64_t> &input_shape,
   BroadcastGradientDescriptor desc;
   desc.rank = static_cast<int>(output_shape.size());
 
-  std::vector<int64_t> input_strides = ContiguousStrides(input_shape);
-  std::vector<int64_t> output_strides = ContiguousStrides(output_shape);
+  std::vector<int64_t> input_strides = detail::ContiguousStrides(input_shape);
+  std::vector<int64_t> output_strides = detail::ContiguousStrides(output_shape);
   for (size_t output_axis = 0; output_axis < output_shape.size(); ++output_axis) {
     int input_axis =
         static_cast<int>(output_axis) - static_cast<int>(output_shape.size() - input_shape.size());
