@@ -2,6 +2,7 @@
 
 #include "dl_cuda/checkpoint.hpp"
 #include "dl_cuda/data.hpp"
+#include "dl_cuda/dtype.hpp"
 #include "dl_cuda/loss.hpp"
 #include "dl_cuda/nn.hpp"
 #include "dl_cuda/optim.hpp"

@@ -1,6 +1,6 @@
 # Profiling
 
-This project includes a lightweight profiling script for the v2 Char-LM example.
+This project includes a lightweight profiling script for the Char-LM example.
 
 ## Prerequisites
 

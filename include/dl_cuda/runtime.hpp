@@ -5,6 +5,9 @@
 #include "dl_cuda/tensor.hpp"
 
 #include <cublas_v2.h>
+#if defined(DLCUDA_HAS_CUBLASLT)
+#include <cublasLt.h>
+#endif
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -29,10 +32,17 @@ public:
   RuntimeContext &operator=(const RuntimeContext &) = delete;
 
   ~RuntimeContext() {
+    scratch_tensors_.clear();
     if (cublas_handle_ != nullptr) {
       cublasDestroy(cublas_handle_);
       cublas_handle_ = nullptr;
     }
+#if defined(DLCUDA_HAS_CUBLASLT)
+    if (cublaslt_handle_ != nullptr) {
+      cublasLtDestroy(cublaslt_handle_);
+      cublaslt_handle_ = nullptr;
+    }
+#endif
   }
 
   Status Initialize() {
@@ -62,8 +72,22 @@ public:
     return Status::Ok();
   }
 
+#if defined(DLCUDA_HAS_CUBLASLT)
+  Status EnsureCublasLt() {
+    if (cublaslt_handle_ != nullptr) {
+      return Status::Ok();
+    }
+    cublasStatus_t create_status = cublasLtCreate(&cublaslt_handle_);
+    return detail::CublasStatus(create_status, "cublasLtCreate");
+  }
+#endif
+
   [[nodiscard]] bool use_cublas() const {
     return options_.use_cublas;
+  }
+
+  [[nodiscard]] bool tf32() const {
+    return options_.tf32;
   }
 
   [[nodiscard]] cudaStream_t stream() const {
@@ -79,6 +103,12 @@ public:
     return cublas_handle_;
   }
 
+#if defined(DLCUDA_HAS_CUBLASLT)
+  [[nodiscard]] cublasLtHandle_t cublaslt_handle() const {
+    return cublaslt_handle_;
+  }
+#endif
+
   [[nodiscard]] uint64_t NextInitSeed() {
     ++seed_counter_;
     return options_.seed + 9973ULL * seed_counter_;
@@ -89,7 +119,7 @@ public:
     auto it = scratch_tensors_.find(key);
     if (it == scratch_tensors_.end() || it->second.shape() != shape ||
         it->second.dtype() != dtype || it->second.device() != device) {
-      auto tensor = Tensor::Allocate(shape, dtype, device);
+      auto tensor = Tensor::AllocateAsync(shape, dtype, options_.stream, device);
       if (!tensor.ok()) {
         return tensor.status();
       }
@@ -124,6 +154,9 @@ private:
 
   RuntimeOptions options_;
   cublasHandle_t cublas_handle_ = nullptr;
+#if defined(DLCUDA_HAS_CUBLASLT)
+  cublasLtHandle_t cublaslt_handle_ = nullptr;
+#endif
   uint64_t seed_counter_ = 0ULL;
   std::unordered_map<std::string, Tensor> scratch_tensors_;
 };

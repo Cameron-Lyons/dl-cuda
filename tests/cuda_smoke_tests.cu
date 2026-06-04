@@ -17,7 +17,7 @@ bool HasCudaDevice() {
 
 int main() {
   if (!HasCudaDevice()) {
-    std::printf("v2_cuda_smoke_tests: SKIP (no CUDA device)\n");
+    std::printf("cuda_smoke_tests: SKIP (no CUDA device)\n");
     return 0;
   }
 
@@ -44,8 +44,8 @@ int main() {
     return 1;
   }
 
-  auto x_result = dlcuda::Tensor::Allocate({4, 2}, dlcuda::DType::kFloat32);
-  auto y_result = dlcuda::Tensor::Allocate({4, 1}, dlcuda::DType::kFloat32);
+  auto x_result = dlcuda::Tensor::AllocateAsync({4, 2}, dlcuda::DType::kFloat32, ctx.stream());
+  auto y_result = dlcuda::Tensor::AllocateAsync({4, 1}, dlcuda::DType::kFloat32, ctx.stream());
   if (!x_result.ok() || !y_result.ok()) {
     std::fprintf(stderr, "Tensor allocation failed\n");
     return 1;
@@ -110,6 +110,6 @@ int main() {
     return 1;
   }
 
-  std::printf("v2_cuda_smoke_tests: PASS\n");
+  std::printf("cuda_smoke_tests: PASS\n");
   return 0;
 }

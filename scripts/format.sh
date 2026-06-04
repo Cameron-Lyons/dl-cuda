@@ -16,7 +16,7 @@ FILES=()
 while IFS= read -r -d '' file; do
   FILES+=("$file")
 done < <(rg --files \
-  examples include tests src/v2 \
+  examples include tests src \
   -g '*.cu' -g '*.cuh' -g '*.h' -g '*.hpp' -g '*.cpp' -g '*.cc' \
   -g '!build/**' -g '!profiles/**' -0)
 

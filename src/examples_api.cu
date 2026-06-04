@@ -43,6 +43,93 @@ static const char *kCharCorpus = "To be, or not to be, that is the question. "
 
 constexpr int kExampleThreads = 256;
 
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 10000
+#define DLCUDA_CAN_CAPTURE_CUDA_GRAPHS 1
+#endif
+
+#if defined(DLCUDA_CAN_CAPTURE_CUDA_GRAPHS)
+class CudaGraphExec {
+public:
+  CudaGraphExec() = default;
+  CudaGraphExec(const CudaGraphExec &) = delete;
+  CudaGraphExec &operator=(const CudaGraphExec &) = delete;
+
+  ~CudaGraphExec() {
+    Reset();
+  }
+
+  [[nodiscard]] bool ready() const {
+    return exec_ != nullptr;
+  }
+
+  void Reset() {
+    if (exec_ != nullptr) {
+      cudaGraphExecDestroy(exec_);
+      exec_ = nullptr;
+    }
+    if (graph_ != nullptr) {
+      cudaGraphDestroy(graph_);
+      graph_ = nullptr;
+    }
+  }
+
+  template <typename Fn> Status Capture(cudaStream_t stream, Fn &&fn) {
+    Reset();
+    cudaError_t err = cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal);
+    if (err != cudaSuccess) {
+      return UnsupportedGraphStatus("cudaStreamBeginCapture", err);
+    }
+
+    Status body_status = fn();
+    cudaGraph_t captured_graph = nullptr;
+    err = cudaStreamEndCapture(stream, &captured_graph);
+    if (!body_status.ok()) {
+      if (captured_graph != nullptr) {
+        cudaGraphDestroy(captured_graph);
+      }
+      return Status::Unsupported("CUDA graph capture body failed: " + body_status.ToString());
+    }
+    if (err != cudaSuccess) {
+      if (captured_graph != nullptr) {
+        cudaGraphDestroy(captured_graph);
+      }
+      return UnsupportedGraphStatus("cudaStreamEndCapture", err);
+    }
+
+    cudaGraphExec_t captured_exec = nullptr;
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 11040
+    err = cudaGraphInstantiateWithFlags(&captured_exec, captured_graph, 0);
+#else
+    err = cudaGraphInstantiate(&captured_exec, captured_graph, nullptr, nullptr, 0);
+#endif
+    if (err != cudaSuccess) {
+      cudaGraphDestroy(captured_graph);
+      return UnsupportedGraphStatus("cudaGraphInstantiate", err);
+    }
+
+    graph_ = captured_graph;
+    exec_ = captured_exec;
+    return Status::Ok();
+  }
+
+  Status Launch(cudaStream_t stream) {
+    if (exec_ == nullptr) {
+      return Status::InvalidArgument("CUDA graph has not been captured");
+    }
+    cudaError_t err = cudaGraphLaunch(exec_, stream);
+    return detail::CudaStatus(err, "cudaGraphLaunch");
+  }
+
+private:
+  static Status UnsupportedGraphStatus(const char *context, cudaError_t err) {
+    return Status::Unsupported(std::string(context) + ": " + cudaGetErrorString(err));
+  }
+
+  cudaGraph_t graph_ = nullptr;
+  cudaGraphExec_t exec_ = nullptr;
+};
+#endif
+
 RuntimeOptions OptionsFromXorConfig(const TrainXorConfig &cfg) {
   RuntimeOptions opts;
   opts.use_cublas = cfg.use_cublas;
@@ -230,6 +317,46 @@ __global__ void FillTrainingWindowKernel(const int32_t *encoded_corpus, int32_t 
   }
 }
 
+Status FillTrainingWindow(RuntimeContext &ctx, const Tensor &encoded_corpus_device,
+                          Tensor *input_ids, Tensor *target_ids, int seq_len, int offset) {
+  if (input_ids == nullptr || target_ids == nullptr) {
+    return Status::InvalidArgument("FillTrainingWindow received null tensor pointer");
+  }
+  auto window_blocks = detail::BlocksForElements(seq_len, kExampleThreads);
+  if (!window_blocks.ok()) {
+    return window_blocks.status();
+  }
+  if (window_blocks.value() > 0) {
+    FillTrainingWindowKernel<<<window_blocks.value(), kExampleThreads, 0, ctx.stream()>>>(
+        encoded_corpus_device.data_as<int32_t>(), input_ids->data_as<int32_t>(),
+        target_ids->data_as<int32_t>(), seq_len, offset);
+    DLCUDA_RETURN_IF_ERROR(detail::CheckKernelLaunch("FillTrainingWindowKernel"));
+  }
+  return Status::Ok();
+}
+
+Status RunCharTrainBody(RuntimeContext &ctx, Sequential &model, AdamOptimizer &optimizer,
+                        const std::vector<ParameterRef> &params, const Tensor &input_ids,
+                        const Tensor &target_ids, Tensor *logits, Tensor *loss_grad,
+                        float grad_clip, ClassificationMetrics *metrics, float *grad_norm) {
+  DLCUDA_RETURN_IF_ERROR(optimizer.ZeroGrad(ctx, params));
+
+  DLCUDA_RETURN_IF_ERROR(model.Forward(ctx, input_ids, logits));
+  if (metrics != nullptr) {
+    auto metrics_result = CategoricalCrossEntropyMetricsFromLogits(ctx, target_ids, *logits);
+    if (!metrics_result.ok()) {
+      return metrics_result.status();
+    }
+    *metrics = metrics_result.value();
+  }
+
+  DLCUDA_RETURN_IF_ERROR(
+      CategoricalCrossEntropyBackwardFromLogits(ctx, target_ids, *logits, loss_grad));
+  DLCUDA_RETURN_IF_ERROR(model.Backward(ctx, *loss_grad, nullptr));
+  DLCUDA_RETURN_IF_ERROR(ClipGradNorm(ctx, params, grad_clip, grad_norm));
+  return Status::Ok();
+}
+
 Status BuildCharModel(Sequential *model, RuntimeContext &ctx, int vocab_size, int d_model) {
   if (model == nullptr) {
     return Status::InvalidArgument("BuildCharModel requires a model pointer");
@@ -253,7 +380,7 @@ Result<std::string> GenerateText(RuntimeContext &ctx, Sequential &model, const C
     context[static_cast<size_t>(i)] = vocab.Encode(text[static_cast<size_t>(i)]);
   }
 
-  auto context_tensor = Tensor::Allocate({seq_len}, DType::kInt32);
+  auto context_tensor = Tensor::AllocateAsync({seq_len}, DType::kInt32, ctx.stream());
   if (!context_tensor.ok()) {
     return context_tensor.status();
   }
@@ -326,11 +453,11 @@ Status TrainXor(const TrainXorConfig &cfg) {
   };
   std::vector<float> host_y = {0.0f, 1.0f, 1.0f, 0.0f};
 
-  auto x_tensor = Tensor::Allocate({4, 2}, DType::kFloat32);
+  auto x_tensor = Tensor::AllocateAsync({4, 2}, DType::kFloat32, ctx.stream());
   if (!x_tensor.ok()) {
     return x_tensor.status();
   }
-  auto y_tensor = Tensor::Allocate({4, 1}, DType::kFloat32);
+  auto y_tensor = Tensor::AllocateAsync({4, 1}, DType::kFloat32, ctx.stream());
   if (!y_tensor.ok()) {
     return y_tensor.status();
   }
@@ -343,14 +470,14 @@ Status TrainXor(const TrainXorConfig &cfg) {
       y.CopyFromHost(host_y.data(), host_y.size() * sizeof(float), ctx.stream()));
 
   if (cfg.resume) {
-    Status load_status = LoadCheckpoint(ctx, cfg.checkpoint_path, "xor-mlp-v2", params);
+    Status load_status = LoadCheckpoint(ctx, cfg.checkpoint_path, "xor-mlp", params);
     if (!load_status.ok()) {
       return Status::RuntimeError("Failed to resume XOR checkpoint: " + load_status.message());
     }
     std::printf("Loaded checkpoint: %s\n", cfg.checkpoint_path.c_str());
   }
 
-  std::printf("XOR v2 | epochs=%d lr=%.4f hidden=%d | backend=%s | TF32=%s\n", cfg.epochs, cfg.lr,
+  std::printf("XOR | epochs=%d lr=%.4f hidden=%d | backend=%s | TF32=%s\n", cfg.epochs, cfg.lr,
               cfg.hidden_size, cfg.use_cublas ? "cuBLAS" : "kernels", cfg.tf32 ? "on" : "off");
 
   Tensor predictions;
@@ -398,7 +525,7 @@ Status TrainXor(const TrainXorConfig &cfg) {
 
   if (cfg.save) {
     CheckpointMetadata metadata;
-    metadata.model_name = "xor-mlp-v2";
+    metadata.model_name = "xor-mlp";
     metadata.format_version = 2;
     DLCUDA_RETURN_IF_ERROR(SaveCheckpoint(ctx, cfg.checkpoint_path, metadata, params));
     std::printf("Saved checkpoint: %s\n", cfg.checkpoint_path.c_str());
@@ -428,11 +555,11 @@ Status TrainChar(const TrainCharConfig &cfg) {
 
   AdamOptimizer optimizer;
 
-  auto input_ids_result = Tensor::Allocate({cfg.seq_len}, DType::kInt32);
+  auto input_ids_result = Tensor::AllocateAsync({cfg.seq_len}, DType::kInt32, ctx.stream());
   if (!input_ids_result.ok()) {
     return input_ids_result.status();
   }
-  auto target_ids_result = Tensor::Allocate({cfg.seq_len}, DType::kInt32);
+  auto target_ids_result = Tensor::AllocateAsync({cfg.seq_len}, DType::kInt32, ctx.stream());
   if (!target_ids_result.ok()) {
     return target_ids_result.status();
   }
@@ -441,14 +568,14 @@ Status TrainChar(const TrainCharConfig &cfg) {
   Tensor target_ids = target_ids_result.value();
 
   if (cfg.resume) {
-    Status load_status = LoadCheckpoint(ctx, cfg.checkpoint_path, "char-embed-softmax-v2", params);
+    Status load_status = LoadCheckpoint(ctx, cfg.checkpoint_path, "char-embed-softmax", params);
     if (!load_status.ok()) {
       return Status::RuntimeError("Failed to resume char checkpoint: " + load_status.message());
     }
     std::printf("Loaded checkpoint: %s\n", cfg.checkpoint_path.c_str());
   }
 
-  std::printf("Char v2 | vocab=%d seq_len=%d d_model=%d epochs=%d\n", vocab.size(), cfg.seq_len,
+  std::printf("Char | vocab=%d seq_len=%d d_model=%d epochs=%d\n", vocab.size(), cfg.seq_len,
               cfg.d_model, cfg.epochs);
   std::printf("Optimizer: Adam | Grad clip: %.2f | temp=%.2f top_p=%.2f\n", cfg.grad_clip,
               cfg.temperature, cfg.top_p);
@@ -460,8 +587,8 @@ Status TrainChar(const TrainCharConfig &cfg) {
   for (size_t i = 0; i < corpus.size(); ++i) {
     encoded_corpus[i] = vocab.Encode(corpus[i]);
   }
-  auto encoded_corpus_tensor =
-      Tensor::Allocate({static_cast<int64_t>(encoded_corpus.size())}, DType::kInt32);
+  auto encoded_corpus_tensor = Tensor::AllocateAsync({static_cast<int64_t>(encoded_corpus.size())},
+                                                     DType::kInt32, ctx.stream());
   if (!encoded_corpus_tensor.ok()) {
     return encoded_corpus_tensor.status();
   }
@@ -472,40 +599,54 @@ Status TrainChar(const TrainCharConfig &cfg) {
   int max_offset = static_cast<int>(corpus.size()) - cfg.seq_len - 1;
   Tensor logits;
   Tensor loss_grad;
+#if defined(DLCUDA_CAN_CAPTURE_CUDA_GRAPHS)
+  CudaGraphExec train_graph;
+  bool graph_capture_disabled = false;
+#endif
 
   for (int epoch = 0; epoch < cfg.epochs; ++epoch) {
     int offset = static_cast<int>(offset_rng() % static_cast<uint32_t>(max_offset + 1));
-    auto window_blocks = detail::BlocksForElements(cfg.seq_len, kExampleThreads);
-    if (!window_blocks.ok()) {
-      return window_blocks.status();
-    }
-    if (window_blocks.value() > 0) {
-      FillTrainingWindowKernel<<<window_blocks.value(), kExampleThreads, 0, ctx.stream()>>>(
-          encoded_corpus_device.data_as<int32_t>(), input_ids.data_as<int32_t>(),
-          target_ids.data_as<int32_t>(), cfg.seq_len, offset);
-      DLCUDA_RETURN_IF_ERROR(detail::CheckKernelLaunch("FillTrainingWindowKernel"));
-    }
+    DLCUDA_RETURN_IF_ERROR(FillTrainingWindow(ctx, encoded_corpus_device, &input_ids, &target_ids,
+                                              cfg.seq_len, offset));
 
-    DLCUDA_RETURN_IF_ERROR(optimizer.ZeroGrad(ctx, params));
-
-    DLCUDA_RETURN_IF_ERROR(model.Forward(ctx, input_ids, &logits));
     bool should_log = (epoch % cfg.print_every) == 0;
     ClassificationMetrics metrics;
-    if (should_log) {
-      auto metrics_result = CategoricalCrossEntropyMetricsFromLogits(ctx, target_ids, logits);
-      if (!metrics_result.ok()) {
-        return metrics_result.status();
-      }
-      metrics = metrics_result.value();
-    }
-
-    DLCUDA_RETURN_IF_ERROR(
-        CategoricalCrossEntropyBackwardFromLogits(ctx, target_ids, logits, &loss_grad));
-    DLCUDA_RETURN_IF_ERROR(model.Backward(ctx, loss_grad, nullptr));
-
     float grad_norm = 0.0f;
-    DLCUDA_RETURN_IF_ERROR(
-        ClipGradNorm(ctx, params, cfg.grad_clip, should_log ? &grad_norm : nullptr));
+
+#if defined(DLCUDA_CAN_CAPTURE_CUDA_GRAPHS)
+    bool ran_graph = false;
+    if (!should_log && !graph_capture_disabled) {
+      if (!train_graph.ready()) {
+        Status capture_status = train_graph.Capture(ctx.stream(), [&]() {
+          return RunCharTrainBody(ctx, model, optimizer, params, input_ids, target_ids, &logits,
+                                  &loss_grad, cfg.grad_clip, nullptr, nullptr);
+        });
+        if (!capture_status.ok()) {
+          graph_capture_disabled = true;
+          train_graph.Reset();
+        }
+      }
+
+      if (train_graph.ready()) {
+        Status launch_status = train_graph.Launch(ctx.stream());
+        if (launch_status.ok()) {
+          ran_graph = true;
+        } else {
+          graph_capture_disabled = true;
+          train_graph.Reset();
+        }
+      }
+    }
+#endif
+
+#if defined(DLCUDA_CAN_CAPTURE_CUDA_GRAPHS)
+    if (!ran_graph)
+#endif
+    {
+      DLCUDA_RETURN_IF_ERROR(RunCharTrainBody(
+          ctx, model, optimizer, params, input_ids, target_ids, &logits, &loss_grad, cfg.grad_clip,
+          should_log ? &metrics : nullptr, should_log ? &grad_norm : nullptr));
+    }
     DLCUDA_RETURN_IF_ERROR(optimizer.Step(ctx, params, cfg.lr));
 
     if (should_log) {
@@ -530,7 +671,7 @@ Status TrainChar(const TrainCharConfig &cfg) {
 
   if (cfg.save) {
     CheckpointMetadata metadata;
-    metadata.model_name = "char-embed-softmax-v2";
+    metadata.model_name = "char-embed-softmax";
     metadata.format_version = 2;
     DLCUDA_RETURN_IF_ERROR(SaveCheckpoint(ctx, cfg.checkpoint_path, metadata, params));
     std::printf("Saved checkpoint: %s\n", cfg.checkpoint_path.c_str());
@@ -563,7 +704,7 @@ Result<std::string> SampleChar(const SampleCharConfig &cfg) {
   Sequential model;
   DLCUDA_RETURN_IF_ERROR(BuildCharModel(&model, ctx, vocab.size(), cfg.d_model));
   DLCUDA_RETURN_IF_ERROR(
-      LoadCheckpoint(ctx, cfg.checkpoint_path, "char-embed-softmax-v2", model.parameters()));
+      LoadCheckpoint(ctx, cfg.checkpoint_path, "char-embed-softmax", model.parameters()));
 
   return GenerateText(ctx, model, vocab, cfg.seq_len, cfg.gen_len, cfg.temperature, cfg.top_p,
                       cfg.sample_seed);

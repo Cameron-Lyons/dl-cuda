@@ -144,7 +144,7 @@ int main() {
     return 1;
   }
 
-  const char config_path[] = "v2_cli_parse_test.cfg";
+  const char config_path[] = "cli_parse_test.cfg";
   {
     std::ofstream config_file(config_path);
     config_file << "lr=0.5\n";
@@ -161,7 +161,7 @@ int main() {
     return 1;
   }
 
-  char inline_config_arg[] = "--config=v2_cli_parse_test.cfg";
+  char inline_config_arg[] = "--config=cli_parse_test.cfg";
   char *inline_config_argv[] = {arg0, arg1, inline_config_arg};
   std::string inline_config_path;
   {
@@ -318,6 +318,6 @@ int main() {
     return 1;
   }
 
-  std::printf("v2_cli_tests: PASS\n");
+  std::printf("cli_tests: PASS\n");
   return 0;
 }

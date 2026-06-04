@@ -353,7 +353,9 @@ Status LoadCheckpoint(RuntimeContext &ctx, const std::string &path,
 
     const TensorRecord &record = it->second;
     if (record.dtype != param.value->dtype()) {
-      return Status::InvalidArgument("DType mismatch for parameter: " + param.name);
+      return Status::InvalidArgument("DType mismatch for parameter: " + param.name + " expected " +
+                                     DTypeName(param.value->dtype()) + " got " +
+                                     DTypeName(record.dtype));
     }
     if (record.shape != param.value->shape()) {
       return Status::InvalidArgument("Shape mismatch for parameter: " + param.name);
