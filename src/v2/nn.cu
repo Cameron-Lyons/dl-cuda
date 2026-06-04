@@ -320,12 +320,11 @@ Status Sequential::Forward(RuntimeContext &ctx, const Tensor &input, Tensor *out
     Tensor next;
     Status status = modules_[i]->Forward(ctx, current, &next);
     if (!status.ok()) {
-      return Status::RuntimeError("Forward failed in module " + std::to_string(i) + " (" +
-                                  modules_[i]->Name() + "): " + status.message());
+      return Status::RuntimeError("Forward failed in module " + std::to_string(i) + ": " +
+                                  status.message());
     }
     if (!next.defined()) {
-      return Status::RuntimeError("Forward output became undefined in module " + std::to_string(i) +
-                                  " (" + modules_[i]->Name() + ")");
+      return Status::RuntimeError("Forward output became undefined in module " + std::to_string(i));
     }
     current = next;
   }
@@ -345,9 +344,8 @@ Status Sequential::Backward(RuntimeContext &ctx, const Tensor &grad_output, Tens
     Tensor *next_out = (i == 0 && grad_input == nullptr) ? nullptr : &next;
     Status status = modules_[static_cast<size_t>(i)]->Backward(ctx, current, next_out);
     if (!status.ok()) {
-      return Status::RuntimeError("Backward failed in module " + std::to_string(i) + " (" +
-                                  modules_[static_cast<size_t>(i)]->Name() +
-                                  "): " + status.message());
+      return Status::RuntimeError("Backward failed in module " + std::to_string(i) + ": " +
+                                  status.message());
     }
     if (i > 0 && !next.defined()) {
       return Status::RuntimeError("Backward gradient became undefined before first module");
