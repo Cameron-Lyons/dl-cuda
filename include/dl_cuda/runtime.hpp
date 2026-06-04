@@ -8,7 +8,6 @@
 #include <cuda_runtime.h>
 
 #include <cstdint>
-#include <random>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -24,8 +23,7 @@ struct RuntimeOptions {
 
 class RuntimeContext {
 public:
-  explicit RuntimeContext(const RuntimeOptions &options = RuntimeOptions())
-      : options_(options), host_rng_(static_cast<uint32_t>(options.seed)) {}
+  explicit RuntimeContext(const RuntimeOptions &options = RuntimeOptions()) : options_(options) {}
 
   RuntimeContext(const RuntimeContext &) = delete;
   RuntimeContext &operator=(const RuntimeContext &) = delete;
@@ -68,58 +66,8 @@ public:
     return options_.use_cublas;
   }
 
-  Status SetUseCuBLAS(bool enabled) {
-    bool previous = options_.use_cublas;
-    options_.use_cublas = enabled;
-    if (enabled) {
-      Status status = EnsureCublas();
-      if (!status.ok()) {
-        options_.use_cublas = previous;
-      }
-      return status;
-    }
-    Status status = ReleaseCublas();
-    if (!status.ok()) {
-      options_.use_cublas = previous;
-    }
-    return status;
-  }
-
-  [[nodiscard]] bool tf32_enabled() const {
-    return options_.tf32;
-  }
-
-  Status SetTF32(bool enabled) {
-    bool previous = options_.tf32;
-    options_.tf32 = enabled;
-    if (!options_.use_cublas || cublas_handle_ == nullptr) {
-      return Status::Ok();
-    }
-    Status status = ApplyMathMode();
-    if (!status.ok()) {
-      options_.tf32 = previous;
-      (void)ApplyMathMode();
-    }
-    return status;
-  }
-
   [[nodiscard]] cudaStream_t stream() const {
     return options_.stream;
-  }
-
-  Status SetStream(cudaStream_t stream) {
-    cudaStream_t previous = options_.stream;
-    options_.stream = stream;
-    if (cublas_handle_ != nullptr) {
-      cublasStatus_t stream_status = cublasSetStream(cublas_handle_, options_.stream);
-      Status status = detail::CublasStatus(stream_status, "cublasSetStream");
-      if (!status.ok()) {
-        options_.stream = previous;
-        (void)cublasSetStream(cublas_handle_, previous);
-        return status;
-      }
-    }
-    return Status::Ok();
   }
 
   Status Synchronize() {
@@ -129,10 +77,6 @@ public:
 
   [[nodiscard]] cublasHandle_t cublas_handle() const {
     return cublas_handle_;
-  }
-
-  [[nodiscard]] uint64_t seed() const {
-    return options_.seed;
   }
 
   [[nodiscard]] uint64_t NextInitSeed() {
@@ -152,10 +96,6 @@ public:
       it = scratch_tensors_.insert_or_assign(key, tensor.value()).first;
     }
     return it->second;
-  }
-
-  [[nodiscard]] std::mt19937 &host_rng() {
-    return host_rng_;
   }
 
 private:
@@ -185,7 +125,6 @@ private:
   RuntimeOptions options_;
   cublasHandle_t cublas_handle_ = nullptr;
   uint64_t seed_counter_ = 0ULL;
-  std::mt19937 host_rng_;
   std::unordered_map<std::string, Tensor> scratch_tensors_;
 };
 

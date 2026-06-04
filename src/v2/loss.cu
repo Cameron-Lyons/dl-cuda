@@ -108,83 +108,6 @@ __global__ void BinaryCrossEntropyMetricKernel(const float *targets, const float
   }
 }
 
-__global__ void CategoricalMetricsKernel(const int32_t *target_ids, const float *probabilities,
-                                         float *loss_sum, float *correct_sum, int64_t n,
-                                         int64_t classes, float epsilon) {
-  __shared__ float shared_values[kLossThreads];
-  __shared__ int shared_indices[kLossThreads];
-
-  int64_t row = static_cast<int64_t>(blockIdx.x);
-  int tid = threadIdx.x;
-  if (row >= n) {
-    return;
-  }
-
-  int32_t target = target_ids[row];
-  const float *row_probs = probabilities + row * classes;
-
-  if (target < 0 || static_cast<int64_t>(target) >= classes) {
-    return;
-  }
-
-  float local_best_p = -FLT_MAX;
-  int local_best = 0;
-  for (int64_t c = tid; c < classes; c += blockDim.x) {
-    float v = row_probs[c];
-    if (v > local_best_p) {
-      local_best = static_cast<int>(c);
-      local_best_p = v;
-    }
-  }
-  shared_values[tid] = local_best_p;
-  shared_indices[tid] = local_best;
-  __syncthreads();
-
-  for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-    if (tid < stride) {
-      float other_value = shared_values[tid + stride];
-      int other_index = shared_indices[tid + stride];
-      if (other_value > shared_values[tid] ||
-          (other_value == shared_values[tid] && other_index < shared_indices[tid])) {
-        shared_values[tid] = other_value;
-        shared_indices[tid] = other_index;
-      }
-    }
-    __syncthreads();
-  }
-
-  if (tid == 0) {
-    float p = row_probs[target];
-    p = fmaxf(epsilon, p);
-    atomicAdd(loss_sum, -logf(p));
-    if (shared_indices[0] == static_cast<int>(target)) {
-      atomicAdd(correct_sum, 1.0f);
-    }
-  }
-}
-
-__global__ void CategoricalGradKernel(const int32_t *target_ids, const float *probabilities,
-                                      float *grads, int64_t n, int64_t classes, float epsilon) {
-  int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  int64_t total = n * classes;
-  if (idx < total) {
-    int64_t row = idx / classes;
-    int64_t col = idx % classes;
-    int32_t target = target_ids[row];
-    if (target < 0 || static_cast<int64_t>(target) >= classes) {
-      grads[idx] = 0.0f;
-      return;
-    }
-    if (col == static_cast<int64_t>(target)) {
-      float p = probabilities[idx];
-      p = fmaxf(epsilon, p);
-      grads[idx] = -1.0f / (p * static_cast<float>(n));
-    } else {
-      grads[idx] = 0.0f;
-    }
-  }
-}
-
 __global__ void CategoricalLogitsGradKernel(const int32_t *target_ids, const float *logits,
                                             float *grads, int64_t n, int64_t classes) {
   __shared__ float shared[kLossThreads];
@@ -385,36 +308,6 @@ Result<float> BinaryCrossEntropyLoss(RuntimeContext &ctx, const Tensor &targets,
   return loss_sum / static_cast<float>(n);
 }
 
-Status CategoricalCrossEntropyBackwardFromIds(RuntimeContext &ctx, const Tensor &target_ids,
-                                              const Tensor &probabilities,
-                                              Tensor *probability_grads) {
-  if (probability_grads == nullptr) {
-    return Status::InvalidArgument(
-        "CategoricalCrossEntropyBackwardFromIds: probability_grads is null");
-  }
-  auto shape = ValidateCategoricalInputs(target_ids, probabilities, "probabilities",
-                                         "CategoricalCrossEntropyBackwardFromIds");
-  if (!shape.ok()) {
-    return shape.status();
-  }
-  CategoricalShape categorical = shape.value();
-  int64_t n = categorical.rows;
-  int64_t classes = categorical.classes;
-
-  DLCUDA_RETURN_IF_ERROR(EnsureTensor(probability_grads, probabilities.shape(), DType::kFloat32));
-
-  int64_t total = n * classes;
-  auto grad_blocks = detail::BlocksForElements(total, kLossThreads);
-  if (!grad_blocks.ok()) {
-    return grad_blocks.status();
-  }
-  CategoricalGradKernel<<<grad_blocks.value(), kLossThreads, 0, ctx.stream()>>>(
-      target_ids.data_as<int32_t>(), probabilities.data_as<float>(),
-      probability_grads->data_as<float>(), n, classes, 1e-8f);
-  DLCUDA_RETURN_IF_ERROR(detail::CheckKernelLaunch("Categorical grad kernel"));
-  return Status::Ok();
-}
-
 Status CategoricalCrossEntropyBackwardFromLogits(RuntimeContext &ctx, const Tensor &target_ids,
                                                  const Tensor &logits, Tensor *logit_grads) {
   if (logit_grads == nullptr) {
@@ -479,56 +372,6 @@ Result<ClassificationMetrics> CategoricalCrossEntropyMetricsFromLogits(RuntimeCo
       target_ids.data_as<int32_t>(), logits.data_as<float>(), loss_sum_buffer.data_as<float>(),
       correct_sum_buffer.data_as<float>(), n, classes);
   DLCUDA_RETURN_IF_ERROR(detail::CheckKernelLaunch("Categorical logits metrics kernel"));
-
-  float loss_sum = 0.0f;
-  float correct_sum = 0.0f;
-  DLCUDA_RETURN_IF_ERROR(loss_sum_buffer.CopyToHost(&loss_sum, sizeof(loss_sum), ctx.stream()));
-  DLCUDA_RETURN_IF_ERROR(
-      correct_sum_buffer.CopyToHost(&correct_sum, sizeof(correct_sum), ctx.stream()));
-  DLCUDA_RETURN_IF_ERROR(ctx.Synchronize());
-
-  ClassificationMetrics metrics;
-  metrics.loss = loss_sum / static_cast<float>(n);
-  metrics.accuracy = correct_sum / static_cast<float>(n);
-  return metrics;
-}
-
-Result<ClassificationMetrics> CategoricalCrossEntropyMetricsFromIds(RuntimeContext &ctx,
-                                                                    const Tensor &target_ids,
-                                                                    const Tensor &probabilities) {
-  auto shape = ValidateCategoricalInputs(target_ids, probabilities, "probabilities",
-                                         "CategoricalCrossEntropyMetricsFromIds");
-  if (!shape.ok()) {
-    return shape.status();
-  }
-  CategoricalShape categorical = shape.value();
-  int64_t n = categorical.rows;
-  int64_t classes = categorical.classes;
-
-  auto loss_sum_tensor =
-      ctx.ScratchTensor("loss.categorical_cross_entropy.loss_sum", {1}, DType::kFloat32);
-  if (!loss_sum_tensor.ok()) {
-    return loss_sum_tensor.status();
-  }
-  auto correct_sum_tensor =
-      ctx.ScratchTensor("loss.categorical_cross_entropy.correct_sum", {1}, DType::kFloat32);
-  if (!correct_sum_tensor.ok()) {
-    return correct_sum_tensor.status();
-  }
-
-  Tensor loss_sum_buffer = loss_sum_tensor.value();
-  Tensor correct_sum_buffer = correct_sum_tensor.value();
-  DLCUDA_RETURN_IF_ERROR(loss_sum_buffer.FillZero(ctx.stream()));
-  DLCUDA_RETURN_IF_ERROR(correct_sum_buffer.FillZero(ctx.stream()));
-
-  auto rows = detail::RowsForGrid(n, "categorical probabilities");
-  if (!rows.ok()) {
-    return rows.status();
-  }
-  CategoricalMetricsKernel<<<rows.value(), kLossThreads, 0, ctx.stream()>>>(
-      target_ids.data_as<int32_t>(), probabilities.data_as<float>(),
-      loss_sum_buffer.data_as<float>(), correct_sum_buffer.data_as<float>(), n, classes, 1e-8f);
-  DLCUDA_RETURN_IF_ERROR(detail::CheckKernelLaunch("Categorical metrics kernel"));
 
   float loss_sum = 0.0f;
   float correct_sum = 0.0f;

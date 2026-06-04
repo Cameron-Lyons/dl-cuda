@@ -9,7 +9,6 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
-#include <string>
 #include <vector>
 
 namespace dlcuda {
@@ -31,16 +30,6 @@ enum class DeviceType {
     return sizeof(int32_t);
   }
   return 0;
-}
-
-[[nodiscard]] inline const char *DTypeName(DType dtype) {
-  switch (dtype) {
-  case DType::kFloat32:
-    return "float32";
-  case DType::kInt32:
-    return "int32";
-  }
-  return "unknown";
 }
 
 [[nodiscard]] inline Result<int64_t> ShapeNumel(const std::vector<int64_t> &shape) {
@@ -227,32 +216,6 @@ private:
   DType dtype_ = DType::kFloat32;
 };
 
-inline Status CopyTensor(const Tensor &src, Tensor *dst, cudaStream_t stream = 0) {
-  if (!src.defined() || !dst || !dst->defined()) {
-    return Status::InvalidArgument("CopyTensor requires defined source and destination");
-  }
-  if (src.dtype() != dst->dtype() || src.shape() != dst->shape()) {
-    return Status::InvalidArgument("CopyTensor requires matching dtype and shape");
-  }
-  if (src.bytes() == 0) {
-    return Status::Ok();
-  }
-  cudaError_t err =
-      cudaMemcpyAsync(dst->data(), src.data(), src.bytes(), cudaMemcpyDeviceToDevice, stream);
-  return detail::CudaStatus(err, "cudaMemcpyAsync(D2D)");
-}
-
-inline Result<Tensor> CloneLike(const Tensor &src) {
-  if (!src.defined()) {
-    return Status::InvalidArgument("CloneLike requires a defined source tensor");
-  }
-  auto out = Tensor::Allocate(src.shape(), src.dtype(), src.device());
-  if (!out.ok()) {
-    return out;
-  }
-  return out;
-}
-
 inline Status EnsureTensor(Tensor *tensor, const std::vector<int64_t> &shape, DType dtype,
                            DeviceType device = DeviceType::kCuda) {
   if (tensor == nullptr) {
@@ -268,18 +231,6 @@ inline Status EnsureTensor(Tensor *tensor, const std::vector<int64_t> &shape, DT
   }
   *tensor = allocated.value();
   return Status::Ok();
-}
-
-[[nodiscard]] inline std::string ShapeString(const Tensor &tensor) {
-  std::string out = "[";
-  for (size_t i = 0; i < tensor.shape().size(); ++i) {
-    if (i > 0) {
-      out += ",";
-    }
-    out += std::to_string(tensor.shape()[i]);
-  }
-  out += "]";
-  return out;
 }
 
 } // namespace dlcuda
