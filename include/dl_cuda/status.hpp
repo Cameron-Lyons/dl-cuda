@@ -38,6 +38,18 @@ class [[nodiscard]] Status {
 public:
   Status() : code_(StatusCode::kOk) {}
   Status(StatusCode code, std::string message) : code_(code), message_(std::move(message)) {}
+  Status(const Status &) = default;
+  Status(Status &&) noexcept = default;
+
+  void operator=(const Status &other) {
+    code_ = other.code_;
+    message_ = other.message_;
+  }
+
+  void operator=(Status &&other) noexcept {
+    code_ = other.code_;
+    message_ = std::move(other.message_);
+  }
 
   [[nodiscard]] static Status Ok() {
     return Status();
