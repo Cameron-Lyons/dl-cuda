@@ -50,27 +50,9 @@ Conv2d::Conv2d(int64_t in_channels, int64_t out_channels, int64_t kernel_h, int6
   grad_weight_ = grad_weight.value();
   grad_bias_ = grad_bias.value();
 
-  std::mt19937 rng(static_cast<uint32_t>(ctx.NextInitSeed()));
   float fan_in = static_cast<float>(in_channels_ * kernel_h_ * kernel_w_);
-  std::normal_distribution<float> dist(0.0f, std::sqrt(2.0f / fan_in));
-  std::vector<float> host_weight(static_cast<size_t>(weight_.numel()));
-  for (float &v : host_weight) {
-    v = dist(rng);
-  }
-
-  init_status_ = CopyHostFloatsToTensor(&weight_, host_weight, ctx.stream());
-  if (!init_status_.ok()) {
-    return;
-  }
-  init_status_ = bias_.FillZero(ctx.stream());
-  if (!init_status_.ok()) {
-    return;
-  }
-  init_status_ = grad_weight_.FillZero(ctx.stream());
-  if (!init_status_.ok()) {
-    return;
-  }
-  init_status_ = grad_bias_.FillZero(ctx.stream());
+  init_status_ =
+      InitializeWeightBiasAndGradients(ctx, &weight_, &bias_, &grad_weight_, &grad_bias_, fan_in);
 }
 
 Status Conv2d::Forward(RuntimeContext &ctx, const Tensor &input, Tensor *output) {
@@ -109,6 +91,20 @@ Status Conv2d::Forward(RuntimeContext &ctx, const Tensor &input, Tensor *output)
                                            {batch, out_channels_, last_output_h_, last_output_w_},
                                            dtype_, ctx.stream()));
   int64_t total = forward_output_.numel();
+  if (ctx.use_cublas()) {
+    Status gemm_status = LaunchConv2dForwardGemm(
+        ctx, dtype_, input, weight_, bias_, &forward_output_, &column_buffer_, batch, in_channels_,
+        input_h, input_w, out_channels_, kernel_h_, kernel_w_, stride_h_, stride_w_, padding_h_,
+        padding_w_, last_output_h_, last_output_w_);
+    if (gemm_status.ok()) {
+      *output = forward_output_;
+      return Status::Ok();
+    }
+    if (gemm_status.code() != StatusCode::kUnsupported) {
+      return gemm_status;
+    }
+  }
+
   auto blocks = detail::BlocksForElements(total, kCudaThreads);
   if (!blocks.ok()) {
     return blocks.status();
@@ -158,27 +154,58 @@ Status Conv2d::Backward(RuntimeContext &ctx, const Tensor &grad_output, Tensor *
   }
 
   if (need_grad_input) {
-    auto input_blocks = detail::BlocksForElements(input_total, kCudaThreads);
-    if (!input_blocks.ok()) {
-      return input_blocks.status();
+    bool used_gemm = false;
+    if (ctx.use_cublas()) {
+      Status gemm_status = LaunchConv2dBackwardInputGemm(
+          ctx, dtype_, grad_output, weight_, &backward_output_, &grad_column_buffer_, last_batch_,
+          in_channels_, last_input_h_, last_input_w_, out_channels_, kernel_h_, kernel_w_,
+          stride_h_, stride_w_, padding_h_, padding_w_, last_output_h_, last_output_w_);
+      if (gemm_status.ok()) {
+        used_gemm = true;
+      } else if (gemm_status.code() != StatusCode::kUnsupported) {
+        return gemm_status;
+      }
     }
-    if (input_blocks.value() > 0) {
-      DLCUDA_RETURN_IF_ERROR(LaunchConv2dBackwardInputKernel(
-          ctx, dtype_, grad_output, weight_, &backward_output_, input_blocks.value(), input_total,
-          last_batch_, in_channels_, last_input_h_, last_input_w_, out_channels_, kernel_h_,
-          kernel_w_, stride_h_, stride_w_, padding_h_, padding_w_, last_output_h_, last_output_w_));
+    if (!used_gemm) {
+      auto input_blocks = detail::BlocksForElements(input_total, kCudaThreads);
+      if (!input_blocks.ok()) {
+        return input_blocks.status();
+      }
+      if (input_blocks.value() > 0) {
+        DLCUDA_RETURN_IF_ERROR(LaunchConv2dBackwardInputKernel(
+            ctx, dtype_, grad_output, weight_, &backward_output_, input_blocks.value(), input_total,
+            last_batch_, in_channels_, last_input_h_, last_input_w_, out_channels_, kernel_h_,
+            kernel_w_, stride_h_, stride_w_, padding_h_, padding_w_, last_output_h_,
+            last_output_w_));
+      }
     }
   }
 
-  auto weight_blocks = detail::BlocksForElements(weight_total, kCudaThreads);
-  if (!weight_blocks.ok()) {
-    return weight_blocks.status();
+  bool used_weight_gemm = false;
+  if (ctx.use_cublas()) {
+    Status gemm_status = LaunchConv2dBackwardWeightGemm(
+        ctx, dtype_, cached_input_, grad_output, &grad_weight_, &column_buffer_,
+        &grad_output_matrix_, last_batch_, in_channels_, last_input_h_, last_input_w_,
+        out_channels_, kernel_h_, kernel_w_, stride_h_, stride_w_, padding_h_, padding_w_,
+        last_output_h_, last_output_w_);
+    if (gemm_status.ok()) {
+      used_weight_gemm = true;
+    } else if (gemm_status.code() != StatusCode::kUnsupported) {
+      return gemm_status;
+    }
   }
-  if (weight_blocks.value() > 0) {
-    DLCUDA_RETURN_IF_ERROR(LaunchConv2dBackwardWeightKernel(
-        ctx, dtype_, cached_input_, grad_output, &grad_weight_, weight_blocks.value(), weight_total,
-        last_batch_, in_channels_, last_input_h_, last_input_w_, out_channels_, kernel_h_,
-        kernel_w_, stride_h_, stride_w_, padding_h_, padding_w_, last_output_h_, last_output_w_));
+  if (!used_weight_gemm) {
+    auto weight_blocks = detail::BlocksForElements(weight_total, kCudaThreads);
+    if (!weight_blocks.ok()) {
+      return weight_blocks.status();
+    }
+    if (weight_blocks.value() > 0) {
+      DLCUDA_RETURN_IF_ERROR(LaunchConv2dBackwardWeightKernel(
+          ctx, dtype_, cached_input_, grad_output, &grad_weight_, weight_blocks.value(),
+          weight_total, last_batch_, in_channels_, last_input_h_, last_input_w_, out_channels_,
+          kernel_h_, kernel_w_, stride_h_, stride_w_, padding_h_, padding_w_, last_output_h_,
+          last_output_w_));
+    }
   }
 
   auto bias_rows = detail::RowsForGrid(out_channels_, "conv bias");

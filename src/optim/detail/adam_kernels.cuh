@@ -5,6 +5,83 @@
 namespace dlcuda {
 namespace {
 
+struct AdamUpdateBlock {
+  void *params = nullptr;
+  const void *grads = nullptr;
+  float *m = nullptr;
+  float *v = nullptr;
+  int64_t start = 0;
+  int64_t n = 0;
+  DType param_dtype = DType::kFloat32;
+  DType grad_dtype = DType::kFloat32;
+  float lr = 0.0f;
+  float weight_decay = 0.0f;
+};
+
+__device__ float LoadAdamValue(const void *data, DType dtype, int64_t index) {
+  switch (dtype) {
+  case DType::kFloat32:
+    return static_cast<const float *>(data)[index];
+  case DType::kFloat16:
+    return detail::Float16BitsToFloat(static_cast<const uint16_t *>(data)[index]);
+  case DType::kBFloat16:
+    return detail::BFloat16BitsToFloat(static_cast<const uint16_t *>(data)[index]);
+  case DType::kInt32:
+    break;
+  }
+  return 0.0f;
+}
+
+__device__ void StoreAdamParam(void *data, DType dtype, int64_t index, float value) {
+  switch (dtype) {
+  case DType::kFloat32:
+    static_cast<float *>(data)[index] = value;
+    return;
+  case DType::kFloat16:
+    static_cast<uint16_t *>(data)[index] = detail::FloatToFloat16Bits(value);
+    return;
+  case DType::kBFloat16:
+    static_cast<uint16_t *>(data)[index] = detail::FloatToBFloat16Bits(value);
+    return;
+  case DType::kInt32:
+    break;
+  }
+}
+
+__global__ void AdamUpdateBlocksKernel(const AdamUpdateBlock *blocks, int block_count, float beta1,
+                                       float beta2, float epsilon, float inv_bias_correction1,
+                                       float inv_bias_correction2, bool decoupled_weight_decay) {
+  int block_id = static_cast<int>(blockIdx.x);
+  if (block_id >= block_count) {
+    return;
+  }
+
+  AdamUpdateBlock block = blocks[block_id];
+  int64_t idx = block.start + threadIdx.x;
+  if (idx >= block.n) {
+    return;
+  }
+
+  float p = LoadAdamValue(block.params, block.param_dtype, idx);
+  float g = LoadAdamValue(block.grads, block.grad_dtype, idx);
+  if (block.weight_decay != 0.0f && !decoupled_weight_decay) {
+    g += block.weight_decay * p;
+  }
+
+  float m_new = beta1 * block.m[idx] + (1.0f - beta1) * g;
+  float v_new = beta2 * block.v[idx] + (1.0f - beta2) * g * g;
+  block.m[idx] = m_new;
+  block.v[idx] = v_new;
+
+  float m_hat = m_new * inv_bias_correction1;
+  float v_hat = v_new * inv_bias_correction2;
+  float updated = p - block.lr * (m_hat / (sqrtf(v_hat) + epsilon));
+  if (block.weight_decay != 0.0f && decoupled_weight_decay) {
+    updated -= block.lr * block.weight_decay * p;
+  }
+  StoreAdamParam(block.params, block.param_dtype, idx, updated);
+}
+
 template <typename ParamCodec, typename GradCodec>
 __global__ void AdamUpdateKernel(typename ParamCodec::Storage *params,
                                  const typename GradCodec::Storage *grads, float *m, float *v,
@@ -46,53 +123,45 @@ Status LaunchAdamUpdate(RuntimeContext &ctx, const ParameterRef &param, Tensor *
   return detail::CheckKernelLaunch("Adam update kernel");
 }
 
-template <typename ParamCodec>
-Status LaunchAdamUpdateForParam(RuntimeContext &ctx, const ParameterRef &param, Tensor *m,
-                                Tensor *v, float lr, float beta1, float beta2, float epsilon,
-                                float inv_bias_correction1, float inv_bias_correction2,
-                                float weight_decay, bool decoupled_weight_decay, int blocks) {
-  switch (param.grad->dtype()) {
-  case DType::kFloat32:
-    return LaunchAdamUpdate<ParamCodec, detail::Float32Codec>(
-        ctx, param, m, v, lr, beta1, beta2, epsilon, inv_bias_correction1, inv_bias_correction2,
-        weight_decay, decoupled_weight_decay, blocks);
-  case DType::kFloat16:
-    return LaunchAdamUpdate<ParamCodec, detail::Float16Codec>(
-        ctx, param, m, v, lr, beta1, beta2, epsilon, inv_bias_correction1, inv_bias_correction2,
-        weight_decay, decoupled_weight_decay, blocks);
-  case DType::kBFloat16:
-    return LaunchAdamUpdate<ParamCodec, detail::BFloat16Codec>(
-        ctx, param, m, v, lr, beta1, beta2, epsilon, inv_bias_correction1, inv_bias_correction2,
-        weight_decay, decoupled_weight_decay, blocks);
-  case DType::kInt32:
-    break;
+struct AdamUpdateLauncher {
+  RuntimeContext &ctx;
+  const ParameterRef &param;
+  Tensor *m = nullptr;
+  Tensor *v = nullptr;
+  float lr = 0.0f;
+  float beta1 = 0.0f;
+  float beta2 = 0.0f;
+  float epsilon = 0.0f;
+  float inv_bias_correction1 = 0.0f;
+  float inv_bias_correction2 = 0.0f;
+  float weight_decay = 0.0f;
+  bool decoupled_weight_decay = false;
+  int blocks = 0;
+
+  template <typename ParamCodec, typename GradCodec> Status operator()() const {
+    return LaunchAdamUpdate<ParamCodec, GradCodec>(ctx, param, m, v, lr, beta1, beta2, epsilon,
+                                                   inv_bias_correction1, inv_bias_correction2,
+                                                   weight_decay, decoupled_weight_decay, blocks);
   }
-  return Status::InvalidArgument("Adam does not support grad dtype " +
-                                 std::string(DTypeName(param.grad->dtype())));
-}
+};
 
 Status LaunchAdamUpdate(RuntimeContext &ctx, const ParameterRef &param, Tensor *m, Tensor *v,
                         float lr, float beta1, float beta2, float epsilon,
                         float inv_bias_correction1, float inv_bias_correction2, float weight_decay,
                         bool decoupled_weight_decay, int blocks) {
-  switch (param.value->dtype()) {
-  case DType::kFloat32:
-    return LaunchAdamUpdateForParam<detail::Float32Codec>(
-        ctx, param, m, v, lr, beta1, beta2, epsilon, inv_bias_correction1, inv_bias_correction2,
-        weight_decay, decoupled_weight_decay, blocks);
-  case DType::kFloat16:
-    return LaunchAdamUpdateForParam<detail::Float16Codec>(
-        ctx, param, m, v, lr, beta1, beta2, epsilon, inv_bias_correction1, inv_bias_correction2,
-        weight_decay, decoupled_weight_decay, blocks);
-  case DType::kBFloat16:
-    return LaunchAdamUpdateForParam<detail::BFloat16Codec>(
-        ctx, param, m, v, lr, beta1, beta2, epsilon, inv_bias_correction1, inv_bias_correction2,
-        weight_decay, decoupled_weight_decay, blocks);
-  case DType::kInt32:
-    break;
-  }
-  return Status::InvalidArgument("Adam does not support parameter dtype " +
-                                 std::string(DTypeName(param.value->dtype())));
+  return DispatchOptimizerParamGradDTypes(
+      param, "Adam",
+      AdamUpdateLauncher{ctx, param, m, v, lr, beta1, beta2, epsilon, inv_bias_correction1,
+                         inv_bias_correction2, weight_decay, decoupled_weight_decay, blocks});
+}
+
+Status LaunchAdamUpdateBlocks(RuntimeContext &ctx, Tensor *blocks, int block_count, float beta1,
+                              float beta2, float epsilon, float inv_bias_correction1,
+                              float inv_bias_correction2, bool decoupled_weight_decay) {
+  AdamUpdateBlocksKernel<<<block_count, kOptimizerThreads, 0, ctx.stream()>>>(
+      blocks->data_as<AdamUpdateBlock>(), block_count, beta1, beta2, epsilon, inv_bias_correction1,
+      inv_bias_correction2, decoupled_weight_decay);
+  return detail::CheckKernelLaunch("Adam multi-tensor update kernel");
 }
 
 } // namespace

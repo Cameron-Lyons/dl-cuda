@@ -125,18 +125,17 @@ template <typename T> __device__ T ApplyBinaryOp(T lhs, T rhs, TensorBinaryOp op
   return lhs;
 }
 
-__device__ float ApplyBinaryOpFloat(float lhs, float rhs, TensorBinaryOp op) {
-  switch (op) {
-  case TensorBinaryOp::kAdd:
-    return lhs + rhs;
-  case TensorBinaryOp::kSubtract:
-    return lhs - rhs;
-  case TensorBinaryOp::kMultiply:
-    return lhs * rhs;
-  case TensorBinaryOp::kDivide:
-    return lhs / rhs;
+__device__ void ComputeBroadcastOffsets(BroadcastDescriptor desc, int64_t index,
+                                        int64_t *lhs_offset, int64_t *rhs_offset) {
+  int64_t remaining = index;
+  *lhs_offset = 0;
+  *rhs_offset = 0;
+  for (int axis = 0; axis < desc.rank; ++axis) {
+    int64_t coord = desc.out_strides[axis] == 0 ? 0 : remaining / desc.out_strides[axis];
+    remaining = desc.out_strides[axis] == 0 ? 0 : remaining % desc.out_strides[axis];
+    *lhs_offset += coord * desc.lhs_strides[axis];
+    *rhs_offset += coord * desc.rhs_strides[axis];
   }
-  return lhs;
 }
 
 template <typename T>
@@ -147,16 +146,9 @@ __global__ void TensorBinaryKernel(const T *lhs, const T *rhs, T *output, Broadc
     return;
   }
 
-  int64_t remaining = idx;
   int64_t lhs_offset = 0;
   int64_t rhs_offset = 0;
-  for (int axis = 0; axis < desc.rank; ++axis) {
-    int64_t coord = desc.out_strides[axis] == 0 ? 0 : remaining / desc.out_strides[axis];
-    remaining = desc.out_strides[axis] == 0 ? 0 : remaining % desc.out_strides[axis];
-    lhs_offset += coord * desc.lhs_strides[axis];
-    rhs_offset += coord * desc.rhs_strides[axis];
-  }
-
+  ComputeBroadcastOffsets(desc, idx, &lhs_offset, &rhs_offset);
   output[idx] = ApplyBinaryOp(lhs[lhs_offset], rhs[rhs_offset], op);
 }
 
@@ -170,19 +162,12 @@ TensorBinaryFloatingKernel(const typename Codec::Storage *lhs, const typename Co
     return;
   }
 
-  int64_t remaining = idx;
   int64_t lhs_offset = 0;
   int64_t rhs_offset = 0;
-  for (int axis = 0; axis < desc.rank; ++axis) {
-    int64_t coord = desc.out_strides[axis] == 0 ? 0 : remaining / desc.out_strides[axis];
-    remaining = desc.out_strides[axis] == 0 ? 0 : remaining % desc.out_strides[axis];
-    lhs_offset += coord * desc.lhs_strides[axis];
-    rhs_offset += coord * desc.rhs_strides[axis];
-  }
-
+  ComputeBroadcastOffsets(desc, idx, &lhs_offset, &rhs_offset);
   float lhs_value = Codec::Load(lhs, lhs_offset);
   float rhs_value = Codec::Load(rhs, rhs_offset);
-  Codec::Store(output, idx, ApplyBinaryOpFloat(lhs_value, rhs_value, op));
+  Codec::Store(output, idx, ApplyBinaryOp(lhs_value, rhs_value, op));
 }
 
 template <typename Codec>
@@ -218,7 +203,8 @@ TensorMatMulKernel(const typename Codec::Storage *lhs, const typename Codec::Sto
 }
 
 template <typename Codec>
-__global__ void TensorSumKernel(const typename Codec::Storage *input, float *output, int64_t n) {
+__global__ void TensorSumPartialsKernel(const typename Codec::Storage *input, float *partials,
+                                        int64_t n) {
   __shared__ typename TensorOpBlockReduce::TempStorage reduce_storage;
 
   int tid = threadIdx.x;
@@ -232,7 +218,23 @@ __global__ void TensorSumKernel(const typename Codec::Storage *input, float *out
   float block_sum = TensorOpBlockReduce(reduce_storage).Sum(local_sum);
 
   if (tid == 0) {
-    atomicAdd(output, block_sum);
+    partials[blockIdx.x] = block_sum;
+  }
+}
+
+__global__ void FinalizeTensorSumKernel(const float *partials, float *output,
+                                        int64_t partial_count) {
+  __shared__ typename TensorOpBlockReduce::TempStorage reduce_storage;
+
+  int tid = threadIdx.x;
+  float local_sum = 0.0f;
+  for (int64_t i = tid; i < partial_count; i += blockDim.x) {
+    local_sum += partials[i];
+  }
+  float sum = TensorOpBlockReduce(reduce_storage).Sum(local_sum);
+
+  if (tid == 0) {
+    output[0] = sum;
   }
 }
 
@@ -293,28 +295,47 @@ Status LaunchTensorMatMul(RuntimeContext &ctx, const Tensor &lhs, const Tensor &
                                  std::string(DTypeName(lhs.dtype())));
 }
 
-template <typename Codec>
-Status LaunchTensorReduceSum(RuntimeContext &ctx, const Tensor &input, Tensor *output, int blocks,
-                             int64_t n) {
-  TensorSumKernel<Codec><<<blocks, kTensorOpThreads, 0, ctx.stream()>>>(
-      input.data_as<typename Codec::Storage>(), output->data_as<float>(), n);
-  return detail::CheckKernelLaunch("TensorReduceSum kernel");
+Status TensorMatMulCublasFloat(RuntimeContext &ctx, const Tensor &lhs, const Tensor &rhs,
+                               Tensor *output, int rows, int inner, int cols) {
+  DLCUDA_RETURN_IF_ERROR(ctx.EnsureCublas());
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  return detail::CublasStatus(cublasSgemm(ctx.cublas_handle(), CUBLAS_OP_N, CUBLAS_OP_N, cols, rows,
+                                          inner, &alpha, rhs.data_as<float>(), cols,
+                                          lhs.data_as<float>(), inner, &beta,
+                                          output->data_as<float>(), cols),
+                              "TensorMatMul cublasSgemm");
 }
 
-Status LaunchTensorReduceSum(RuntimeContext &ctx, const Tensor &input, Tensor *output, int blocks,
-                             int64_t n) {
+template <typename Codec>
+Status LaunchTensorReduceSumPartials(RuntimeContext &ctx, const Tensor &input, Tensor *partials,
+                                     int blocks, int64_t n) {
+  TensorSumPartialsKernel<Codec><<<blocks, kTensorOpThreads, 0, ctx.stream()>>>(
+      input.data_as<typename Codec::Storage>(), partials->data_as<float>(), n);
+  return detail::CheckKernelLaunch("TensorReduceSum partials kernel");
+}
+
+Status LaunchTensorReduceSumPartials(RuntimeContext &ctx, const Tensor &input, Tensor *partials,
+                                     int blocks, int64_t n) {
   switch (input.dtype()) {
   case DType::kFloat32:
-    return LaunchTensorReduceSum<detail::Float32Codec>(ctx, input, output, blocks, n);
+    return LaunchTensorReduceSumPartials<detail::Float32Codec>(ctx, input, partials, blocks, n);
   case DType::kFloat16:
-    return LaunchTensorReduceSum<detail::Float16Codec>(ctx, input, output, blocks, n);
+    return LaunchTensorReduceSumPartials<detail::Float16Codec>(ctx, input, partials, blocks, n);
   case DType::kBFloat16:
-    return LaunchTensorReduceSum<detail::BFloat16Codec>(ctx, input, output, blocks, n);
+    return LaunchTensorReduceSumPartials<detail::BFloat16Codec>(ctx, input, partials, blocks, n);
   case DType::kInt32:
     break;
   }
   return Status::InvalidArgument("TensorReduceSum does not support dtype " +
                                  std::string(DTypeName(input.dtype())));
+}
+
+Status LaunchFinalizeTensorReduceSum(RuntimeContext &ctx, const Tensor &partials, Tensor *output,
+                                     int64_t partial_count) {
+  FinalizeTensorSumKernel<<<1, kTensorOpThreads, 0, ctx.stream()>>>(
+      partials.data_as<float>(), output->data_as<float>(), partial_count);
+  return detail::CheckKernelLaunch("TensorReduceSum finalize kernel");
 }
 
 Status RunTensorBinaryOp(RuntimeContext &ctx, const Tensor &lhs, const Tensor &rhs, Tensor *output,
@@ -418,6 +439,9 @@ Status TensorMatMul(RuntimeContext &ctx, const Tensor &lhs, const Tensor &rhs, T
   if (rows == 0 || cols == 0) {
     return Status::Ok();
   }
+  if (inner == 0) {
+    return output->FillZero(ctx.stream());
+  }
 
   auto rows_int = detail::CheckedInt(rows, "TensorMatMul rows");
   if (!rows_int.ok()) {
@@ -430,6 +454,11 @@ Status TensorMatMul(RuntimeContext &ctx, const Tensor &lhs, const Tensor &rhs, T
   auto inner_int = detail::CheckedInt(inner, "TensorMatMul inner");
   if (!inner_int.ok()) {
     return inner_int.status();
+  }
+
+  if (ctx.use_cublas() && lhs.dtype() == DType::kFloat32) {
+    return TensorMatMulCublasFloat(ctx, lhs, rhs, output, rows_int.value(), inner_int.value(),
+                                   cols_int.value());
   }
 
   return LaunchTensorMatMul(ctx, lhs, rhs, output, rows_int.value(), inner_int.value(),
@@ -449,17 +478,28 @@ Status TensorReduceSum(RuntimeContext &ctx, const Tensor &input, Tensor *output)
   }
 
   DLCUDA_RETURN_IF_ERROR(EnsureTensorAsync(output, {1}, DType::kFloat32, ctx.stream()));
-  DLCUDA_RETURN_IF_ERROR(output->FillZero(ctx.stream()));
 
   int64_t n = input.numel();
   if (n == 0) {
-    return Status::Ok();
+    return output->FillZero(ctx.stream());
   }
   auto blocks = detail::CappedBlocksForElements(n, kTensorOpThreads, kTensorReductionMaxBlocks);
   if (!blocks.ok()) {
     return blocks.status();
   }
-  return LaunchTensorReduceSum(ctx, input, output, blocks.value(), n);
+  if (blocks.value() == 1) {
+    return LaunchTensorReduceSumPartials(ctx, input, output, blocks.value(), n);
+  }
+
+  auto partials =
+      ctx.ScratchTensor("tensor_ops.reduce_sum.partials", {blocks.value()}, DType::kFloat32);
+  if (!partials.ok()) {
+    return partials.status();
+  }
+  Tensor partial_buffer = partials.value();
+  DLCUDA_RETURN_IF_ERROR(
+      LaunchTensorReduceSumPartials(ctx, input, &partial_buffer, blocks.value(), n));
+  return LaunchFinalizeTensorReduceSum(ctx, partial_buffer, output, blocks.value());
 }
 
 Result<float> TensorSum(RuntimeContext &ctx, const Tensor &input) {

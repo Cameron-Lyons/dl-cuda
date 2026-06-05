@@ -40,51 +40,32 @@ Status LaunchSGDUpdate(RuntimeContext &ctx, const ParameterRef &param, Tensor *m
   return detail::CheckKernelLaunch("SGD update kernel");
 }
 
-template <typename ParamCodec>
-Status LaunchSGDUpdateForParam(RuntimeContext &ctx, const ParameterRef &param,
-                               Tensor *momentum_buffer, bool has_momentum, float lr, float momentum,
-                               float weight_decay, float dampening, bool nesterov, int blocks) {
-  switch (param.grad->dtype()) {
-  case DType::kFloat32:
-    return LaunchSGDUpdate<ParamCodec, detail::Float32Codec>(
-        ctx, param, momentum_buffer, has_momentum, lr, momentum, weight_decay, dampening, nesterov,
-        blocks);
-  case DType::kFloat16:
-    return LaunchSGDUpdate<ParamCodec, detail::Float16Codec>(
-        ctx, param, momentum_buffer, has_momentum, lr, momentum, weight_decay, dampening, nesterov,
-        blocks);
-  case DType::kBFloat16:
-    return LaunchSGDUpdate<ParamCodec, detail::BFloat16Codec>(
-        ctx, param, momentum_buffer, has_momentum, lr, momentum, weight_decay, dampening, nesterov,
-        blocks);
-  case DType::kInt32:
-    break;
+struct SGDUpdateLauncher {
+  RuntimeContext &ctx;
+  const ParameterRef &param;
+  Tensor *momentum_buffer = nullptr;
+  bool has_momentum = false;
+  float lr = 0.0f;
+  float momentum = 0.0f;
+  float weight_decay = 0.0f;
+  float dampening = 0.0f;
+  bool nesterov = false;
+  int blocks = 0;
+
+  template <typename ParamCodec, typename GradCodec> Status operator()() const {
+    return LaunchSGDUpdate<ParamCodec, GradCodec>(ctx, param, momentum_buffer, has_momentum, lr,
+                                                  momentum, weight_decay, dampening, nesterov,
+                                                  blocks);
   }
-  return Status::InvalidArgument("SGD does not support grad dtype " +
-                                 std::string(DTypeName(param.grad->dtype())));
-}
+};
 
 Status LaunchSGDUpdate(RuntimeContext &ctx, const ParameterRef &param, Tensor *momentum_buffer,
                        bool has_momentum, float lr, float momentum, float weight_decay,
                        float dampening, bool nesterov, int blocks) {
-  switch (param.value->dtype()) {
-  case DType::kFloat32:
-    return LaunchSGDUpdateForParam<detail::Float32Codec>(ctx, param, momentum_buffer, has_momentum,
-                                                         lr, momentum, weight_decay, dampening,
-                                                         nesterov, blocks);
-  case DType::kFloat16:
-    return LaunchSGDUpdateForParam<detail::Float16Codec>(ctx, param, momentum_buffer, has_momentum,
-                                                         lr, momentum, weight_decay, dampening,
-                                                         nesterov, blocks);
-  case DType::kBFloat16:
-    return LaunchSGDUpdateForParam<detail::BFloat16Codec>(ctx, param, momentum_buffer, has_momentum,
-                                                          lr, momentum, weight_decay, dampening,
-                                                          nesterov, blocks);
-  case DType::kInt32:
-    break;
-  }
-  return Status::InvalidArgument("SGD does not support parameter dtype " +
-                                 std::string(DTypeName(param.value->dtype())));
+  return DispatchOptimizerParamGradDTypes(
+      param, "SGD",
+      SGDUpdateLauncher{ctx, param, momentum_buffer, has_momentum, lr, momentum, weight_decay,
+                        dampening, nesterov, blocks});
 }
 
 } // namespace

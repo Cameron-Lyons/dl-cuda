@@ -75,6 +75,36 @@ inline Status CopyHostFloatsToTensor(Tensor *tensor, const std::vector<float> &v
   return Status::InvalidArgument("CopyHostFloatsToTensor requires a floating-point tensor");
 }
 
+inline Status FillKaimingNormal(RuntimeContext &ctx, Tensor *weight, float fan_in) {
+  if (weight == nullptr) {
+    return Status::InvalidArgument("FillKaimingNormal received a null tensor");
+  }
+  if (!(fan_in > 0.0f)) {
+    return Status::InvalidArgument("FillKaimingNormal fan_in must be positive");
+  }
+
+  std::mt19937 rng(static_cast<uint32_t>(ctx.NextInitSeed()));
+  std::normal_distribution<float> dist(0.0f, std::sqrt(2.0f / fan_in));
+  std::vector<float> host_weight(static_cast<size_t>(weight->numel()));
+  for (float &v : host_weight) {
+    v = dist(rng);
+  }
+
+  return CopyHostFloatsToTensor(weight, host_weight, ctx.stream());
+}
+
+inline Status InitializeWeightBiasAndGradients(RuntimeContext &ctx, Tensor *weight, Tensor *bias,
+                                               Tensor *grad_weight, Tensor *grad_bias,
+                                               float fan_in) {
+  if (bias == nullptr || grad_weight == nullptr || grad_bias == nullptr) {
+    return Status::InvalidArgument("InitializeWeightBiasAndGradients received a null tensor");
+  }
+  DLCUDA_RETURN_IF_ERROR(FillKaimingNormal(ctx, weight, fan_in));
+  DLCUDA_RETURN_IF_ERROR(bias->FillZero(ctx.stream()));
+  DLCUDA_RETURN_IF_ERROR(grad_weight->FillZero(ctx.stream()));
+  return grad_bias->FillZero(ctx.stream());
+}
+
 inline Result<int64_t> SpatialOutputSize(int64_t input, int64_t kernel, int64_t stride,
                                          int64_t padding, const char *name) {
   if (input < 0) {

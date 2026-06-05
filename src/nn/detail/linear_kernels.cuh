@@ -3,37 +3,80 @@
 #include "common.cuh"
 
 namespace dlcuda {
-namespace {
 
-struct CublasLtMatmulDescOwner {
-  ~CublasLtMatmulDescOwner() {
-    if (desc != nullptr) {
-      cublasLtMatmulDescDestroy(desc);
-    }
+#if defined(DLCUDA_HAS_CUBLASLT)
+struct LinearCublasLtForwardPlan {
+  ~LinearCublasLtForwardPlan() {
+    ResetDescriptors();
   }
 
-  cublasLtMatmulDesc_t desc = nullptr;
-};
+  LinearCublasLtForwardPlan() = default;
+  LinearCublasLtForwardPlan(const LinearCublasLtForwardPlan &) = delete;
+  LinearCublasLtForwardPlan &operator=(const LinearCublasLtForwardPlan &) = delete;
 
-struct CublasLtMatrixLayoutOwner {
-  ~CublasLtMatrixLayoutOwner() {
-    if (layout != nullptr) {
-      cublasLtMatrixLayoutDestroy(layout);
+  void ResetDescriptors() {
+    if (op_desc != nullptr) {
+      cublasLtMatmulDescDestroy(op_desc);
+      op_desc = nullptr;
     }
-  }
-
-  cublasLtMatrixLayout_t layout = nullptr;
-};
-
-struct CublasLtPreferenceOwner {
-  ~CublasLtPreferenceOwner() {
+    if (weight_layout != nullptr) {
+      cublasLtMatrixLayoutDestroy(weight_layout);
+      weight_layout = nullptr;
+    }
+    if (input_layout != nullptr) {
+      cublasLtMatrixLayoutDestroy(input_layout);
+      input_layout = nullptr;
+    }
+    if (output_layout != nullptr) {
+      cublasLtMatrixLayoutDestroy(output_layout);
+      output_layout = nullptr;
+    }
     if (preference != nullptr) {
       cublasLtMatmulPreferenceDestroy(preference);
+      preference = nullptr;
     }
+    initialized = false;
+    out_features = 0;
+    batch = 0;
+    in_features = 0;
+    dtype = DType::kFloat32;
+    tf32 = false;
+    bias_data = nullptr;
+    workspace_bytes = 0;
   }
 
+  [[nodiscard]] bool Matches(int out_features_in, int batch_in, int in_features_in, DType dtype_in,
+                             bool tf32_in, const void *bias_data_in) const {
+    return initialized && out_features == out_features_in && batch == batch_in &&
+           in_features == in_features_in && dtype == dtype_in && tf32 == tf32_in &&
+           bias_data == bias_data_in;
+  }
+
+  bool initialized = false;
+  int out_features = 0;
+  int batch = 0;
+  int in_features = 0;
+  DType dtype = DType::kFloat32;
+  bool tf32 = false;
+  const void *bias_data = nullptr;
+  cublasLtMatmulDesc_t op_desc = nullptr;
+  cublasLtMatrixLayout_t weight_layout = nullptr;
+  cublasLtMatrixLayout_t input_layout = nullptr;
+  cublasLtMatrixLayout_t output_layout = nullptr;
   cublasLtMatmulPreference_t preference = nullptr;
+  cublasLtMatmulAlgo_t algo = {};
+  Tensor workspace;
+  size_t workspace_bytes = 0;
 };
+#else
+struct LinearCublasLtForwardPlan {};
+#endif
+
+namespace {
+
+#if defined(DLCUDA_HAS_CUBLASLT)
+
+constexpr size_t kLinearCublasLtWorkspaceLimitBytes = 4 * 1024 * 1024;
 
 bool IsCublasLtUnsupported(cublasStatus_t status) {
   return status == CUBLAS_STATUS_NOT_SUPPORTED || status == CUBLAS_STATUS_ARCH_MISMATCH;
@@ -49,91 +92,175 @@ Status CublasLtStatus(cublasStatus_t status, const std::string &context) {
   return detail::CublasStatus(status, context);
 }
 
-cublasComputeType_t LinearForwardComputeType(const RuntimeContext &ctx) {
-#if defined(CUBLAS_VERSION) && CUBLAS_VERSION >= 11000
-  if (ctx.tf32()) {
-    return CUBLAS_COMPUTE_32F_FAST_TF32;
-  }
-#else
-  (void)ctx;
 #endif
-  return CUBLAS_COMPUTE_32F;
+
+#if defined(DLCUDA_HAS_CUBLASLT)
+
+Result<int64_t> LinearCublasLtWorkspaceElements(size_t bytes) {
+  size_t elements = (bytes + sizeof(float) - 1) / sizeof(float);
+  if (elements > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
+    return Status::InvalidArgument("Linear forward cuBLASLt workspace is too large");
+  }
+  return static_cast<int64_t>(elements);
 }
 
-Status LinearForwardCublasLt(RuntimeContext &ctx, const Tensor &input, const Tensor &weight,
-                             const Tensor &bias, Tensor *forward_output, int out_features,
-                             int batch, int in_features) {
-  Status lt_status = ctx.EnsureCublasLt();
-  if (!lt_status.ok()) {
-    return Status::Unsupported("cuBLASLt unavailable: " + lt_status.message());
+Status BuildLinearForwardCublasLtPlan(RuntimeContext &ctx, const Tensor &bias,
+                                      LinearCublasLtForwardPlan *plan, int out_features, int batch,
+                                      int in_features, DType dtype) {
+  if (plan == nullptr) {
+    return Status::InvalidArgument("Linear forward cuBLASLt plan is null");
   }
 
-  CublasLtMatmulDescOwner op_desc;
-  cublasStatus_t status =
-      cublasLtMatmulDescCreate(&op_desc.desc, LinearForwardComputeType(ctx), CUDA_R_32F);
+  plan->ResetDescriptors();
+
+  auto data_type = detail::CublasCudaDataType(dtype, "Linear cuBLAS");
+  if (!data_type.ok()) {
+    return data_type.status();
+  }
+
+  cublasStatus_t status = cublasLtMatmulDescCreate(
+      &plan->op_desc, detail::CublasComputeType(ctx.tf32(), dtype), CUDA_R_32F);
   DLCUDA_RETURN_IF_ERROR(CublasLtStatus(status, "Linear forward cublasLtMatmulDescCreate"));
 
   cublasOperation_t trans = CUBLAS_OP_N;
-  status = cublasLtMatmulDescSetAttribute(op_desc.desc, CUBLASLT_MATMUL_DESC_TRANSA, &trans,
+  status = cublasLtMatmulDescSetAttribute(plan->op_desc, CUBLASLT_MATMUL_DESC_TRANSA, &trans,
                                           sizeof(trans));
   DLCUDA_RETURN_IF_ERROR(CublasLtStatus(status, "Linear forward cuBLASLt transA"));
-  status = cublasLtMatmulDescSetAttribute(op_desc.desc, CUBLASLT_MATMUL_DESC_TRANSB, &trans,
+  status = cublasLtMatmulDescSetAttribute(plan->op_desc, CUBLASLT_MATMUL_DESC_TRANSB, &trans,
                                           sizeof(trans));
   DLCUDA_RETURN_IF_ERROR(CublasLtStatus(status, "Linear forward cuBLASLt transB"));
 
   cublasLtEpilogue_t epilogue = CUBLASLT_EPILOGUE_BIAS;
-  status = cublasLtMatmulDescSetAttribute(op_desc.desc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue,
+  status = cublasLtMatmulDescSetAttribute(plan->op_desc, CUBLASLT_MATMUL_DESC_EPILOGUE, &epilogue,
                                           sizeof(epilogue));
   DLCUDA_RETURN_IF_ERROR(CublasLtStatus(status, "Linear forward cuBLASLt bias epilogue"));
   const void *bias_ptr = bias.data();
-  status = cublasLtMatmulDescSetAttribute(op_desc.desc, CUBLASLT_MATMUL_DESC_BIAS_POINTER,
+  status = cublasLtMatmulDescSetAttribute(plan->op_desc, CUBLASLT_MATMUL_DESC_BIAS_POINTER,
                                           &bias_ptr, sizeof(bias_ptr));
   DLCUDA_RETURN_IF_ERROR(CublasLtStatus(status, "Linear forward cuBLASLt bias pointer"));
 
-  CublasLtMatrixLayoutOwner weight_desc;
-  status = cublasLtMatrixLayoutCreate(&weight_desc.layout, CUDA_R_32F, out_features, in_features,
-                                      out_features);
+  status = cublasLtMatrixLayoutCreate(&plan->weight_layout, data_type.value(), out_features,
+                                      in_features, out_features);
   DLCUDA_RETURN_IF_ERROR(CublasLtStatus(status, "Linear forward cuBLASLt weight layout"));
 
-  CublasLtMatrixLayoutOwner input_desc;
-  status =
-      cublasLtMatrixLayoutCreate(&input_desc.layout, CUDA_R_32F, in_features, batch, in_features);
+  status = cublasLtMatrixLayoutCreate(&plan->input_layout, data_type.value(), in_features, batch,
+                                      in_features);
   DLCUDA_RETURN_IF_ERROR(CublasLtStatus(status, "Linear forward cuBLASLt input layout"));
 
-  CublasLtMatrixLayoutOwner output_desc;
-  status = cublasLtMatrixLayoutCreate(&output_desc.layout, CUDA_R_32F, out_features, batch,
+  status = cublasLtMatrixLayoutCreate(&plan->output_layout, data_type.value(), out_features, batch,
                                       out_features);
   DLCUDA_RETURN_IF_ERROR(CublasLtStatus(status, "Linear forward cuBLASLt output layout"));
 
-  CublasLtPreferenceOwner preference;
-  status = cublasLtMatmulPreferenceCreate(&preference.preference);
+  status = cublasLtMatmulPreferenceCreate(&plan->preference);
   DLCUDA_RETURN_IF_ERROR(CublasLtStatus(status, "Linear forward cublasLtMatmulPreferenceCreate"));
-
-  constexpr size_t kWorkspaceBytes = 0;
-  status = cublasLtMatmulPreferenceSetAttribute(preference.preference,
-                                                CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
-                                                &kWorkspaceBytes, sizeof(kWorkspaceBytes));
+  status = cublasLtMatmulPreferenceSetAttribute(
+      plan->preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
+      &kLinearCublasLtWorkspaceLimitBytes, sizeof(kLinearCublasLtWorkspaceLimitBytes));
   DLCUDA_RETURN_IF_ERROR(CublasLtStatus(status, "Linear forward cuBLASLt workspace preference"));
 
   cublasLtMatmulHeuristicResult_t heuristic = {};
   int returned_results = 0;
-  status = cublasLtMatmulAlgoGetHeuristic(ctx.cublaslt_handle(), op_desc.desc, weight_desc.layout,
-                                          input_desc.layout, output_desc.layout, output_desc.layout,
-                                          preference.preference, 1, &heuristic, &returned_results);
+  status = cublasLtMatmulAlgoGetHeuristic(
+      ctx.cublaslt_handle(), plan->op_desc, plan->weight_layout, plan->input_layout,
+      plan->output_layout, plan->output_layout, plan->preference, 1, &heuristic, &returned_results);
   DLCUDA_RETURN_IF_ERROR(CublasLtStatus(status, "Linear forward cublasLtMatmulAlgoGetHeuristic"));
   if (returned_results == 0) {
     return Status::Unsupported("Linear forward cuBLASLt found no supported matmul algorithm");
   }
 
+  plan->workspace_bytes = heuristic.workspaceSize;
+  if (plan->workspace_bytes > 0) {
+    auto workspace_elements = LinearCublasLtWorkspaceElements(plan->workspace_bytes);
+    if (!workspace_elements.ok()) {
+      return workspace_elements.status();
+    }
+    DLCUDA_RETURN_IF_ERROR(EnsureTensorAsync(&plan->workspace, {workspace_elements.value()},
+                                             DType::kFloat32, ctx.stream()));
+  }
+
+  plan->algo = heuristic.algo;
+  plan->out_features = out_features;
+  plan->batch = batch;
+  plan->in_features = in_features;
+  plan->dtype = dtype;
+  plan->tf32 = ctx.tf32();
+  plan->bias_data = bias.data();
+  plan->initialized = true;
+  return Status::Ok();
+}
+
+Status LinearForwardCublasLt(RuntimeContext &ctx, const Tensor &input, const Tensor &weight,
+                             const Tensor &bias, Tensor *forward_output, int out_features,
+                             int batch, int in_features, DType dtype,
+                             LinearCublasLtForwardPlan *plan) {
+  Status lt_status = ctx.EnsureCublasLt();
+  if (!lt_status.ok()) {
+    return Status::Unsupported("cuBLASLt unavailable: " + lt_status.message());
+  }
+  if (plan == nullptr) {
+    return Status::InvalidArgument("Linear forward cuBLASLt plan is null");
+  }
+
+  if (!plan->Matches(out_features, batch, in_features, dtype, ctx.tf32(), bias.data())) {
+    DLCUDA_RETURN_IF_ERROR(
+        BuildLinearForwardCublasLtPlan(ctx, bias, plan, out_features, batch, in_features, dtype));
+  }
+
   const float alpha = 1.0f;
   const float beta = 0.0f;
-  status = cublasLtMatmul(ctx.cublaslt_handle(), op_desc.desc, &alpha, weight.data_as<float>(),
-                          weight_desc.layout, input.data_as<float>(), input_desc.layout, &beta,
-                          forward_output->data_as<float>(), output_desc.layout,
-                          forward_output->data_as<float>(), output_desc.layout, &heuristic.algo,
-                          nullptr, kWorkspaceBytes, ctx.stream());
+  void *workspace = plan->workspace_bytes == 0 ? nullptr : plan->workspace.data();
+  cublasStatus_t status = cublasLtMatmul(
+      ctx.cublaslt_handle(), plan->op_desc, &alpha, weight.data(), plan->weight_layout,
+      input.data(), plan->input_layout, &beta, forward_output->data(), plan->output_layout,
+      forward_output->data(), plan->output_layout, &plan->algo, workspace, plan->workspace_bytes,
+      ctx.stream());
   return CublasLtStatus(status, "Linear forward cublasLtMatmul");
 }
+
+#endif
+
+#if defined(CUBLAS_VERSION) && CUBLAS_VERSION >= 11000
+
+Status CublasGemmExStatus(cublasStatus_t status, const std::string &context) {
+  if (status == CUBLAS_STATUS_SUCCESS) {
+    return Status::Ok();
+  }
+  if (status == CUBLAS_STATUS_NOT_SUPPORTED || status == CUBLAS_STATUS_ARCH_MISMATCH) {
+    return Status::Unsupported(context + " is not supported by cuBLAS");
+  }
+  return detail::CublasStatus(status, context);
+}
+
+Status LinearCublasGemmEx(RuntimeContext &ctx, cublasOperation_t trans_a, cublasOperation_t trans_b,
+                          int m, int n, int k, const Tensor &a, DType a_dtype, int lda,
+                          const Tensor &b, DType b_dtype, int ldb, Tensor *c, DType c_dtype,
+                          int ldc, const char *op_name) {
+  if (c == nullptr) {
+    return Status::InvalidArgument(std::string(op_name) + " output is null");
+  }
+  auto a_type = detail::CublasCudaDataType(a_dtype, "Linear cuBLAS");
+  if (!a_type.ok()) {
+    return a_type.status();
+  }
+  auto b_type = detail::CublasCudaDataType(b_dtype, "Linear cuBLAS");
+  if (!b_type.ok()) {
+    return b_type.status();
+  }
+  auto c_type = detail::CublasCudaDataType(c_dtype, "Linear cuBLAS");
+  if (!c_type.ok()) {
+    return c_type.status();
+  }
+
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  cublasStatus_t status =
+      cublasGemmEx(ctx.cublas_handle(), trans_a, trans_b, m, n, k, &alpha, a.data(), a_type.value(),
+                   lda, b.data(), b_type.value(), ldb, &beta, c->data(), c_type.value(), ldc,
+                   detail::CublasComputeType(ctx.tf32(), a_dtype), CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+  return CublasGemmExStatus(status, op_name);
+}
+
+#endif
 
 __global__ void AddBiasKernel(float *output, const float *bias, int64_t batch,
                               int64_t out_features) {

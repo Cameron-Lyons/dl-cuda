@@ -45,7 +45,15 @@ public:
   }
 
 private:
+  enum class ClassificationKind {
+    kBinary,
+    kCategorical,
+  };
+
   Status ValidateOptions(const TrainStepOptions &options) const;
+  Status TrainClassificationStep(const Tensor &inputs, const Tensor &labels,
+                                 const TrainStepOptions &options, TrainStepResult *result,
+                                 ClassificationKind kind);
   Status FinishStep(const TrainStepOptions &options, TrainStepResult *result);
 
   RuntimeContext *ctx_ = nullptr;

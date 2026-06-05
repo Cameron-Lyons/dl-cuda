@@ -1,53 +1,78 @@
 #include "detail/activation_kernels.cuh"
 
 namespace dlcuda {
+namespace {
 
-Status ReLU::Forward(RuntimeContext &ctx, const Tensor &input, Tensor *output) {
+using UnaryForwardLauncher = Status (*)(RuntimeContext &, const Tensor &, Tensor *, int);
+using UnaryBackwardLauncher = Status (*)(RuntimeContext &, const Tensor &, const Tensor &, Tensor *,
+                                         int);
+
+Status RunUnaryForward(RuntimeContext &ctx, const Tensor &input, Tensor *output,
+                       Tensor *cached_input, Tensor *stored_output, const char *op_name,
+                       UnaryForwardLauncher launcher) {
   if (output == nullptr) {
-    return Status::InvalidArgument("ReLU::Forward output is null");
+    return Status::InvalidArgument(std::string(op_name) + "::Forward output is null");
   }
-  DLCUDA_RETURN_IF_ERROR(ValidateFloatingTensor(input, "ReLU input"));
+  DLCUDA_RETURN_IF_ERROR(ValidateFloatingTensor(input, (std::string(op_name) + " input").c_str()));
 
   DLCUDA_RETURN_IF_ERROR(
-      EnsureTensorAsync(&forward_output_, input.shape(), input.dtype(), ctx.stream()));
-  cached_input_ = input;
+      EnsureTensorAsync(stored_output, input.shape(), input.dtype(), ctx.stream()));
+  if (cached_input != nullptr) {
+    *cached_input = input;
+  }
 
   auto blocks = detail::BlocksForElements(input.numel(), kCudaThreads);
   if (!blocks.ok()) {
     return blocks.status();
   }
   if (blocks.value() > 0) {
-    DLCUDA_RETURN_IF_ERROR(LaunchReLUForwardKernel(ctx, input, &forward_output_, blocks.value()));
+    DLCUDA_RETURN_IF_ERROR(launcher(ctx, input, stored_output, blocks.value()));
   }
 
-  *output = forward_output_;
+  *output = *stored_output;
   return Status::Ok();
 }
 
-Status ReLU::Backward(RuntimeContext &ctx, const Tensor &grad_output, Tensor *grad_input) {
-  DLCUDA_RETURN_IF_ERROR(ValidateFloatingTensor(grad_output, "ReLU grad_output"));
-  if (!cached_input_.defined()) {
-    return Status::RuntimeError("ReLU backward called before forward");
+Status RunUnaryBackward(RuntimeContext &ctx, const Tensor &grad_output, Tensor *grad_input,
+                        const Tensor &cached_tensor, Tensor *stored_grad_input, const char *op_name,
+                        const char *cached_name, UnaryBackwardLauncher launcher) {
+  DLCUDA_RETURN_IF_ERROR(
+      ValidateFloatingTensor(grad_output, (std::string(op_name) + " grad_output").c_str()));
+  if (!cached_tensor.defined()) {
+    return Status::RuntimeError(std::string(op_name) + " backward called before forward");
   }
   DLCUDA_RETURN_IF_ERROR(
-      EnsureSameShapeAndType(grad_output, cached_input_, "grad_output", "cached_input"));
+      EnsureSameShapeAndType(grad_output, cached_tensor, "grad_output", cached_name));
   if (grad_input == nullptr) {
     return Status::Ok();
   }
 
   DLCUDA_RETURN_IF_ERROR(
-      EnsureTensorAsync(&backward_output_, grad_output.shape(), grad_output.dtype(), ctx.stream()));
+      EnsureTensorAsync(stored_grad_input, grad_output.shape(), grad_output.dtype(), ctx.stream()));
   auto blocks = detail::BlocksForElements(grad_output.numel(), kCudaThreads);
   if (!blocks.ok()) {
     return blocks.status();
   }
   if (blocks.value() > 0) {
-    DLCUDA_RETURN_IF_ERROR(LaunchReLUBackwardKernel(ctx, grad_output, cached_input_,
-                                                    &backward_output_, blocks.value()));
+    DLCUDA_RETURN_IF_ERROR(
+        launcher(ctx, grad_output, cached_tensor, stored_grad_input, blocks.value()));
   }
 
-  *grad_input = backward_output_;
+  *grad_input = *stored_grad_input;
   return Status::Ok();
+}
+
+} // namespace
+
+Status ReLU::Forward(RuntimeContext &ctx, const Tensor &input, Tensor *output) {
+  return RunUnaryForward(ctx, input, output, &cached_input_, &forward_output_, "ReLU",
+                         static_cast<UnaryForwardLauncher>(LaunchReLUForwardKernel));
+}
+
+Status ReLU::Backward(RuntimeContext &ctx, const Tensor &grad_output, Tensor *grad_input) {
+  return RunUnaryBackward(ctx, grad_output, grad_input, cached_input_, &backward_output_, "ReLU",
+                          "cached_input",
+                          static_cast<UnaryBackwardLauncher>(LaunchReLUBackwardKernel));
 }
 
 void ReLU::AppendParameters(const std::string &prefix, std::vector<ParameterRef> *out) {
@@ -56,51 +81,14 @@ void ReLU::AppendParameters(const std::string &prefix, std::vector<ParameterRef>
 }
 
 Status GELU::Forward(RuntimeContext &ctx, const Tensor &input, Tensor *output) {
-  if (output == nullptr) {
-    return Status::InvalidArgument("GELU::Forward output is null");
-  }
-  DLCUDA_RETURN_IF_ERROR(ValidateFloatingTensor(input, "GELU input"));
-
-  DLCUDA_RETURN_IF_ERROR(
-      EnsureTensorAsync(&forward_output_, input.shape(), input.dtype(), ctx.stream()));
-  cached_input_ = input;
-
-  auto blocks = detail::BlocksForElements(input.numel(), kCudaThreads);
-  if (!blocks.ok()) {
-    return blocks.status();
-  }
-  if (blocks.value() > 0) {
-    DLCUDA_RETURN_IF_ERROR(LaunchGELUForwardKernel(ctx, input, &forward_output_, blocks.value()));
-  }
-
-  *output = forward_output_;
-  return Status::Ok();
+  return RunUnaryForward(ctx, input, output, &cached_input_, &forward_output_, "GELU",
+                         static_cast<UnaryForwardLauncher>(LaunchGELUForwardKernel));
 }
 
 Status GELU::Backward(RuntimeContext &ctx, const Tensor &grad_output, Tensor *grad_input) {
-  DLCUDA_RETURN_IF_ERROR(ValidateFloatingTensor(grad_output, "GELU grad_output"));
-  if (!cached_input_.defined()) {
-    return Status::RuntimeError("GELU backward called before forward");
-  }
-  DLCUDA_RETURN_IF_ERROR(
-      EnsureSameShapeAndType(grad_output, cached_input_, "grad_output", "cached_input"));
-  if (grad_input == nullptr) {
-    return Status::Ok();
-  }
-
-  DLCUDA_RETURN_IF_ERROR(
-      EnsureTensorAsync(&backward_output_, grad_output.shape(), grad_output.dtype(), ctx.stream()));
-  auto blocks = detail::BlocksForElements(grad_output.numel(), kCudaThreads);
-  if (!blocks.ok()) {
-    return blocks.status();
-  }
-  if (blocks.value() > 0) {
-    DLCUDA_RETURN_IF_ERROR(LaunchGELUBackwardKernel(ctx, grad_output, cached_input_,
-                                                    &backward_output_, blocks.value()));
-  }
-
-  *grad_input = backward_output_;
-  return Status::Ok();
+  return RunUnaryBackward(ctx, grad_output, grad_input, cached_input_, &backward_output_, "GELU",
+                          "cached_input",
+                          static_cast<UnaryBackwardLauncher>(LaunchGELUBackwardKernel));
 }
 
 void GELU::AppendParameters(const std::string &prefix, std::vector<ParameterRef> *out) {
@@ -109,50 +97,14 @@ void GELU::AppendParameters(const std::string &prefix, std::vector<ParameterRef>
 }
 
 Status Sigmoid::Forward(RuntimeContext &ctx, const Tensor &input, Tensor *output) {
-  if (output == nullptr) {
-    return Status::InvalidArgument("Sigmoid::Forward output is null");
-  }
-  DLCUDA_RETURN_IF_ERROR(ValidateFloatingTensor(input, "Sigmoid input"));
-
-  DLCUDA_RETURN_IF_ERROR(
-      EnsureTensorAsync(&cached_output_, input.shape(), input.dtype(), ctx.stream()));
-
-  auto blocks = detail::BlocksForElements(input.numel(), kCudaThreads);
-  if (!blocks.ok()) {
-    return blocks.status();
-  }
-  if (blocks.value() > 0) {
-    DLCUDA_RETURN_IF_ERROR(LaunchSigmoidForwardKernel(ctx, input, &cached_output_, blocks.value()));
-  }
-
-  *output = cached_output_;
-  return Status::Ok();
+  return RunUnaryForward(ctx, input, output, nullptr, &cached_output_, "Sigmoid",
+                         static_cast<UnaryForwardLauncher>(LaunchSigmoidForwardKernel));
 }
 
 Status Sigmoid::Backward(RuntimeContext &ctx, const Tensor &grad_output, Tensor *grad_input) {
-  DLCUDA_RETURN_IF_ERROR(ValidateFloatingTensor(grad_output, "Sigmoid grad_output"));
-  if (!cached_output_.defined()) {
-    return Status::RuntimeError("Sigmoid backward called before forward");
-  }
-  DLCUDA_RETURN_IF_ERROR(
-      EnsureSameShapeAndType(grad_output, cached_output_, "grad_output", "cached_output"));
-  if (grad_input == nullptr) {
-    return Status::Ok();
-  }
-
-  DLCUDA_RETURN_IF_ERROR(
-      EnsureTensorAsync(&backward_output_, grad_output.shape(), grad_output.dtype(), ctx.stream()));
-  auto blocks = detail::BlocksForElements(grad_output.numel(), kCudaThreads);
-  if (!blocks.ok()) {
-    return blocks.status();
-  }
-  if (blocks.value() > 0) {
-    DLCUDA_RETURN_IF_ERROR(LaunchSigmoidBackwardKernel(ctx, grad_output, cached_output_,
-                                                       &backward_output_, blocks.value()));
-  }
-
-  *grad_input = backward_output_;
-  return Status::Ok();
+  return RunUnaryBackward(ctx, grad_output, grad_input, cached_output_, &backward_output_,
+                          "Sigmoid", "cached_output",
+                          static_cast<UnaryBackwardLauncher>(LaunchSigmoidBackwardKernel));
 }
 
 void Sigmoid::AppendParameters(const std::string &prefix, std::vector<ParameterRef> *out) {

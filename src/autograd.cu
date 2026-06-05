@@ -12,6 +12,8 @@
 #include <limits>
 #include <sstream>
 #include <string>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -26,6 +28,13 @@ struct BroadcastGradientDescriptor {
   int rank = 0;
   int64_t input_strides[kMaxBroadcastRank] = {};
   int64_t output_strides[kMaxBroadcastRank] = {};
+};
+
+enum class ElementwiseGradientKind {
+  kScale = 0,
+  kProduct = 1,
+  kQuotient = 2,
+  kDivideRhs = 3,
 };
 
 Status ValidateFloat32Tensor(const Tensor &tensor, const char *name) {
@@ -82,15 +91,37 @@ __global__ void FillFloatKernel(float *output, float value, int64_t total) {
   }
 }
 
-__global__ void NegateFloatKernel(const float *input, float *output, int64_t total) {
+__device__ float ElementwiseGradientContribution(ElementwiseGradientKind kind,
+                                                 const float *output_grad, const float *lhs,
+                                                 const float *rhs, float scale, int64_t idx) {
+  float dy = output_grad[idx];
+  switch (kind) {
+  case ElementwiseGradientKind::kScale:
+    return dy * scale;
+  case ElementwiseGradientKind::kProduct:
+    return dy * rhs[idx];
+  case ElementwiseGradientKind::kQuotient:
+    return dy / rhs[idx];
+  case ElementwiseGradientKind::kDivideRhs: {
+    float divisor = rhs[idx];
+    return -dy * lhs[idx] / (divisor * divisor);
+  }
+  }
+  return 0.0f;
+}
+
+__global__ void StoreOrAccumulateElementwiseGradientFloatKernel(
+    const float *existing, const float *output_grad, const float *lhs, const float *rhs,
+    float *output, ElementwiseGradientKind kind, float scale, int64_t total) {
   int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (idx < total) {
-    output[idx] = -input[idx];
+    float contribution = ElementwiseGradientContribution(kind, output_grad, lhs, rhs, scale, idx);
+    output[idx] = existing == nullptr ? contribution : existing[idx] + contribution;
   }
 }
 
 __global__ void BroadcastReduceGradientFloatKernel(const float *output_grad, float *input_grad,
-                                                   BroadcastGradientDescriptor desc,
+                                                   BroadcastGradientDescriptor desc, float scale,
                                                    int64_t total) {
   int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
   if (idx >= total) {
@@ -106,7 +137,7 @@ __global__ void BroadcastReduceGradientFloatKernel(const float *output_grad, flo
     input_offset += coord * desc.input_strides[axis];
   }
 
-  atomicAdd(input_grad + input_offset, output_grad[idx]);
+  atomicAdd(input_grad + input_offset, scale * output_grad[idx]);
 }
 
 __global__ void ReduceSumBackwardFloatKernel(const float *output_grad, float *input_grad,
@@ -181,6 +212,38 @@ __global__ void MatMulBackwardRightFloatKernel(const float *lhs, const float *ou
   rhs_grad[row * cols + col] = sum;
 }
 
+Status MatMulBackwardLeftCublasFloat(RuntimeContext &ctx, const Tensor &output_grad,
+                                     const Tensor &rhs, Tensor *lhs_grad, int rows, int inner,
+                                     int cols) {
+  if (cols == 0) {
+    return lhs_grad->FillZero(ctx.stream());
+  }
+  DLCUDA_RETURN_IF_ERROR(ctx.EnsureCublas());
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  return detail::CublasStatus(cublasSgemm(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N, inner,
+                                          rows, cols, &alpha, rhs.data_as<float>(), cols,
+                                          output_grad.data_as<float>(), cols, &beta,
+                                          lhs_grad->data_as<float>(), inner),
+                              "MatMul backward-left cublasSgemm");
+}
+
+Status MatMulBackwardRightCublasFloat(RuntimeContext &ctx, const Tensor &lhs,
+                                      const Tensor &output_grad, Tensor *rhs_grad, int rows,
+                                      int inner, int cols) {
+  if (rows == 0) {
+    return rhs_grad->FillZero(ctx.stream());
+  }
+  DLCUDA_RETURN_IF_ERROR(ctx.EnsureCublas());
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  return detail::CublasStatus(cublasSgemm(ctx.cublas_handle(), CUBLAS_OP_N, CUBLAS_OP_T, cols,
+                                          inner, rows, &alpha, output_grad.data_as<float>(), cols,
+                                          lhs.data_as<float>(), inner, &beta,
+                                          rhs_grad->data_as<float>(), cols),
+                              "MatMul backward-right cublasSgemm");
+}
+
 Status LaunchFillFloat(RuntimeContext &ctx, Tensor *output, float value) {
   DLCUDA_RETURN_IF_ERROR(ValidateFloat32Tensor(*output, "FillFloat output"));
   auto blocks = detail::BlocksForElements(output->numel(), kAutogradThreads);
@@ -206,35 +269,148 @@ Result<Tensor> TensorOnesLikeFloat(RuntimeContext &ctx, const Tensor &input) {
   return result;
 }
 
-Status TensorNegateFloat(RuntimeContext &ctx, const Tensor &input, Tensor *output) {
+Status LaunchStoreOrAccumulateElementwiseGradientFloat(RuntimeContext &ctx, const Tensor *existing,
+                                                       const Tensor &output_grad, const Tensor *lhs,
+                                                       const Tensor *rhs, Tensor *output,
+                                                       ElementwiseGradientKind kind, float scale) {
   if (output == nullptr) {
-    return Status::InvalidArgument("TensorNegateFloat output is null");
+    return Status::InvalidArgument("Elementwise gradient output is null");
   }
-  DLCUDA_RETURN_IF_ERROR(ValidateFloat32Tensor(input, "TensorNegateFloat input"));
-  DLCUDA_RETURN_IF_ERROR(EnsureTensorAsync(output, input.shape(), DType::kFloat32, ctx.stream()));
-  auto blocks = detail::BlocksForElements(input.numel(), kAutogradThreads);
+  auto blocks = detail::BlocksForElements(output_grad.numel(), kAutogradThreads);
   if (!blocks.ok()) {
     return blocks.status();
   }
   if (blocks.value() > 0) {
-    NegateFloatKernel<<<blocks.value(), kAutogradThreads, 0, ctx.stream()>>>(
-        input.data_as<float>(), output->data_as<float>(), input.numel());
-    DLCUDA_RETURN_IF_ERROR(detail::CheckKernelLaunch("TensorNegateFloat kernel"));
+    StoreOrAccumulateElementwiseGradientFloatKernel<<<blocks.value(), kAutogradThreads, 0,
+                                                      ctx.stream()>>>(
+        existing == nullptr ? nullptr : existing->data_as<float>(), output_grad.data_as<float>(),
+        lhs == nullptr ? nullptr : lhs->data_as<float>(),
+        rhs == nullptr ? nullptr : rhs->data_as<float>(), output->data_as<float>(), kind, scale,
+        output_grad.numel());
+    DLCUDA_RETURN_IF_ERROR(detail::CheckKernelLaunch("Elementwise gradient accumulation kernel"));
   }
   return Status::Ok();
 }
 
+bool GradientStorageIsUniquelyOwned(const std::unordered_map<int64_t, Tensor> &gradients,
+                                    int64_t id, const Tensor &gradient) {
+  if (!gradient.defined() || gradient.numel() == 0 || gradient.data() == nullptr) {
+    return false;
+  }
+  void *data = gradient.data();
+  for (const auto &entry : gradients) {
+    if (entry.first != id && entry.second.defined() && entry.second.data() == data) {
+      return false;
+    }
+  }
+  return true;
+}
+
+Status ValidateElementwiseContributionInputs(const Tensor &output_grad, const Tensor *lhs,
+                                             const Tensor *rhs,
+                                             const std::vector<int64_t> &input_shape,
+                                             ElementwiseGradientKind kind) {
+  DLCUDA_RETURN_IF_ERROR(ValidateFloat32Tensor(output_grad, "Elementwise output gradient"));
+  if (output_grad.shape() != input_shape) {
+    return Status::InvalidArgument("Elementwise gradient requires same-shape output gradient");
+  }
+  if (lhs != nullptr) {
+    DLCUDA_RETURN_IF_ERROR(ValidateFloat32Tensor(*lhs, "Elementwise gradient lhs"));
+    if (lhs->shape() != input_shape) {
+      return Status::InvalidArgument("Elementwise gradient lhs shape mismatch");
+    }
+  }
+  if (rhs != nullptr) {
+    DLCUDA_RETURN_IF_ERROR(ValidateFloat32Tensor(*rhs, "Elementwise gradient rhs"));
+    if (rhs->shape() != input_shape) {
+      return Status::InvalidArgument("Elementwise gradient rhs shape mismatch");
+    }
+  }
+  if ((kind == ElementwiseGradientKind::kProduct || kind == ElementwiseGradientKind::kQuotient) &&
+      rhs == nullptr) {
+    return Status::InvalidArgument("Elementwise gradient requires rhs");
+  }
+  if (kind == ElementwiseGradientKind::kDivideRhs && (lhs == nullptr || rhs == nullptr)) {
+    return Status::InvalidArgument("Divide rhs gradient requires lhs and rhs");
+  }
+  return Status::Ok();
+}
+
+Status AccumulateElementwiseContribution(RuntimeContext &ctx, int64_t id, const Tensor &output_grad,
+                                         const Tensor *lhs, const Tensor *rhs,
+                                         const std::vector<int64_t> &input_shape,
+                                         ElementwiseGradientKind kind, float scale,
+                                         std::unordered_map<int64_t, Tensor> *gradients,
+                                         std::unordered_set<int64_t> *owned_gradient_ids) {
+  if (gradients == nullptr || owned_gradient_ids == nullptr) {
+    return Status::InvalidArgument("Gradient map is null");
+  }
+  DLCUDA_RETURN_IF_ERROR(
+      ValidateElementwiseContributionInputs(output_grad, lhs, rhs, input_shape, kind));
+
+  auto it = gradients->find(id);
+  if (it == gradients->end()) {
+    auto allocated = Tensor::AllocateAsync(input_shape, DType::kFloat32, ctx.stream());
+    if (!allocated.ok()) {
+      return allocated.status();
+    }
+    Tensor contribution = allocated.value();
+    DLCUDA_RETURN_IF_ERROR(LaunchStoreOrAccumulateElementwiseGradientFloat(
+        ctx, nullptr, output_grad, lhs, rhs, &contribution, kind, scale));
+    gradients->insert_or_assign(id, contribution);
+    owned_gradient_ids->insert(id);
+    return Status::Ok();
+  }
+
+  if (it->second.shape() != input_shape) {
+    return Status::RuntimeError("Gradient accumulation shape mismatch for tensor id " +
+                                std::to_string(id));
+  }
+  if (it->second.dtype() != DType::kFloat32) {
+    return Status::RuntimeError("Gradient accumulation dtype mismatch for tensor id " +
+                                std::to_string(id));
+  }
+  if (output_grad.numel() == 0) {
+    return Status::Ok();
+  }
+
+  bool use_in_place = owned_gradient_ids->find(id) != owned_gradient_ids->end() &&
+                      GradientStorageIsUniquelyOwned(*gradients, id, it->second);
+  if (use_in_place) {
+    return LaunchStoreOrAccumulateElementwiseGradientFloat(ctx, &it->second, output_grad, lhs, rhs,
+                                                           &it->second, kind, scale);
+  }
+
+  auto allocated = Tensor::AllocateAsync(input_shape, DType::kFloat32, ctx.stream());
+  if (!allocated.ok()) {
+    return allocated.status();
+  }
+  Tensor accumulated = allocated.value();
+  DLCUDA_RETURN_IF_ERROR(LaunchStoreOrAccumulateElementwiseGradientFloat(
+      ctx, &it->second, output_grad, lhs, rhs, &accumulated, kind, scale));
+  it->second = accumulated;
+  owned_gradient_ids->insert(id);
+  return Status::Ok();
+}
+
 Status MaybeReduceBroadcastGradient(RuntimeContext &ctx, const Tensor &output_grad,
-                                    const std::vector<int64_t> &input_shape, Tensor *input_grad) {
+                                    const std::vector<int64_t> &input_shape, Tensor *input_grad,
+                                    float scale) {
   if (input_grad == nullptr) {
     return Status::InvalidArgument("MaybeReduceBroadcastGradient output is null");
   }
   DLCUDA_RETURN_IF_ERROR(ValidateFloat32Tensor(output_grad, "Broadcast output gradient"));
   if (output_grad.shape() == input_shape) {
-    *input_grad = output_grad;
-    return Status::Ok();
+    if (scale == 1.0f) {
+      *input_grad = output_grad;
+      return Status::Ok();
+    }
+    DLCUDA_RETURN_IF_ERROR(
+        EnsureTensorAsync(input_grad, input_shape, DType::kFloat32, ctx.stream()));
+    return LaunchStoreOrAccumulateElementwiseGradientFloat(ctx, nullptr, output_grad, nullptr,
+                                                           nullptr, input_grad,
+                                                           ElementwiseGradientKind::kScale, scale);
   }
-
   auto descriptor =
       BuildBroadcastGradientDescriptor(input_shape, output_grad.shape(), "BroadcastGradient");
   if (!descriptor.ok()) {
@@ -250,7 +426,7 @@ Status MaybeReduceBroadcastGradient(RuntimeContext &ctx, const Tensor &output_gr
   }
   if (blocks.value() > 0) {
     BroadcastReduceGradientFloatKernel<<<blocks.value(), kAutogradThreads, 0, ctx.stream()>>>(
-        output_grad.data_as<float>(), input_grad->data_as<float>(), descriptor.value(),
+        output_grad.data_as<float>(), input_grad->data_as<float>(), descriptor.value(), scale,
         output_grad.numel());
     DLCUDA_RETURN_IF_ERROR(detail::CheckKernelLaunch("BroadcastReduceGradient kernel"));
   }
@@ -396,6 +572,13 @@ Status TensorMatMulBackwardLeftFloat(RuntimeContext &ctx, const Tensor &output_g
   if (!inner_int.ok()) {
     return inner_int.status();
   }
+  if (ctx.use_cublas()) {
+    auto cols_int = detail::CheckedInt(cols, "MatMul backward cols");
+    if (cols_int.ok()) {
+      return MatMulBackwardLeftCublasFloat(ctx, output_grad, rhs, lhs_grad, rows_int.value(),
+                                           inner_int.value(), cols_int.value());
+    }
+  }
   dim3 block(kMatMulTile, kMatMulTile);
   dim3 grid((inner_int.value() + kMatMulTile - 1) / kMatMulTile,
             (rows_int.value() + kMatMulTile - 1) / kMatMulTile);
@@ -435,6 +618,13 @@ Status TensorMatMulBackwardRightFloat(RuntimeContext &ctx, const Tensor &lhs,
   if (!cols_int.ok()) {
     return cols_int.status();
   }
+  if (ctx.use_cublas()) {
+    auto rows_int = detail::CheckedInt(rows, "MatMul backward rows");
+    if (rows_int.ok()) {
+      return MatMulBackwardRightCublasFloat(ctx, lhs, output_grad, rhs_grad, rows_int.value(),
+                                            inner_int.value(), cols_int.value());
+    }
+  }
   dim3 block(kMatMulTile, kMatMulTile);
   dim3 grid((cols_int.value() + kMatMulTile - 1) / kMatMulTile,
             (inner_int.value() + kMatMulTile - 1) / kMatMulTile);
@@ -442,6 +632,46 @@ Status TensorMatMulBackwardRightFloat(RuntimeContext &ctx, const Tensor &lhs,
       lhs.data_as<float>(), output_grad.data_as<float>(), rhs_grad->data_as<float>(), rows, inner,
       cols);
   return detail::CheckKernelLaunch("MatMul backward-right kernel");
+}
+
+struct BinaryAutogradContext {
+  bool requires_grad = false;
+  int64_t lhs_id = -1;
+  int64_t rhs_id = -1;
+  bool lhs_requires_grad = false;
+  bool rhs_requires_grad = false;
+  Tensor lhs_value;
+  Tensor rhs_value;
+  std::vector<int64_t> lhs_shape;
+  std::vector<int64_t> rhs_shape;
+};
+
+Result<BinaryAutogradContext> PrepareBinaryAutogradContext(const AutoTensor &lhs,
+                                                           const AutoTensor &rhs,
+                                                           const char *op_name,
+                                                           bool capture_values) {
+  BinaryAutogradContext context;
+  context.requires_grad = lhs.requires_grad() || rhs.requires_grad();
+  if (!context.requires_grad) {
+    return context;
+  }
+
+  std::string lhs_name = std::string(op_name) + " lhs";
+  std::string rhs_name = std::string(op_name) + " rhs";
+  DLCUDA_RETURN_IF_ERROR(ValidateFloat32Tensor(lhs.value(), lhs_name.c_str()));
+  DLCUDA_RETURN_IF_ERROR(ValidateFloat32Tensor(rhs.value(), rhs_name.c_str()));
+
+  context.lhs_id = lhs.id();
+  context.rhs_id = rhs.id();
+  context.lhs_requires_grad = lhs.requires_grad();
+  context.rhs_requires_grad = rhs.requires_grad();
+  context.lhs_shape = lhs.value().shape();
+  context.rhs_shape = rhs.value().shape();
+  if (capture_values) {
+    context.lhs_value = lhs.value();
+    context.rhs_value = rhs.value();
+  }
+  return context;
 }
 
 bool AnyRequiresGrad(const std::vector<AutoTensor> &inputs) {
@@ -498,34 +728,23 @@ Result<AutoTensor> GradientTape::Add(RuntimeContext &ctx, const AutoTensor &lhs,
 
   Tensor output;
   DLCUDA_RETURN_IF_ERROR(TensorAdd(ctx, lhs.value_, rhs.value_, &output));
-  bool requires_grad = lhs.requires_grad_ || rhs.requires_grad_;
-  if (requires_grad) {
-    DLCUDA_RETURN_IF_ERROR(ValidateFloat32Tensor(lhs.value_, "Add lhs"));
-    DLCUDA_RETURN_IF_ERROR(ValidateFloat32Tensor(rhs.value_, "Add rhs"));
+  auto autograd_context = PrepareBinaryAutogradContext(lhs, rhs, "Add", false);
+  if (!autograd_context.ok()) {
+    return autograd_context.status();
   }
+  BinaryAutogradContext binary = autograd_context.value();
 
-  AutoTensor result = CreateTensor(output, requires_grad);
-  if (requires_grad) {
-    int64_t lhs_id = lhs.id_;
-    int64_t rhs_id = rhs.id_;
-    bool lhs_requires_grad = lhs.requires_grad_;
-    bool rhs_requires_grad = rhs.requires_grad_;
-    std::vector<int64_t> lhs_shape = lhs.value_.shape();
-    std::vector<int64_t> rhs_shape = rhs.value_.shape();
+  AutoTensor result = CreateTensor(output, binary.requires_grad);
+  if (binary.requires_grad) {
     RecordNode(Node{result.id_, "add",
-                    [lhs_id, rhs_id, lhs_requires_grad, rhs_requires_grad, lhs_shape, rhs_shape](
-                        RuntimeContext &ctx, GradientTape &tape, const Tensor &output_grad) {
-                      if (lhs_requires_grad) {
-                        Tensor lhs_grad;
-                        DLCUDA_RETURN_IF_ERROR(
-                            MaybeReduceBroadcastGradient(ctx, output_grad, lhs_shape, &lhs_grad));
-                        DLCUDA_RETURN_IF_ERROR(tape.AccumulateGradient(ctx, lhs_id, lhs_grad));
+                    [binary](RuntimeContext &ctx, GradientTape &tape, const Tensor &output_grad) {
+                      if (binary.lhs_requires_grad) {
+                        DLCUDA_RETURN_IF_ERROR(tape.AccumulateReducedGradient(
+                            ctx, binary.lhs_id, output_grad, binary.lhs_shape));
                       }
-                      if (rhs_requires_grad) {
-                        Tensor rhs_grad;
-                        DLCUDA_RETURN_IF_ERROR(
-                            MaybeReduceBroadcastGradient(ctx, output_grad, rhs_shape, &rhs_grad));
-                        DLCUDA_RETURN_IF_ERROR(tape.AccumulateGradient(ctx, rhs_id, rhs_grad));
+                      if (binary.rhs_requires_grad) {
+                        DLCUDA_RETURN_IF_ERROR(tape.AccumulateReducedGradient(
+                            ctx, binary.rhs_id, output_grad, binary.rhs_shape));
                       }
                       return Status::Ok();
                     }});
@@ -540,36 +759,23 @@ Result<AutoTensor> GradientTape::Subtract(RuntimeContext &ctx, const AutoTensor 
 
   Tensor output;
   DLCUDA_RETURN_IF_ERROR(TensorSubtract(ctx, lhs.value_, rhs.value_, &output));
-  bool requires_grad = lhs.requires_grad_ || rhs.requires_grad_;
-  if (requires_grad) {
-    DLCUDA_RETURN_IF_ERROR(ValidateFloat32Tensor(lhs.value_, "Subtract lhs"));
-    DLCUDA_RETURN_IF_ERROR(ValidateFloat32Tensor(rhs.value_, "Subtract rhs"));
+  auto autograd_context = PrepareBinaryAutogradContext(lhs, rhs, "Subtract", false);
+  if (!autograd_context.ok()) {
+    return autograd_context.status();
   }
+  BinaryAutogradContext binary = autograd_context.value();
 
-  AutoTensor result = CreateTensor(output, requires_grad);
-  if (requires_grad) {
-    int64_t lhs_id = lhs.id_;
-    int64_t rhs_id = rhs.id_;
-    bool lhs_requires_grad = lhs.requires_grad_;
-    bool rhs_requires_grad = rhs.requires_grad_;
-    std::vector<int64_t> lhs_shape = lhs.value_.shape();
-    std::vector<int64_t> rhs_shape = rhs.value_.shape();
+  AutoTensor result = CreateTensor(output, binary.requires_grad);
+  if (binary.requires_grad) {
     RecordNode(Node{result.id_, "subtract",
-                    [lhs_id, rhs_id, lhs_requires_grad, rhs_requires_grad, lhs_shape, rhs_shape](
-                        RuntimeContext &ctx, GradientTape &tape, const Tensor &output_grad) {
-                      if (lhs_requires_grad) {
-                        Tensor lhs_grad;
-                        DLCUDA_RETURN_IF_ERROR(
-                            MaybeReduceBroadcastGradient(ctx, output_grad, lhs_shape, &lhs_grad));
-                        DLCUDA_RETURN_IF_ERROR(tape.AccumulateGradient(ctx, lhs_id, lhs_grad));
+                    [binary](RuntimeContext &ctx, GradientTape &tape, const Tensor &output_grad) {
+                      if (binary.lhs_requires_grad) {
+                        DLCUDA_RETURN_IF_ERROR(tape.AccumulateReducedGradient(
+                            ctx, binary.lhs_id, output_grad, binary.lhs_shape));
                       }
-                      if (rhs_requires_grad) {
-                        Tensor neg_grad;
-                        DLCUDA_RETURN_IF_ERROR(TensorNegateFloat(ctx, output_grad, &neg_grad));
-                        Tensor rhs_grad;
-                        DLCUDA_RETURN_IF_ERROR(
-                            MaybeReduceBroadcastGradient(ctx, neg_grad, rhs_shape, &rhs_grad));
-                        DLCUDA_RETURN_IF_ERROR(tape.AccumulateGradient(ctx, rhs_id, rhs_grad));
+                      if (binary.rhs_requires_grad) {
+                        DLCUDA_RETURN_IF_ERROR(tape.AccumulateReducedGradient(
+                            ctx, binary.rhs_id, output_grad, binary.rhs_shape, -1.0f));
                       }
                       return Status::Ok();
                     }});
@@ -584,44 +790,26 @@ Result<AutoTensor> GradientTape::Multiply(RuntimeContext &ctx, const AutoTensor 
 
   Tensor output;
   DLCUDA_RETURN_IF_ERROR(TensorMultiply(ctx, lhs.value_, rhs.value_, &output));
-  bool requires_grad = lhs.requires_grad_ || rhs.requires_grad_;
-  if (requires_grad) {
-    DLCUDA_RETURN_IF_ERROR(ValidateFloat32Tensor(lhs.value_, "Multiply lhs"));
-    DLCUDA_RETURN_IF_ERROR(ValidateFloat32Tensor(rhs.value_, "Multiply rhs"));
+  auto autograd_context = PrepareBinaryAutogradContext(lhs, rhs, "Multiply", true);
+  if (!autograd_context.ok()) {
+    return autograd_context.status();
   }
+  BinaryAutogradContext binary = autograd_context.value();
 
-  AutoTensor result = CreateTensor(output, requires_grad);
-  if (requires_grad) {
-    int64_t lhs_id = lhs.id_;
-    int64_t rhs_id = rhs.id_;
-    bool lhs_requires_grad = lhs.requires_grad_;
-    bool rhs_requires_grad = rhs.requires_grad_;
-    Tensor lhs_value = lhs.value_;
-    Tensor rhs_value = rhs.value_;
-    std::vector<int64_t> lhs_shape = lhs.value_.shape();
-    std::vector<int64_t> rhs_shape = rhs.value_.shape();
-    RecordNode(Node{
-        result.id_, "multiply",
-        [lhs_id, rhs_id, lhs_requires_grad, rhs_requires_grad, lhs_value, rhs_value, lhs_shape,
-         rhs_shape](RuntimeContext &ctx, GradientTape &tape, const Tensor &output_grad) {
-          if (lhs_requires_grad) {
-            Tensor lhs_contribution;
-            DLCUDA_RETURN_IF_ERROR(TensorMultiply(ctx, output_grad, rhs_value, &lhs_contribution));
-            Tensor lhs_grad;
-            DLCUDA_RETURN_IF_ERROR(
-                MaybeReduceBroadcastGradient(ctx, lhs_contribution, lhs_shape, &lhs_grad));
-            DLCUDA_RETURN_IF_ERROR(tape.AccumulateGradient(ctx, lhs_id, lhs_grad));
-          }
-          if (rhs_requires_grad) {
-            Tensor rhs_contribution;
-            DLCUDA_RETURN_IF_ERROR(TensorMultiply(ctx, output_grad, lhs_value, &rhs_contribution));
-            Tensor rhs_grad;
-            DLCUDA_RETURN_IF_ERROR(
-                MaybeReduceBroadcastGradient(ctx, rhs_contribution, rhs_shape, &rhs_grad));
-            DLCUDA_RETURN_IF_ERROR(tape.AccumulateGradient(ctx, rhs_id, rhs_grad));
-          }
-          return Status::Ok();
-        }});
+  AutoTensor result = CreateTensor(output, binary.requires_grad);
+  if (binary.requires_grad) {
+    RecordNode(Node{result.id_, "multiply",
+                    [binary](RuntimeContext &ctx, GradientTape &tape, const Tensor &output_grad) {
+                      if (binary.lhs_requires_grad) {
+                        DLCUDA_RETURN_IF_ERROR(tape.AccumulateProductGradient(
+                            ctx, binary.lhs_id, output_grad, binary.rhs_value, binary.lhs_shape));
+                      }
+                      if (binary.rhs_requires_grad) {
+                        DLCUDA_RETURN_IF_ERROR(tape.AccumulateProductGradient(
+                            ctx, binary.rhs_id, output_grad, binary.lhs_value, binary.rhs_shape));
+                      }
+                      return Status::Ok();
+                    }});
   }
   return result;
 }
@@ -633,50 +821,27 @@ Result<AutoTensor> GradientTape::Divide(RuntimeContext &ctx, const AutoTensor &l
 
   Tensor output;
   DLCUDA_RETURN_IF_ERROR(TensorDivide(ctx, lhs.value_, rhs.value_, &output));
-  bool requires_grad = lhs.requires_grad_ || rhs.requires_grad_;
-  if (requires_grad) {
-    DLCUDA_RETURN_IF_ERROR(ValidateFloat32Tensor(lhs.value_, "Divide lhs"));
-    DLCUDA_RETURN_IF_ERROR(ValidateFloat32Tensor(rhs.value_, "Divide rhs"));
+  auto autograd_context = PrepareBinaryAutogradContext(lhs, rhs, "Divide", true);
+  if (!autograd_context.ok()) {
+    return autograd_context.status();
   }
+  BinaryAutogradContext binary = autograd_context.value();
 
-  AutoTensor result = CreateTensor(output, requires_grad);
-  if (requires_grad) {
-    int64_t lhs_id = lhs.id_;
-    int64_t rhs_id = rhs.id_;
-    bool lhs_requires_grad = lhs.requires_grad_;
-    bool rhs_requires_grad = rhs.requires_grad_;
-    Tensor lhs_value = lhs.value_;
-    Tensor rhs_value = rhs.value_;
-    std::vector<int64_t> lhs_shape = lhs.value_.shape();
-    std::vector<int64_t> rhs_shape = rhs.value_.shape();
-    RecordNode(Node{
-        result.id_, "divide",
-        [lhs_id, rhs_id, lhs_requires_grad, rhs_requires_grad, lhs_value, rhs_value, lhs_shape,
-         rhs_shape](RuntimeContext &ctx, GradientTape &tape, const Tensor &output_grad) {
-          if (lhs_requires_grad) {
-            Tensor lhs_contribution;
-            DLCUDA_RETURN_IF_ERROR(TensorDivide(ctx, output_grad, rhs_value, &lhs_contribution));
-            Tensor lhs_grad;
-            DLCUDA_RETURN_IF_ERROR(
-                MaybeReduceBroadcastGradient(ctx, lhs_contribution, lhs_shape, &lhs_grad));
-            DLCUDA_RETURN_IF_ERROR(tape.AccumulateGradient(ctx, lhs_id, lhs_grad));
-          }
-          if (rhs_requires_grad) {
-            Tensor numerator;
-            DLCUDA_RETURN_IF_ERROR(TensorMultiply(ctx, output_grad, lhs_value, &numerator));
-            Tensor rhs_squared;
-            DLCUDA_RETURN_IF_ERROR(TensorMultiply(ctx, rhs_value, rhs_value, &rhs_squared));
-            Tensor quotient;
-            DLCUDA_RETURN_IF_ERROR(TensorDivide(ctx, numerator, rhs_squared, &quotient));
-            Tensor neg_quotient;
-            DLCUDA_RETURN_IF_ERROR(TensorNegateFloat(ctx, quotient, &neg_quotient));
-            Tensor rhs_grad;
-            DLCUDA_RETURN_IF_ERROR(
-                MaybeReduceBroadcastGradient(ctx, neg_quotient, rhs_shape, &rhs_grad));
-            DLCUDA_RETURN_IF_ERROR(tape.AccumulateGradient(ctx, rhs_id, rhs_grad));
-          }
-          return Status::Ok();
-        }});
+  AutoTensor result = CreateTensor(output, binary.requires_grad);
+  if (binary.requires_grad) {
+    RecordNode(Node{result.id_, "divide",
+                    [binary](RuntimeContext &ctx, GradientTape &tape, const Tensor &output_grad) {
+                      if (binary.lhs_requires_grad) {
+                        DLCUDA_RETURN_IF_ERROR(tape.AccumulateQuotientGradient(
+                            ctx, binary.lhs_id, output_grad, binary.rhs_value, binary.lhs_shape));
+                      }
+                      if (binary.rhs_requires_grad) {
+                        DLCUDA_RETURN_IF_ERROR(tape.AccumulateDivideRhsGradient(
+                            ctx, binary.rhs_id, output_grad, binary.lhs_value, binary.rhs_value,
+                            binary.rhs_shape));
+                      }
+                      return Status::Ok();
+                    }});
   }
   return result;
 }
@@ -688,37 +853,28 @@ Result<AutoTensor> GradientTape::MatMul(RuntimeContext &ctx, const AutoTensor &l
 
   Tensor output;
   DLCUDA_RETURN_IF_ERROR(TensorMatMul(ctx, lhs.value_, rhs.value_, &output));
-  bool requires_grad = lhs.requires_grad_ || rhs.requires_grad_;
-  if (requires_grad) {
-    DLCUDA_RETURN_IF_ERROR(ValidateFloat32Tensor(lhs.value_, "MatMul lhs"));
-    DLCUDA_RETURN_IF_ERROR(ValidateFloat32Tensor(rhs.value_, "MatMul rhs"));
+  auto autograd_context = PrepareBinaryAutogradContext(lhs, rhs, "MatMul", true);
+  if (!autograd_context.ok()) {
+    return autograd_context.status();
   }
+  BinaryAutogradContext binary = autograd_context.value();
 
-  AutoTensor result = CreateTensor(output, requires_grad);
-  if (requires_grad) {
-    int64_t lhs_id = lhs.id_;
-    int64_t rhs_id = rhs.id_;
-    bool lhs_requires_grad = lhs.requires_grad_;
-    bool rhs_requires_grad = rhs.requires_grad_;
-    Tensor lhs_value = lhs.value_;
-    Tensor rhs_value = rhs.value_;
-    std::vector<int64_t> lhs_shape = lhs.value_.shape();
-    std::vector<int64_t> rhs_shape = rhs.value_.shape();
+  AutoTensor result = CreateTensor(output, binary.requires_grad);
+  if (binary.requires_grad) {
     RecordNode(
         Node{result.id_, "matmul",
-             [lhs_id, rhs_id, lhs_requires_grad, rhs_requires_grad, lhs_value, rhs_value, lhs_shape,
-              rhs_shape](RuntimeContext &ctx, GradientTape &tape, const Tensor &output_grad) {
-               if (lhs_requires_grad) {
+             [binary](RuntimeContext &ctx, GradientTape &tape, const Tensor &output_grad) {
+               if (binary.lhs_requires_grad) {
                  Tensor lhs_grad;
-                 DLCUDA_RETURN_IF_ERROR(TensorMatMulBackwardLeftFloat(ctx, output_grad, rhs_value,
-                                                                      lhs_shape, &lhs_grad));
-                 DLCUDA_RETURN_IF_ERROR(tape.AccumulateGradient(ctx, lhs_id, lhs_grad));
+                 DLCUDA_RETURN_IF_ERROR(TensorMatMulBackwardLeftFloat(
+                     ctx, output_grad, binary.rhs_value, binary.lhs_shape, &lhs_grad));
+                 DLCUDA_RETURN_IF_ERROR(tape.AccumulateGradient(ctx, binary.lhs_id, lhs_grad));
                }
-               if (rhs_requires_grad) {
+               if (binary.rhs_requires_grad) {
                  Tensor rhs_grad;
-                 DLCUDA_RETURN_IF_ERROR(TensorMatMulBackwardRightFloat(ctx, lhs_value, output_grad,
-                                                                       rhs_shape, &rhs_grad));
-                 DLCUDA_RETURN_IF_ERROR(tape.AccumulateGradient(ctx, rhs_id, rhs_grad));
+                 DLCUDA_RETURN_IF_ERROR(TensorMatMulBackwardRightFloat(
+                     ctx, binary.lhs_value, output_grad, binary.rhs_shape, &rhs_grad));
+                 DLCUDA_RETURN_IF_ERROR(tape.AccumulateGradient(ctx, binary.rhs_id, rhs_grad));
                }
                return Status::Ok();
              }});
@@ -938,6 +1094,7 @@ Status GradientTape::Backward(RuntimeContext &ctx, const AutoTensor &target,
   }
 
   gradients_.clear();
+  owned_gradient_ids_.clear();
   gradients_.insert_or_assign(target.id_, initial_gradient);
 
   for (auto it = nodes_.rbegin(); it != nodes_.rend(); ++it) {
@@ -965,11 +1122,13 @@ Result<Tensor> GradientTape::Gradient(const AutoTensor &tensor) const {
 
 void GradientTape::ClearGradients() {
   gradients_.clear();
+  owned_gradient_ids_.clear();
 }
 
 void GradientTape::Reset() {
   nodes_.clear();
   gradients_.clear();
+  owned_gradient_ids_.clear();
 }
 
 AutoTensor GradientTape::CreateTensor(Tensor value, bool requires_grad) {
@@ -986,13 +1145,88 @@ Status GradientTape::ValidateTensor(const AutoTensor &tensor, const char *name) 
   return Status::Ok();
 }
 
-Status GradientTape::AccumulateGradient(RuntimeContext &ctx, int64_t id, const Tensor &grad) {
+Status GradientTape::AccumulateReducedGradient(RuntimeContext &ctx, int64_t id, const Tensor &grad,
+                                               const std::vector<int64_t> &input_shape,
+                                               float scale) {
   if (!grad.defined()) {
     return Status::Ok();
   }
+  if (grad.shape() == input_shape) {
+    return AccumulateGradient(ctx, id, grad, scale);
+  }
+  Tensor reduced_grad;
+  DLCUDA_RETURN_IF_ERROR(
+      MaybeReduceBroadcastGradient(ctx, grad, input_shape, &reduced_grad, scale));
+  bool had_gradient = gradients_.find(id) != gradients_.end();
+  DLCUDA_RETURN_IF_ERROR(AccumulateGradient(ctx, id, reduced_grad));
+  if (!had_gradient) {
+    owned_gradient_ids_.insert(id);
+  }
+  return Status::Ok();
+}
+
+Status GradientTape::AccumulateProductGradient(RuntimeContext &ctx, int64_t id,
+                                               const Tensor &output_grad, const Tensor &factor,
+                                               const std::vector<int64_t> &input_shape) {
+  if (output_grad.shape() == input_shape && factor.shape() == input_shape) {
+    return AccumulateElementwiseContribution(ctx, id, output_grad, nullptr, &factor, input_shape,
+                                             ElementwiseGradientKind::kProduct, 1.0f, &gradients_,
+                                             &owned_gradient_ids_);
+  }
+
+  Tensor contribution;
+  DLCUDA_RETURN_IF_ERROR(TensorMultiply(ctx, output_grad, factor, &contribution));
+  return AccumulateReducedGradient(ctx, id, contribution, input_shape);
+}
+
+Status GradientTape::AccumulateQuotientGradient(RuntimeContext &ctx, int64_t id,
+                                                const Tensor &output_grad, const Tensor &divisor,
+                                                const std::vector<int64_t> &input_shape) {
+  if (output_grad.shape() == input_shape && divisor.shape() == input_shape) {
+    return AccumulateElementwiseContribution(ctx, id, output_grad, nullptr, &divisor, input_shape,
+                                             ElementwiseGradientKind::kQuotient, 1.0f, &gradients_,
+                                             &owned_gradient_ids_);
+  }
+
+  Tensor contribution;
+  DLCUDA_RETURN_IF_ERROR(TensorDivide(ctx, output_grad, divisor, &contribution));
+  return AccumulateReducedGradient(ctx, id, contribution, input_shape);
+}
+
+Status GradientTape::AccumulateDivideRhsGradient(RuntimeContext &ctx, int64_t id,
+                                                 const Tensor &output_grad, const Tensor &lhs,
+                                                 const Tensor &rhs,
+                                                 const std::vector<int64_t> &rhs_shape) {
+  if (output_grad.shape() == rhs_shape && lhs.shape() == rhs_shape && rhs.shape() == rhs_shape) {
+    return AccumulateElementwiseContribution(ctx, id, output_grad, &lhs, &rhs, rhs_shape,
+                                             ElementwiseGradientKind::kDivideRhs, 1.0f, &gradients_,
+                                             &owned_gradient_ids_);
+  }
+
+  Tensor numerator;
+  DLCUDA_RETURN_IF_ERROR(TensorMultiply(ctx, output_grad, lhs, &numerator));
+  Tensor rhs_squared;
+  DLCUDA_RETURN_IF_ERROR(TensorMultiply(ctx, rhs, rhs, &rhs_squared));
+  Tensor quotient;
+  DLCUDA_RETURN_IF_ERROR(TensorDivide(ctx, numerator, rhs_squared, &quotient));
+  return AccumulateReducedGradient(ctx, id, quotient, rhs_shape, -1.0f);
+}
+
+Status GradientTape::AccumulateGradient(RuntimeContext &ctx, int64_t id, const Tensor &grad,
+                                        float scale) {
+  if (!grad.defined()) {
+    return Status::Ok();
+  }
+  DLCUDA_RETURN_IF_ERROR(ValidateFloat32Tensor(grad, "Gradient contribution"));
   auto it = gradients_.find(id);
   if (it == gradients_.end()) {
+    if (scale != 1.0f) {
+      return AccumulateElementwiseContribution(ctx, id, grad, nullptr, nullptr, grad.shape(),
+                                               ElementwiseGradientKind::kScale, scale, &gradients_,
+                                               &owned_gradient_ids_);
+    }
     gradients_.insert_or_assign(id, grad);
+    owned_gradient_ids_.erase(id);
     return Status::Ok();
   }
   if (it->second.shape() != grad.shape()) {
@@ -1003,11 +1237,13 @@ Status GradientTape::AccumulateGradient(RuntimeContext &ctx, int64_t id, const T
     return Status::RuntimeError("Gradient accumulation dtype mismatch for tensor id " +
                                 std::to_string(id));
   }
+  if (grad.numel() == 0) {
+    return Status::Ok();
+  }
 
-  Tensor accumulated;
-  DLCUDA_RETURN_IF_ERROR(TensorAdd(ctx, it->second, grad, &accumulated));
-  it->second = accumulated;
-  return Status::Ok();
+  return AccumulateElementwiseContribution(ctx, id, grad, nullptr, nullptr, grad.shape(),
+                                           ElementwiseGradientKind::kScale, scale, &gradients_,
+                                           &owned_gradient_ids_);
 }
 
 void GradientTape::RecordNode(Node node) {

@@ -76,9 +76,48 @@ Status ReadStateTensors(FILE *file, std::unordered_map<std::string, HostTensorRe
 Status RestoreStateTensors(RuntimeContext &ctx,
                            const std::unordered_map<std::string, HostTensorRecord> &records,
                            const std::vector<Optimizer::StateTensorRef> &states);
+Result<Tensor> ScratchTensorForBytes(RuntimeContext &ctx, const std::string &key, size_t bytes);
 Status EnsureStateMap(RuntimeContext &ctx, const std::vector<ParameterRef> &params,
                       std::unordered_map<const Tensor *, Tensor> *state);
 void ClearStateMap(std::unordered_map<const Tensor *, Tensor> *state);
 std::string StateName(const ParameterRef &param, const char *suffix);
+
+template <typename ParamCodec, typename Launcher>
+Status DispatchOptimizerGradDType(const ParameterRef &param, const char *op_name,
+                                  Launcher &&launcher) {
+  switch (param.grad->dtype()) {
+  case DType::kFloat32:
+    return std::forward<Launcher>(launcher).template operator()<ParamCodec, detail::Float32Codec>();
+  case DType::kFloat16:
+    return std::forward<Launcher>(launcher).template operator()<ParamCodec, detail::Float16Codec>();
+  case DType::kBFloat16:
+    return std::forward<Launcher>(launcher)
+        .template operator()<ParamCodec, detail::BFloat16Codec>();
+  case DType::kInt32:
+    break;
+  }
+  return Status::InvalidArgument(std::string(op_name) + " does not support grad dtype " +
+                                 std::string(DTypeName(param.grad->dtype())));
+}
+
+template <typename Launcher>
+Status DispatchOptimizerParamGradDTypes(const ParameterRef &param, const char *op_name,
+                                        Launcher &&launcher) {
+  switch (param.value->dtype()) {
+  case DType::kFloat32:
+    return DispatchOptimizerGradDType<detail::Float32Codec>(param, op_name,
+                                                            std::forward<Launcher>(launcher));
+  case DType::kFloat16:
+    return DispatchOptimizerGradDType<detail::Float16Codec>(param, op_name,
+                                                            std::forward<Launcher>(launcher));
+  case DType::kBFloat16:
+    return DispatchOptimizerGradDType<detail::BFloat16Codec>(param, op_name,
+                                                             std::forward<Launcher>(launcher));
+  case DType::kInt32:
+    break;
+  }
+  return Status::InvalidArgument(std::string(op_name) + " does not support parameter dtype " +
+                                 std::string(DTypeName(param.value->dtype())));
+}
 
 } // namespace dlcuda

@@ -1,6 +1,11 @@
 #include "detail/adam_kernels.cuh"
 
 namespace dlcuda {
+namespace {
+
+constexpr int kAdamMultiTensorMaxBlocksPerParam = 256;
+
+} // namespace
 
 AdamOptimizer::AdamOptimizer(float beta1, float beta2, float epsilon)
     : Optimizer(), beta1_(beta1), beta2_(beta2), epsilon_(epsilon) {}
@@ -45,6 +50,25 @@ Status AdamOptimizer::StepImpl(RuntimeContext &ctx,
   float inv_bias_correction1 = 1.0f / (1.0f - beta1_power);
   float inv_bias_correction2 = 1.0f / (1.0f - beta2_power);
 
+  if (params.size() == 1) {
+    const ParameterRef &param = *params.front().param;
+    Tensor &m = m_state_.at(param.value);
+    Tensor &v = v_state_.at(param.value);
+
+    auto blocks = detail::BlocksForElements(param.value->numel(), kOptimizerThreads);
+    if (!blocks.ok()) {
+      return blocks.status();
+    }
+    if (blocks.value() > 0) {
+      DLCUDA_RETURN_IF_ERROR(LaunchAdamUpdate(ctx, param, &m, &v, params.front().lr, beta1_, beta2_,
+                                              epsilon_, inv_bias_correction1, inv_bias_correction2,
+                                              params.front().weight_decay, decoupled_weight_decay_,
+                                              blocks.value()));
+    }
+    return Status::Ok();
+  }
+
+  std::vector<AdamUpdateBlock> update_blocks;
   for (const auto &resolved : params) {
     const ParameterRef &param = *resolved.param;
     Tensor &m = m_state_.at(param.value);
@@ -54,14 +78,42 @@ Status AdamOptimizer::StepImpl(RuntimeContext &ctx,
     if (!blocks.ok()) {
       return blocks.status();
     }
-    if (blocks.value() > 0) {
+    if (blocks.value() > kAdamMultiTensorMaxBlocksPerParam) {
       DLCUDA_RETURN_IF_ERROR(LaunchAdamUpdate(
           ctx, param, &m, &v, resolved.lr, beta1_, beta2_, epsilon_, inv_bias_correction1,
           inv_bias_correction2, resolved.weight_decay, decoupled_weight_decay_, blocks.value()));
+      continue;
+    }
+
+    int64_t n = param.value->numel();
+    for (int block = 0; block < blocks.value(); ++block) {
+      int64_t start = static_cast<int64_t>(block) * kOptimizerThreads;
+      update_blocks.push_back(AdamUpdateBlock{
+          param.value->data(), param.grad->data(), m.data_as<float>(), v.data_as<float>(), start, n,
+          param.value->dtype(), param.grad->dtype(), resolved.lr, resolved.weight_decay});
     }
   }
 
-  return Status::Ok();
+  if (update_blocks.empty()) {
+    return Status::Ok();
+  }
+
+  size_t descriptor_bytes = update_blocks.size() * sizeof(AdamUpdateBlock);
+  auto descriptor_tensor = ScratchTensorForBytes(ctx, "optim.adam.update_blocks", descriptor_bytes);
+  if (!descriptor_tensor.ok()) {
+    return descriptor_tensor.status();
+  }
+  Tensor descriptor_buffer = descriptor_tensor.value();
+  DLCUDA_RETURN_IF_ERROR(
+      descriptor_buffer.CopyFromHost(update_blocks.data(), descriptor_bytes, ctx.stream()));
+
+  auto rows = detail::RowsForGrid(static_cast<int64_t>(update_blocks.size()), "Adam update");
+  if (!rows.ok()) {
+    return rows.status();
+  }
+  return LaunchAdamUpdateBlocks(ctx, &descriptor_buffer, rows.value(), beta1_, beta2_, epsilon_,
+                                inv_bias_correction1, inv_bias_correction2,
+                                decoupled_weight_decay_);
 }
 
 Status AdamOptimizer::CollectStateTensors(const std::vector<ParameterRef> &params,
