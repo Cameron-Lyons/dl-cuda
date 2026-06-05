@@ -63,9 +63,7 @@ __global__ void MaxPool2dBackwardKernel(const typename Codec::Storage *grad_outp
     return;
   }
 
-  int64_t iw = input_index % input_w;
   int64_t tmp = input_index / input_w;
-  int64_t ih = tmp % input_h;
   tmp /= input_h;
   int64_t c = tmp % channels;
   int64_t n = tmp / channels;
