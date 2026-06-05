@@ -9,6 +9,7 @@
 #include <functional>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace dlcuda {
@@ -103,12 +104,23 @@ private:
 
   AutoTensor CreateTensor(Tensor value, bool requires_grad);
   Status ValidateTensor(const AutoTensor &tensor, const char *name) const;
-  Status AccumulateGradient(RuntimeContext &ctx, int64_t id, const Tensor &grad);
+  Status AccumulateReducedGradient(RuntimeContext &ctx, int64_t id, const Tensor &grad,
+                                   const std::vector<int64_t> &input_shape, float scale = 1.0f);
+  Status AccumulateProductGradient(RuntimeContext &ctx, int64_t id, const Tensor &output_grad,
+                                   const Tensor &factor, const std::vector<int64_t> &input_shape);
+  Status AccumulateQuotientGradient(RuntimeContext &ctx, int64_t id, const Tensor &output_grad,
+                                    const Tensor &divisor, const std::vector<int64_t> &input_shape);
+  Status AccumulateDivideRhsGradient(RuntimeContext &ctx, int64_t id, const Tensor &output_grad,
+                                     const Tensor &lhs, const Tensor &rhs,
+                                     const std::vector<int64_t> &rhs_shape);
+  Status AccumulateGradient(RuntimeContext &ctx, int64_t id, const Tensor &grad,
+                            float scale = 1.0f);
   void RecordNode(Node node);
 
   int64_t next_id_ = 1;
   std::vector<Node> nodes_;
   std::unordered_map<int64_t, Tensor> gradients_;
+  std::unordered_set<int64_t> owned_gradient_ids_;
   std::unordered_map<std::string, CustomOp> custom_ops_;
 };
 

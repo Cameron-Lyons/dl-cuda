@@ -1,26 +1,19 @@
 #include "common.cuh"
 
+#include "dl_cuda/detail/value_validation.hpp"
+
 namespace dlcuda {
 
 Status ValidatePositiveFinite(float value, const char *name) {
-  if (!std::isfinite(value) || !(value > 0.0f)) {
-    return Status::InvalidArgument(std::string(name) + " must be finite and > 0");
-  }
-  return Status::Ok();
+  return detail::ValidatePositiveFinite(value, name);
 }
 
 Status ValidateNonNegativeFinite(float value, const char *name) {
-  if (!std::isfinite(value) || value < 0.0f) {
-    return Status::InvalidArgument(std::string(name) + " must be finite and >= 0");
-  }
-  return Status::Ok();
+  return detail::ValidateNonNegativeFinite(value, name);
 }
 
 Status ValidateRate(float value, const char *name) {
-  if (!std::isfinite(value) || value < 0.0f || value >= 1.0f) {
-    return Status::InvalidArgument(std::string(name) + " must be finite and in [0, 1)");
-  }
-  return Status::Ok();
+  return detail::ValidateRate(value, name);
 }
 
 Status ValidateParameterOnly(const ParameterRef &param, const char *op_name) {
@@ -408,6 +401,18 @@ Status RestoreStateTensors(RuntimeContext &ctx,
     DLCUDA_RETURN_IF_ERROR(CopyHostToDevice(ctx, record.bytes, state.tensor));
   }
   return Status::Ok();
+}
+
+Result<Tensor> ScratchTensorForBytes(RuntimeContext &ctx, const std::string &key, size_t bytes) {
+  int64_t words = 0;
+  if (bytes > 0) {
+    size_t word_count = (bytes + sizeof(int32_t) - 1) / sizeof(int32_t);
+    if (word_count > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
+      return Status::InvalidArgument("Scratch byte request is too large");
+    }
+    words = static_cast<int64_t>(word_count);
+  }
+  return ctx.ScratchTensor(key, {words}, DType::kInt32);
 }
 
 Status EnsureStateMap(RuntimeContext &ctx, const std::vector<ParameterRef> &params,

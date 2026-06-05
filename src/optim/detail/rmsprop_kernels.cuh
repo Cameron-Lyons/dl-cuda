@@ -52,53 +52,36 @@ Status LaunchRMSPropUpdate(RuntimeContext &ctx, const ParameterRef &param, Tenso
   return detail::CheckKernelLaunch("RMSProp update kernel");
 }
 
-template <typename ParamCodec>
-Status LaunchRMSPropUpdateForParam(RuntimeContext &ctx, const ParameterRef &param,
-                                   Tensor *square_avg, Tensor *momentum_buffer, Tensor *grad_avg,
-                                   bool has_momentum, bool centered, float lr, float alpha,
-                                   float epsilon, float momentum, float weight_decay, int blocks) {
-  switch (param.grad->dtype()) {
-  case DType::kFloat32:
-    return LaunchRMSPropUpdate<ParamCodec, detail::Float32Codec>(
-        ctx, param, square_avg, momentum_buffer, grad_avg, has_momentum, centered, lr, alpha,
-        epsilon, momentum, weight_decay, blocks);
-  case DType::kFloat16:
-    return LaunchRMSPropUpdate<ParamCodec, detail::Float16Codec>(
-        ctx, param, square_avg, momentum_buffer, grad_avg, has_momentum, centered, lr, alpha,
-        epsilon, momentum, weight_decay, blocks);
-  case DType::kBFloat16:
-    return LaunchRMSPropUpdate<ParamCodec, detail::BFloat16Codec>(
-        ctx, param, square_avg, momentum_buffer, grad_avg, has_momentum, centered, lr, alpha,
-        epsilon, momentum, weight_decay, blocks);
-  case DType::kInt32:
-    break;
+struct RMSPropUpdateLauncher {
+  RuntimeContext &ctx;
+  const ParameterRef &param;
+  Tensor *square_avg = nullptr;
+  Tensor *momentum_buffer = nullptr;
+  Tensor *grad_avg = nullptr;
+  bool has_momentum = false;
+  bool centered = false;
+  float lr = 0.0f;
+  float alpha = 0.0f;
+  float epsilon = 0.0f;
+  float momentum = 0.0f;
+  float weight_decay = 0.0f;
+  int blocks = 0;
+
+  template <typename ParamCodec, typename GradCodec> Status operator()() const {
+    return LaunchRMSPropUpdate<ParamCodec, GradCodec>(ctx, param, square_avg, momentum_buffer,
+                                                      grad_avg, has_momentum, centered, lr, alpha,
+                                                      epsilon, momentum, weight_decay, blocks);
   }
-  return Status::InvalidArgument("RMSProp does not support grad dtype " +
-                                 std::string(DTypeName(param.grad->dtype())));
-}
+};
 
 Status LaunchRMSPropUpdate(RuntimeContext &ctx, const ParameterRef &param, Tensor *square_avg,
                            Tensor *momentum_buffer, Tensor *grad_avg, bool has_momentum,
                            bool centered, float lr, float alpha, float epsilon, float momentum,
                            float weight_decay, int blocks) {
-  switch (param.value->dtype()) {
-  case DType::kFloat32:
-    return LaunchRMSPropUpdateForParam<detail::Float32Codec>(
-        ctx, param, square_avg, momentum_buffer, grad_avg, has_momentum, centered, lr, alpha,
-        epsilon, momentum, weight_decay, blocks);
-  case DType::kFloat16:
-    return LaunchRMSPropUpdateForParam<detail::Float16Codec>(
-        ctx, param, square_avg, momentum_buffer, grad_avg, has_momentum, centered, lr, alpha,
-        epsilon, momentum, weight_decay, blocks);
-  case DType::kBFloat16:
-    return LaunchRMSPropUpdateForParam<detail::BFloat16Codec>(
-        ctx, param, square_avg, momentum_buffer, grad_avg, has_momentum, centered, lr, alpha,
-        epsilon, momentum, weight_decay, blocks);
-  case DType::kInt32:
-    break;
-  }
-  return Status::InvalidArgument("RMSProp does not support parameter dtype " +
-                                 std::string(DTypeName(param.value->dtype())));
+  return DispatchOptimizerParamGradDTypes(
+      param, "RMSProp",
+      RMSPropUpdateLauncher{ctx, param, square_avg, momentum_buffer, grad_avg, has_momentum,
+                            centered, lr, alpha, epsilon, momentum, weight_decay, blocks});
 }
 
 } // namespace

@@ -1,6 +1,51 @@
 #include "detail/common.cuh"
 
 namespace dlcuda {
+namespace {
+
+constexpr int64_t kZeroGradBytesPerBlock = kOptimizerThreads * 16;
+constexpr size_t kZeroGradDirectMemsetThresholdBytes = 1 * 1024 * 1024;
+
+struct ZeroGradBlock {
+  uint8_t *data = nullptr;
+  int64_t offset = 0;
+  int64_t bytes = 0;
+};
+
+__global__ void ZeroGradBlocksKernel(const ZeroGradBlock *blocks, int block_count) {
+  int block_id = static_cast<int>(blockIdx.x);
+  if (block_id >= block_count) {
+    return;
+  }
+  ZeroGradBlock block = blocks[block_id];
+  for (int64_t offset = threadIdx.x; offset < block.bytes; offset += blockDim.x) {
+    block.data[block.offset + offset] = 0;
+  }
+}
+
+Status LaunchZeroGradBlocks(RuntimeContext &ctx, const std::vector<ZeroGradBlock> &blocks) {
+  if (blocks.empty()) {
+    return Status::Ok();
+  }
+  size_t descriptor_bytes = blocks.size() * sizeof(ZeroGradBlock);
+  auto descriptor_tensor = ScratchTensorForBytes(ctx, "optim.zero_grad.blocks", descriptor_bytes);
+  if (!descriptor_tensor.ok()) {
+    return descriptor_tensor.status();
+  }
+  Tensor descriptor_buffer = descriptor_tensor.value();
+  DLCUDA_RETURN_IF_ERROR(
+      descriptor_buffer.CopyFromHost(blocks.data(), descriptor_bytes, ctx.stream()));
+
+  auto rows = detail::RowsForGrid(static_cast<int64_t>(blocks.size()), "ZeroGrad");
+  if (!rows.ok()) {
+    return rows.status();
+  }
+  ZeroGradBlocksKernel<<<rows.value(), kOptimizerThreads, 0, ctx.stream()>>>(
+      descriptor_buffer.data_as<ZeroGradBlock>(), rows.value());
+  return detail::CheckKernelLaunch("ZeroGrad blocks kernel");
+}
+
+} // namespace
 
 Optimizer::Optimizer(float lr, float weight_decay) {
   param_groups_.push_back(OptimizerParamGroup{{}, lr, weight_decay});
@@ -14,11 +59,27 @@ Optimizer::Optimizer(std::vector<OptimizerParamGroup> param_groups)
 }
 
 Status Optimizer::ZeroGrad(RuntimeContext &ctx, const std::vector<ParameterRef> &params) {
+  std::vector<ZeroGradBlock> blocks;
   for (const auto &param : params) {
     DLCUDA_RETURN_IF_ERROR(ValidateGradient(param, "ZeroGrad"));
-    DLCUDA_RETURN_IF_ERROR(param.grad->FillZero(ctx.stream()));
+    size_t bytes = param.grad->bytes();
+    if (bytes == 0) {
+      continue;
+    }
+    if (bytes > kZeroGradDirectMemsetThresholdBytes) {
+      DLCUDA_RETURN_IF_ERROR(param.grad->FillZero(ctx.stream()));
+      continue;
+    }
+    if (bytes > static_cast<size_t>(std::numeric_limits<int64_t>::max())) {
+      return Status::InvalidArgument("ZeroGrad tensor is too large");
+    }
+    int64_t tensor_bytes = static_cast<int64_t>(bytes);
+    for (int64_t offset = 0; offset < tensor_bytes; offset += kZeroGradBytesPerBlock) {
+      int64_t chunk_bytes = std::min(kZeroGradBytesPerBlock, tensor_bytes - offset);
+      blocks.push_back(ZeroGradBlock{param.grad->data_as<uint8_t>(), offset, chunk_bytes});
+    }
   }
-  return Status::Ok();
+  return LaunchZeroGradBlocks(ctx, blocks);
 }
 
 Result<std::vector<ResolvedOptimizerParam>>

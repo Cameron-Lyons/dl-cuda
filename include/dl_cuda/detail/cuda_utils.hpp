@@ -1,5 +1,6 @@
 #pragma once
 
+#include "dl_cuda/dtype.hpp"
 #include "dl_cuda/status.hpp"
 
 #include <cublas_v2.h>
@@ -27,6 +28,41 @@ inline Status CublasStatus(cublasStatus_t status, const std::string &context) {
   oss << context << " failed with cuBLAS status code " << static_cast<int>(status);
   return Status::RuntimeError(oss.str());
 }
+
+#if defined(CUBLAS_VERSION) && CUBLAS_VERSION >= 11000
+
+inline Result<cudaDataType_t> CublasCudaDataType(DType dtype, const std::string &context) {
+  switch (dtype) {
+  case DType::kFloat32:
+    return CUDA_R_32F;
+  case DType::kFloat16:
+    return CUDA_R_16F;
+  case DType::kBFloat16:
+#if defined(CUDART_VERSION) && CUDART_VERSION >= 11000
+    return CUDA_R_16BF;
+#else
+    return Status::Unsupported("bfloat16 " + context + " requires CUDA 11 or newer");
+#endif
+  case DType::kInt32:
+    break;
+  }
+  return Status::InvalidArgument(context + " does not support dtype " +
+                                 std::string(DTypeName(dtype)));
+}
+
+inline cublasComputeType_t CublasComputeType(bool use_tf32, DType dtype) {
+#if defined(CUBLAS_COMPUTE_32F_FAST_TF32)
+  if (dtype == DType::kFloat32 && use_tf32) {
+    return CUBLAS_COMPUTE_32F_FAST_TF32;
+  }
+#else
+  (void)use_tf32;
+#endif
+  (void)dtype;
+  return CUBLAS_COMPUTE_32F;
+}
+
+#endif
 
 inline Status CheckKernelLaunch(const std::string &context) {
   return CudaStatus(cudaGetLastError(), context);

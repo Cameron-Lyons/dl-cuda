@@ -1,6 +1,11 @@
 #include "detail/embedding_kernels.cuh"
 
 namespace dlcuda {
+namespace {
+
+constexpr int64_t kEmbeddingWarpAggregationMinTokens = 32;
+
+} // namespace
 
 Embedding::Embedding(int64_t vocab_size, int64_t embedding_dim, RuntimeContext &ctx, DType dtype)
     : vocab_size_(vocab_size), embedding_dim_(embedding_dim), dtype_(dtype) {
@@ -28,14 +33,7 @@ Embedding::Embedding(int64_t vocab_size, int64_t embedding_dim, RuntimeContext &
   table_ = table.value();
   grad_table_ = grad_table.value();
 
-  std::mt19937 rng(static_cast<uint32_t>(ctx.NextInitSeed()));
-  std::normal_distribution<float> dist(0.0f, std::sqrt(2.0f / embedding_dim_));
-  std::vector<float> host_table(static_cast<size_t>(vocab_size_ * embedding_dim_));
-  for (float &v : host_table) {
-    v = dist(rng);
-  }
-
-  init_status_ = CopyHostFloatsToTensor(&table_, host_table, ctx.stream());
+  init_status_ = FillKaimingNormal(ctx, &table_, static_cast<float>(embedding_dim_));
   if (!init_status_.ok()) {
     return;
   }
@@ -92,14 +90,27 @@ Status Embedding::Backward(RuntimeContext &ctx, const Tensor &grad_output, Tenso
   DLCUDA_RETURN_IF_ERROR(grad_table_.FillZero(ctx.stream()));
 
   int64_t total = last_num_tokens_ * embedding_dim_;
-  auto blocks = detail::BlocksForElements(total, kCudaThreads);
-  if (!blocks.ok()) {
-    return blocks.status();
+  bool used_warp_aggregation = false;
+  if (last_num_tokens_ >= kEmbeddingWarpAggregationMinTokens) {
+    Status warp_status = LaunchEmbeddingBackwardWarpAggregatedKernel(
+        ctx, dtype_, grad_output, cached_token_ids_, &grad_table_, last_num_tokens_, embedding_dim_,
+        vocab_size_);
+    if (warp_status.ok()) {
+      used_warp_aggregation = true;
+    } else if (warp_status.code() != StatusCode::kUnsupported) {
+      return warp_status;
+    }
   }
-  if (blocks.value() > 0) {
-    DLCUDA_RETURN_IF_ERROR(LaunchEmbeddingBackwardKernel(
-        ctx, dtype_, grad_output, cached_token_ids_, &grad_table_, blocks.value(), last_num_tokens_,
-        embedding_dim_, vocab_size_));
+  if (!used_warp_aggregation) {
+    auto blocks = detail::BlocksForElements(total, kCudaThreads);
+    if (!blocks.ok()) {
+      return blocks.status();
+    }
+    if (blocks.value() > 0) {
+      DLCUDA_RETURN_IF_ERROR(LaunchEmbeddingBackwardKernel(
+          ctx, dtype_, grad_output, cached_token_ids_, &grad_table_, blocks.value(),
+          last_num_tokens_, embedding_dim_, vocab_size_));
+    }
   }
 
   // Token IDs are non-differentiable; upstream gradient terminates here.

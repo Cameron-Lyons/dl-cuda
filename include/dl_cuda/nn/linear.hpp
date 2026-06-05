@@ -2,12 +2,17 @@
 
 #include "dl_cuda/nn/module.hpp"
 
+#include <memory>
+
 namespace dlcuda {
+
+struct LinearCublasLtForwardPlan;
 
 class Linear : public Module {
 public:
   Linear(int64_t in_features, int64_t out_features, RuntimeContext &ctx,
          DType dtype = DType::kFloat32);
+  ~Linear() override;
 
   Status Forward(RuntimeContext &ctx, const Tensor &input, Tensor *output) override;
   Status Backward(RuntimeContext &ctx, const Tensor &grad_output, Tensor *grad_input) override;
@@ -27,6 +32,7 @@ private:
   Tensor cached_input_;
   Tensor forward_output_;
   Tensor backward_output_;
+  std::unique_ptr<LinearCublasLtForwardPlan> cublaslt_forward_plan_;
 };
 
 } // namespace dlcuda

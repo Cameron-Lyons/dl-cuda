@@ -121,23 +121,6 @@ private:
   DType dtype_ = DType::kFloat32;
 };
 
-inline Status EnsureTensor(Tensor *tensor, const std::vector<int64_t> &shape, DType dtype,
-                           DeviceType device = DeviceType::kCuda) {
-  if (tensor == nullptr) {
-    return Status::InvalidArgument("EnsureTensor received null tensor");
-  }
-  if (tensor->defined() && tensor->shape() == shape && tensor->dtype() == dtype &&
-      tensor->device() == device) {
-    return Status::Ok();
-  }
-  auto allocated = Tensor::Allocate(shape, dtype, device);
-  if (!allocated.ok()) {
-    return allocated.status();
-  }
-  *tensor = allocated.value();
-  return Status::Ok();
-}
-
 inline Status EnsureTensorAsync(Tensor *tensor, const std::vector<int64_t> &shape, DType dtype,
                                 cudaStream_t stream = 0, DeviceType device = DeviceType::kCuda) {
   if (tensor == nullptr) {

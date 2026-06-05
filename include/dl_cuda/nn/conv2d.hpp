@@ -40,6 +40,9 @@ private:
   Tensor cached_input_;
   Tensor forward_output_;
   Tensor backward_output_;
+  Tensor column_buffer_;
+  Tensor grad_column_buffer_;
+  Tensor grad_output_matrix_;
 };
 
 } // namespace dlcuda

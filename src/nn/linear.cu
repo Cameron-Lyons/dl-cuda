@@ -40,28 +40,11 @@ Linear::Linear(int64_t in_features, int64_t out_features, RuntimeContext &ctx, D
   grad_weight_ = grad_weight.value();
   grad_bias_ = grad_bias.value();
 
-  std::mt19937 rng(static_cast<uint32_t>(ctx.NextInitSeed()));
-  std::normal_distribution<float> dist(0.0f, std::sqrt(2.0f / in_features_));
-
-  std::vector<float> host_weight(static_cast<size_t>(in_features_ * out_features_));
-  for (float &v : host_weight) {
-    v = dist(rng);
-  }
-
-  init_status_ = CopyHostFloatsToTensor(&weight_, host_weight, ctx.stream());
-  if (!init_status_.ok()) {
-    return;
-  }
-  init_status_ = bias_.FillZero(ctx.stream());
-  if (!init_status_.ok()) {
-    return;
-  }
-  init_status_ = grad_weight_.FillZero(ctx.stream());
-  if (!init_status_.ok()) {
-    return;
-  }
-  init_status_ = grad_bias_.FillZero(ctx.stream());
+  init_status_ = InitializeWeightBiasAndGradients(ctx, &weight_, &bias_, &grad_weight_, &grad_bias_,
+                                                  static_cast<float>(in_features_));
 }
+
+Linear::~Linear() = default;
 
 Status Linear::Forward(RuntimeContext &ctx, const Tensor &input, Tensor *output) {
   if (!init_status_.ok()) {
@@ -92,10 +75,8 @@ Status Linear::Forward(RuntimeContext &ctx, const Tensor &input, Tensor *output)
     return Status::Ok();
   }
 
-  if (ctx.use_cublas() && dtype_ == DType::kFloat32) {
-    DLCUDA_RETURN_IF_ERROR(ctx.EnsureCublas());
-    cublasHandle_t handle = ctx.cublas_handle();
-
+  bool used_accelerated = false;
+  if (ctx.use_cublas()) {
     auto out_features_int = detail::CheckedInt(out_features_, "out_features");
     if (!out_features_int.ok()) {
       return out_features_int.status();
@@ -109,20 +90,24 @@ Status Linear::Forward(RuntimeContext &ctx, const Tensor &input, Tensor *output)
       return in_features_int.status();
     }
 
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
-    bool used_cublaslt = false;
 #if defined(DLCUDA_HAS_CUBLASLT)
-    Status lt_status =
-        LinearForwardCublasLt(ctx, input, weight_, bias_, &forward_output_,
-                              out_features_int.value(), batch_int.value(), in_features_int.value());
+    if (cublaslt_forward_plan_ == nullptr) {
+      cublaslt_forward_plan_ = std::make_unique<LinearCublasLtForwardPlan>();
+    }
+    Status lt_status = LinearForwardCublasLt(
+        ctx, input, weight_, bias_, &forward_output_, out_features_int.value(), batch_int.value(),
+        in_features_int.value(), dtype_, cublaslt_forward_plan_.get());
     if (lt_status.ok()) {
-      used_cublaslt = true;
+      used_accelerated = true;
     } else if (lt_status.code() != StatusCode::kUnsupported) {
       return lt_status;
     }
 #endif
-    if (!used_cublaslt) {
+    if (!used_accelerated && dtype_ == DType::kFloat32) {
+      DLCUDA_RETURN_IF_ERROR(ctx.EnsureCublas());
+      cublasHandle_t handle = ctx.cublas_handle();
+      const float alpha = 1.0f;
+      const float beta = 0.0f;
       DLCUDA_RETURN_IF_ERROR(detail::CublasStatus(
           cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N, out_features_int.value(), batch_int.value(),
                       in_features_int.value(), &alpha, weight_.data_as<float>(),
@@ -138,8 +123,11 @@ Status Linear::Forward(RuntimeContext &ctx, const Tensor &input, Tensor *output)
       AddBiasKernel<<<blocks.value(), kCudaThreads, 0, ctx.stream()>>>(
           forward_output_.data_as<float>(), bias_.data_as<float>(), batch, out_features_);
       DLCUDA_RETURN_IF_ERROR(detail::CheckKernelLaunch("Linear add-bias kernel"));
+      used_accelerated = true;
     }
-  } else {
+  }
+
+  if (!used_accelerated) {
     auto x_blocks = detail::BlocksForElements(out_features_, kLinearTile);
     if (!x_blocks.ok()) {
       return x_blocks.status();
@@ -189,10 +177,8 @@ Status Linear::Backward(RuntimeContext &ctx, const Tensor &grad_output, Tensor *
     return Status::Ok();
   }
 
-  if (ctx.use_cublas() && dtype_ == DType::kFloat32) {
-    DLCUDA_RETURN_IF_ERROR(ctx.EnsureCublas());
-    cublasHandle_t handle = ctx.cublas_handle();
-
+  bool used_accelerated = false;
+  if (ctx.use_cublas()) {
     auto in_features_int = detail::CheckedInt(in_features_, "in_features");
     if (!in_features_int.ok()) {
       return in_features_int.status();
@@ -206,34 +192,77 @@ Status Linear::Backward(RuntimeContext &ctx, const Tensor &grad_output, Tensor *
       return out_features_int.status();
     }
 
-    const float alpha = 1.0f;
-    const float beta = 0.0f;
+    DLCUDA_RETURN_IF_ERROR(ctx.EnsureCublas());
+    cublasHandle_t handle = ctx.cublas_handle();
 
-    if (need_grad_input) {
+    if (dtype_ == DType::kFloat32) {
+      const float alpha = 1.0f;
+      const float beta = 0.0f;
+
+      if (need_grad_input) {
+        DLCUDA_RETURN_IF_ERROR(detail::CublasStatus(
+            cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, in_features_int.value(),
+                        batch_int.value(), out_features_int.value(), &alpha,
+                        weight_.data_as<float>(), out_features_int.value(),
+                        grad_output.data_as<float>(), out_features_int.value(), &beta,
+                        backward_output_.data_as<float>(), in_features_int.value()),
+            "Linear backward-input cublasSgemm"));
+      }
+
       DLCUDA_RETURN_IF_ERROR(detail::CublasStatus(
-          cublasSgemm(handle, CUBLAS_OP_T, CUBLAS_OP_N, in_features_int.value(), batch_int.value(),
-                      out_features_int.value(), &alpha, weight_.data_as<float>(),
-                      out_features_int.value(), grad_output.data_as<float>(),
-                      out_features_int.value(), &beta, backward_output_.data_as<float>(),
-                      in_features_int.value()),
-          "Linear backward-input cublasSgemm"));
+          cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, out_features_int.value(),
+                      in_features_int.value(), batch_int.value(), &alpha,
+                      grad_output.data_as<float>(), out_features_int.value(),
+                      cached_input_.data_as<float>(), in_features_int.value(), &beta,
+                      grad_weight_.data_as<float>(), out_features_int.value()),
+          "Linear backward-weight cublasSgemm"));
+      used_accelerated = true;
     }
 
-    DLCUDA_RETURN_IF_ERROR(detail::CublasStatus(
-        cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_T, out_features_int.value(),
-                    in_features_int.value(), batch_int.value(), &alpha,
-                    grad_output.data_as<float>(), out_features_int.value(),
-                    cached_input_.data_as<float>(), in_features_int.value(), &beta,
-                    grad_weight_.data_as<float>(), out_features_int.value()),
-        "Linear backward-weight cublasSgemm"));
+#if defined(CUBLAS_VERSION) && CUBLAS_VERSION >= 11000
+    if (!used_accelerated && (dtype_ == DType::kFloat16 || dtype_ == DType::kBFloat16)) {
+      bool gemm_supported = true;
+      if (need_grad_input) {
+        Status input_status = LinearCublasGemmEx(
+            ctx, CUBLAS_OP_T, CUBLAS_OP_N, in_features_int.value(), batch_int.value(),
+            out_features_int.value(), weight_, dtype_, out_features_int.value(), grad_output,
+            dtype_, out_features_int.value(), &backward_output_, dtype_, in_features_int.value(),
+            "Linear backward-input cublasGemmEx");
+        if (!input_status.ok()) {
+          if (input_status.code() == StatusCode::kUnsupported) {
+            gemm_supported = false;
+          } else {
+            return input_status;
+          }
+        }
+      }
 
-    auto rows = detail::RowsForGrid(out_features_, "linear bias");
-    if (!rows.ok()) {
-      return rows.status();
+      if (gemm_supported) {
+        Status weight_status = LinearCublasGemmEx(
+            ctx, CUBLAS_OP_N, CUBLAS_OP_T, out_features_int.value(), in_features_int.value(),
+            batch_int.value(), grad_output, dtype_, out_features_int.value(), cached_input_, dtype_,
+            in_features_int.value(), &grad_weight_, DType::kFloat32, out_features_int.value(),
+            "Linear backward-weight cublasGemmEx");
+        if (weight_status.ok()) {
+          used_accelerated = true;
+        } else if (weight_status.code() != StatusCode::kUnsupported) {
+          return weight_status;
+        }
+      }
     }
-    DLCUDA_RETURN_IF_ERROR(LaunchLinearBackwardBiasKernel(
-        ctx, dtype_, grad_output, &grad_bias_, rows.value(), last_batch_, out_features_));
-  } else {
+#endif
+
+    if (used_accelerated) {
+      auto rows = detail::RowsForGrid(out_features_, "linear bias");
+      if (!rows.ok()) {
+        return rows.status();
+      }
+      DLCUDA_RETURN_IF_ERROR(LaunchLinearBackwardBiasKernel(
+          ctx, dtype_, grad_output, &grad_bias_, rows.value(), last_batch_, out_features_));
+    }
+  }
+
+  if (!used_accelerated) {
     dim3 threads(kLinearTile, kLinearTile);
     if (need_grad_input) {
       auto input_x_blocks = detail::BlocksForElements(in_features_, kLinearTile);

@@ -1,5 +1,7 @@
 #include "common.cuh"
 
+#include "dl_cuda/detail/value_validation.hpp"
+
 namespace dlcuda::examples_detail {
 
 RuntimeOptions OptionsFromXorConfig(const TrainXorConfig &cfg) {
@@ -21,10 +23,7 @@ RuntimeOptions OptionsFromCharConfig(bool use_cublas, bool tf32, uint64_t seed) 
 }
 
 Status ValidatePositiveFinite(float value, const char *name) {
-  if (!std::isfinite(value) || !(value > 0.0f)) {
-    return Status::InvalidArgument(std::string(name) + " must be finite and > 0");
-  }
-  return Status::Ok();
+  return ::dlcuda::detail::ValidatePositiveFinite(value, name);
 }
 
 Status ValidateTopP(float value) {
@@ -35,10 +34,7 @@ Status ValidateTopP(float value) {
 }
 
 Status ValidateFraction(float value, const char *name) {
-  if (!std::isfinite(value) || value < 0.0f || value >= 1.0f) {
-    return Status::InvalidArgument(std::string(name) + " must be finite and in [0, 1)");
-  }
-  return Status::Ok();
+  return ::dlcuda::detail::ValidateRate(value, name);
 }
 
 Status ValidateXorConfig(const TrainXorConfig &cfg) {
