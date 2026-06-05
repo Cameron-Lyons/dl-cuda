@@ -135,7 +135,6 @@ Status LinearForwardCublasLt(RuntimeContext &ctx, const Tensor &input, const Ten
   return CublasLtStatus(status, "Linear forward cublasLtMatmul");
 }
 
-#endif
 __global__ void AddBiasKernel(float *output, const float *bias, int64_t batch,
                               int64_t out_features) {
   int64_t idx = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
