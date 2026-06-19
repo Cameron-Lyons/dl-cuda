@@ -37,6 +37,12 @@ using detail::ValidateFloatingTensor;
 using detail::ValidateIntTensor;
 using detail::ValidateRank;
 
+struct FloatMaxReduce {
+  __host__ __device__ __forceinline__ float operator()(float a, float b) const {
+    return fmaxf(a, b);
+  }
+};
+
 inline Status ValidateFloatingDType(DType dtype, const char *name) {
   if (!IsFloatingPointDType(dtype)) {
     return Status::InvalidArgument(std::string(name) + " dtype must be floating point");

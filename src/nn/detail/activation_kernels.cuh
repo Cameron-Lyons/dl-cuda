@@ -69,7 +69,7 @@ __global__ void SoftmaxForwardKernel(const typename Codec::Storage *input,
   for (int64_t c = tid; c < row_width; c += blockDim.x) {
     local_max = fmaxf(local_max, Codec::Load(in_row, c));
   }
-  float row_max = CudaBlockReduce(max_storage).Reduce(local_max, cub::Max());
+  float row_max = CudaBlockReduce(max_storage).Reduce(local_max, FloatMaxReduce{});
   if (tid == 0) {
     row_max_shared = row_max;
   }
