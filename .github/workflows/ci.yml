@@ -10,12 +10,12 @@ jobs:
   build-and-test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install CUDA toolkit
-        uses: Jimver/cuda-toolkit@v0.2.24
+        uses: Jimver/cuda-toolkit@v0.2.35
         with:
-          cuda: "12.4.1"
+          cuda: "13.2.0"
 
       - name: Install linter
         run: sudo apt-get update && sudo apt-get install -y clang-format
@@ -33,7 +33,7 @@ jobs:
     if: ${{ vars.ENABLE_GPU_CI == 'true' }}
     runs-on: [self-hosted, linux, x64, gpu, nvidia]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DDL_CUDA_WARNINGS_AS_ERRORS=ON
