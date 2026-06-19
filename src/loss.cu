@@ -21,6 +21,12 @@ constexpr int kLossReductionMaxBlocks = 4096;
 
 using LossBlockReduce = cub::BlockReduce<float, kLossThreads>;
 
+struct FloatMaxReduce {
+  __host__ __device__ __forceinline__ float operator()(float a, float b) const {
+    return fmaxf(a, b);
+  }
+};
+
 struct BestClass {
   float value;
   int index;
@@ -137,7 +143,7 @@ CategoricalLogitsGradKernel(const int32_t *target_ids, const typename Codec::Sto
   for (int64_t c = tid; c < classes; c += blockDim.x) {
     local_max = fmaxf(local_max, Codec::Load(row_logits, c));
   }
-  float row_max = LossBlockReduce(max_storage).Reduce(local_max, cub::Max());
+  float row_max = LossBlockReduce(max_storage).Reduce(local_max, FloatMaxReduce{});
   if (tid == 0) {
     row_max_shared = row_max;
   }
